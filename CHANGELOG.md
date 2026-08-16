@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.31.2 - 2026-08-16
+
 ### Security
 
 - Fix CPU-exhaustion loops when hostile array or map blocks end early.
