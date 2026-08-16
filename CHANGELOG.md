@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v2.31.3 - 2026-08-16
+
+### Dependencies
+
+- Upgrade `github.com/go-viper/mapstructure/v2` from v2.4.0 to v2.5.0.
+- Upgrade `github.com/klauspost/compress` from v1.18.7 to v1.19.2.
+- Upgrade `github.com/stretchr/testify` from v1.9.0 to v1.11.1.
+- Upgrade the loaded transitive test dependencies `github.com/google/go-cmp`
+  from v0.6.0 to v0.7.0 and `gopkg.in/check.v1` from its 2016 revision to
+  `v1.0.0-20201130134442-10cb98267c6c`; refresh the resulting `kr/pretty`,
+  `kr/text`, and `rogpeppe/go-internal` dependency chain.
+
 ## v2.31.2 - 2026-08-16
 
 ### Security
