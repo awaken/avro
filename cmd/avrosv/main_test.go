@@ -5,7 +5,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/hamba/avro/v2"
+	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
 )
 

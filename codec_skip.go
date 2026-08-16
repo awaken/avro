@@ -143,17 +143,20 @@ type sliceSkipDecoder struct {
 func (d *sliceSkipDecoder) Decode(_ unsafe.Pointer, r *Reader) {
 	for {
 		l, size := r.ReadBlockHeader()
-		if l == 0 {
+		if l == 0 || r.Error != nil {
 			break
 		}
 
 		if size > 0 {
-			r.SkipNBytes(int(size))
+			r.SkipNBytesInt64(size)
 			continue
 		}
 
 		for range l {
 			d.decoder.Decode(nil, r)
+			if r.Error != nil {
+				return
+			}
 		}
 	}
 }
@@ -174,18 +177,24 @@ type mapSkipDecoder struct {
 func (d *mapSkipDecoder) Decode(_ unsafe.Pointer, r *Reader) {
 	for {
 		l, size := r.ReadBlockHeader()
-		if l == 0 {
+		if l == 0 || r.Error != nil {
 			break
 		}
 
 		if size > 0 {
-			r.SkipNBytes(int(size))
+			r.SkipNBytesInt64(size)
 			continue
 		}
 
 		for range l {
 			r.SkipString()
+			if r.Error != nil {
+				return
+			}
 			d.decoder.Decode(nil, r)
+			if r.Error != nil {
+				return
+			}
 		}
 	}
 }

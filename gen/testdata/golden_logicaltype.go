@@ -5,8 +5,8 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/awaken/avro/v2"
 	"github.com/google/uuid"
-	"github.com/hamba/avro/v2"
 )
 
 // InnerRecord is a generated struct.

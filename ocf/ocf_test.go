@@ -3,6 +3,7 @@ package ocf_test
 import (
 	"bytes"
 	"compress/flate"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hamba/avro/v2"
-	"github.com/hamba/avro/v2/ocf"
+	"github.com/awaken/avro/v2"
+	"github.com/awaken/avro/v2/ocf"
 	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1371,15 +1372,18 @@ func TestSharedZstdDecoder(t *testing.T) {
 	require.NoError(t, err)
 	defer sharedDecoder.Close()
 
+	_, err = ocf.NewDecoder(bytes.NewReader(buf1.Bytes()), ocf.WithZStandardDecoder(sharedDecoder))
+	require.ErrorContains(t, err, "shared decoder cannot guarantee")
+
 	// Use the shared decoder with multiple OCF decoders
-	dec1, err := ocf.NewDecoder(&buf1, ocf.WithZStandardDecoder(sharedDecoder))
+	dec1, err := ocf.NewDecoder(&buf1, ocf.WithZStandardDecoder(sharedDecoder), ocf.WithMaxDecompressedBlockBytes(-1))
 	require.NoError(t, err)
 	require.True(t, dec1.HasNext())
 	var result1 string
 	require.NoError(t, dec1.Decode(&result1))
 	assert.Equal(t, "data in file 1", result1)
 
-	dec2, err := ocf.NewDecoder(&buf2, ocf.WithZStandardDecoder(sharedDecoder))
+	dec2, err := ocf.NewDecoder(&buf2, ocf.WithZStandardDecoder(sharedDecoder), ocf.WithMaxDecompressedBlockBytes(-1))
 	require.NoError(t, err)
 	require.True(t, dec2.HasNext())
 	var result2 string
@@ -1648,4 +1652,169 @@ func TestEncoder_ResetPreservesCodec(t *testing.T) {
 	dec2, err := ocf.NewDecoder(buf2)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("deflate"), dec2.Metadata()["avro.codec"])
+}
+
+func TestDecoder_DefaultResourceLimits(t *testing.T) {
+	original := buildSecurityOCF(t, ocf.Null)
+	headerEnd, sync := securityOCFHeaderEnd(t, original)
+
+	t.Run("compressed block bytes", func(t *testing.T) {
+		var hostile bytes.Buffer
+		hostile.Write(original[:headerEnd])
+		writeSecurityLong(&hostile, 1)
+		writeSecurityLong(&hostile, 65<<20)
+
+		decoder, err := ocf.NewDecoder(bytes.NewReader(hostile.Bytes()))
+		require.NoError(t, err)
+		assert.False(t, decoder.HasNext())
+		assert.ErrorContains(t, decoder.Error(), "WithMaxBlockBytes")
+	})
+
+	t.Run("records per block", func(t *testing.T) {
+		var hostile bytes.Buffer
+		hostile.Write(original[:headerEnd])
+		writeSecurityLong(&hostile, 1_048_577)
+		writeSecurityLong(&hostile, 0)
+		hostile.Write(sync)
+
+		decoder, err := ocf.NewDecoder(bytes.NewReader(hostile.Bytes()))
+		require.NoError(t, err)
+		assert.False(t, decoder.HasNext())
+		assert.ErrorContains(t, decoder.Error(), "WithMaxBlockRecords")
+	})
+}
+
+func TestDecoder_RejectsDeflateDecompressionBomb(t *testing.T) {
+	original := buildSecurityOCF(t, ocf.Deflate)
+
+	var compressed bytes.Buffer
+	compressor, err := flate.NewWriter(&compressed, flate.BestCompression)
+	require.NoError(t, err)
+	_, err = compressor.Write(bytes.Repeat([]byte{0}, 1<<20))
+	require.NoError(t, err)
+	require.NoError(t, compressor.Close())
+
+	hostile := replaceSecurityOCFPayload(t, original, compressed.Bytes())
+	decoder, err := ocf.NewDecoder(
+		bytes.NewReader(hostile),
+		ocf.WithMaxDecompressedBlockBytes(64<<10),
+	)
+	require.NoError(t, err)
+
+	assert.False(t, decoder.HasNext())
+	require.Error(t, decoder.Error())
+	assert.ErrorContains(t, decoder.Error(), "decompressed size exceeds")
+}
+
+func TestDecoder_AppliesConfigToHeader(t *testing.T) {
+	original := buildSecurityOCF(t, ocf.Null)
+	config := avro.Config{MaxMapAllocSize: 1}.Freeze()
+
+	_, err := ocf.NewDecoder(bytes.NewReader(original), ocf.WithDecoderConfig(config))
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "MaxMapAllocSize")
+}
+
+func buildSecurityOCF(t *testing.T, codec ocf.CodecName) []byte {
+	t.Helper()
+
+	var data bytes.Buffer
+	encoder, err := ocf.NewEncoder(`"long"`, &data, ocf.WithCodec(codec))
+	require.NoError(t, err)
+	require.NoError(t, encoder.Encode(int64(7)))
+	require.NoError(t, encoder.Close())
+	return data.Bytes()
+}
+
+func securityOCFHeaderEnd(t *testing.T, data []byte) (int, []byte) {
+	t.Helper()
+
+	reader := (&avro.Reader{}).Reset(data)
+	var header ocf.Header
+	reader.ReadVal(ocf.HeaderSchema, &header)
+	require.NoError(t, reader.Error)
+
+	position := bytes.Index(data[4:], header.Sync[:])
+	require.NotEqual(t, -1, position)
+	end := 4 + position + len(header.Sync)
+	return end, header.Sync[:]
+}
+
+func replaceSecurityOCFPayload(t *testing.T, original, payload []byte) []byte {
+	t.Helper()
+
+	headerEnd, sync := securityOCFHeaderEnd(t, original)
+	countEncoded := original[headerEnd:]
+	_, countSize := binary.Uvarint(countEncoded)
+	require.Greater(t, countSize, 0)
+	sizeEncoded := countEncoded[countSize:]
+	sizeValue, sizeSize := binary.Uvarint(sizeEncoded)
+	require.Greater(t, sizeSize, 0)
+	oldSize := int(int64(sizeValue>>1) ^ -int64(sizeValue&1))
+	require.GreaterOrEqual(t, oldSize, 0)
+	oldPayloadEnd := headerEnd + countSize + sizeSize + oldSize
+	require.LessOrEqual(t, oldPayloadEnd+len(sync), len(original))
+
+	var mutated bytes.Buffer
+	mutated.Write(original[:headerEnd+countSize])
+	writeSecurityLong(&mutated, int64(len(payload)))
+	mutated.Write(payload)
+	mutated.Write(sync)
+	return mutated.Bytes()
+}
+
+func writeSecurityLong(writer io.Writer, value int64) {
+	encoded := (uint64(value) << 1) ^ uint64(value>>63)
+	var data [binary.MaxVarintLen64]byte
+	size := binary.PutUvarint(data[:], encoded)
+	_, _ = writer.Write(data[:size])
+}
+
+func FuzzOCFDecoder(f *testing.F) {
+	config := avro.Config{
+		MaxByteSliceSize:  1 << 20,
+		MaxSliceAllocSize: 1 << 16,
+		MaxMapAllocSize:   1 << 16,
+	}.Freeze()
+
+	var seed bytes.Buffer
+	encoder, err := ocf.NewEncoder(`"long"`, &seed, ocf.WithCodec(ocf.Deflate))
+	if err != nil {
+		f.Fatal(err)
+	}
+	if err := encoder.Encode(int64(42)); err != nil {
+		f.Fatal(err)
+	}
+	if err := encoder.Close(); err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed.Bytes())
+	f.Add([]byte{})
+	f.Add([]byte("Obj\x01"))
+
+	f.Fuzz(func(_ *testing.T, data []byte) {
+		if len(data) > 4<<20 {
+			return
+		}
+		decoder, err := ocf.NewDecoder(
+			bytes.NewReader(data),
+			ocf.WithDecoderConfig(config),
+			ocf.WithMaxBlockBytes(4<<20),
+			ocf.WithMaxDecompressedBlockBytes(4<<20),
+			ocf.WithMaxBlockRecords(1024),
+		)
+		if err != nil {
+			return
+		}
+		defer decoder.Close()
+
+		for count := 0; count < 1024 && decoder.HasNext(); count++ {
+			var value int64
+			if decoder.Decode(&value) != nil {
+				return
+			}
+		}
+		_ = decoder.Error()
+	})
 }

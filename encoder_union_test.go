@@ -3,10 +3,11 @@ package avro_test
 import (
 	"bytes"
 	"math/big"
+	"strconv"
 	"testing"
 	"time"
 
-	"github.com/hamba/avro/v2"
+	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -687,7 +688,7 @@ func TestEncoder_UnionResolver(t *testing.T) {
 		{
 			name:   "Go int as Avro long",
 			schema: `["null","long"]`,
-			value:  int(2147483648),
+			value:  largePlatformInt(),
 			want:   []byte{0x2, 0x80, 0x80, 0x80, 0x80, 0x10},
 		},
 		{
@@ -784,4 +785,12 @@ func TestEncoder_UnionResolver(t *testing.T) {
 			assert.Equal(t, tc.want, buf.Bytes())
 		})
 	}
+}
+
+func largePlatformInt() any {
+	value := int64(2147483648)
+	if strconv.IntSize == 64 {
+		return int(value)
+	}
+	return value
 }

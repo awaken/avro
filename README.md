@@ -4,35 +4,39 @@
   <img alt="Logo" src="http://svg.wiersma.co.za/hamba/project?title=avro&tag=A%20fast%20Go%20avro%20codec">
 </picture>
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/hamba/avro/v2)](https://goreportcard.com/report/github.com/hamba/avro/v2)
-[![Build Status](https://github.com/hamba/avro/actions/workflows/test.yml/badge.svg)](https://github.com/hamba/avro/actions)
-[![Coverage Status](https://coveralls.io/repos/github/hamba/avro/badge.svg?branch=main)](https://coveralls.io/github/hamba/avro?branch=main)
-[![Go Reference](https://pkg.go.dev/badge/github.com/hamba/avro/v2.svg)](https://pkg.go.dev/github.com/hamba/avro/v2)
-[![GitHub release](https://img.shields.io/github/release/hamba/avro.svg)](https://github.com/hamba/avro/releases)
-[![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/hamba/avro/master/LICENSE)
+[![Go Report Card](https://goreportcard.com/badge/github.com/awaken/avro/v2)](https://goreportcard.com/report/github.com/awaken/avro/v2)
+[![Build Status](https://github.com/awaken/avro/actions/workflows/test.yml/badge.svg)](https://github.com/awaken/avro/actions)
+[![Coverage Status](https://coveralls.io/repos/github/awaken/avro/badge.svg?branch=main)](https://coveralls.io/github/awaken/avro?branch=main)
+[![Go Reference](https://pkg.go.dev/badge/github.com/awaken/avro/v2.svg)](https://pkg.go.dev/github.com/awaken/avro/v2)
+[![GitHub release](https://img.shields.io/github/release/awaken/avro.svg)](https://github.com/awaken/avro/releases)
+[![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/awaken/avro/main/LICENCE)
 
-A fast Go avro codec
+A fast, security-hardened Go Avro codec.
 
-> [!WARNING]
-> This project is no longer maintained.
->
-> If you wish to update or extend `avro`, please do so in a fork.
-
-I am grateful for the contributions and support from the community over the years.
-
-This project was born out of necessity for a fast and reliable Avro codec for Go.
-It has been a labor of love, and I hope has served you well in your projects, but
-I no longer have the time to maintain it.
+This is a maintained fork of the archived
+[`hamba/avro`](https://github.com/hamba/avro), based on its final `v2.31.0`
+release. It fixes the 2026 array/map denial-of-service and integer-overflow
+advisories, adds bounded OCF decompression, hardens generated Go source, and
+keeps untrusted-input resource limits enabled by default.
 
 ## Overview
 
 Install with:
 
 ```shell
-go get github.com/hamba/avro/v2
+go get github.com/awaken/avro/v2
 ```
 
-**Note:** This project has renamed the default branch from `master` to `main`. You will need to update your local environment.
+See [CHANGELOG.md](CHANGELOG.md) for behavioral changes and
+[SECURITY.md](SECURITY.md) for the security policy.
+
+### Secure defaults
+
+The zero-value configuration limits strings and byte slices to 1 MiB, arrays
+and maps to 1,048,576 items, and OCF compressed/decompressed blocks to 64 MiB.
+An OCF block may declare at most 1,048,576 records. Applications can lower
+these budgets for their workloads. A negative value explicitly disables the
+corresponding limit and should be reserved for trusted input.
 
 ## Usage
 
@@ -75,7 +79,7 @@ fmt.Println(out)
 // Outputs: {27 foo}
 ```
 
-More examples in the [godoc](https://pkg.go.dev/github.com/hamba/avro/v2).
+More examples in the [godoc](https://pkg.go.dev/github.com/awaken/avro/v2).
 
 #### Types Conversions
 
@@ -243,7 +247,7 @@ You can use the avrogen command line tool to generate the structs, or use it as 
 Install the struct generator with:
 
 ```shell
-go install github.com/hamba/avro/v2/cmd/avrogen@<version>
+go install github.com/awaken/avro/v2/cmd/avrogen@<version>
 ```
 
 Example usage assuming there's a valid schema in `in.avsc`:
@@ -290,7 +294,7 @@ schemas to the console. It can be used in CI/CD pipelines to validate schema cha
 Install the Avro schema validator with:
 
 ```shell
-go install github.com/hamba/avro/v2/cmd/avrosv@<version>
+go install github.com/awaken/avro/v2/cmd/avrosv@<version>
 ```
 
 Example usage assuming there's a valid schema in `in.avsc` (exit status code is `0`):

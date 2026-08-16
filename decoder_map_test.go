@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/hamba/avro/v2"
+	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -146,12 +146,8 @@ func TestDecoder_MapUnmarshallerMap(t *testing.T) {
 type textUnmarshallerNope int
 
 func (t textUnmarshallerNope) UnmarshalText(text []byte) error {
-	i, err := strconv.Atoi(string(text))
-	if err != nil {
-		return err
-	}
-	t = textUnmarshallerNope(i)
-	return nil
+	_, err := strconv.Atoi(string(text))
+	return err
 }
 
 func TestDecoder_MapUnmarshallerMapImpossible(t *testing.T) {
@@ -199,4 +195,30 @@ func TestDecoder_MapInvalidKeyType(t *testing.T) {
 	err := dec.Decode(&got)
 
 	assert.Error(t, err)
+}
+
+func TestDecoder_MapLimitIsCumulativeAcrossBlocks(t *testing.T) {
+	defer ConfigTeardown()
+	avro.DefaultConfig = avro.Config{MaxMapAllocSize: 3}.Freeze()
+
+	var data bytes.Buffer
+	writer := avro.NewWriter(&data, 128)
+	for block := range 2 {
+		writer.WriteLong(2)
+		for item := range 2 {
+			writer.WriteString(strconv.Itoa(block*2 + item))
+			writer.WriteLong(int64(item))
+		}
+	}
+	writer.WriteLong(0)
+	require.NoError(t, writer.Flush())
+
+	decoder, err := avro.NewDecoder(`{"type":"map","values":"long"}`, bytes.NewReader(data.Bytes()))
+	require.NoError(t, err)
+
+	var values map[string]int64
+	err = decoder.Decode(&values)
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "MaxMapAllocSize")
 }

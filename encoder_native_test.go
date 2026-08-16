@@ -3,10 +3,11 @@ package avro_test
 import (
 	"bytes"
 	"math/big"
+	"strconv"
 	"testing"
 	"time"
 
-	"github.com/hamba/avro/v2"
+	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -269,6 +270,9 @@ func TestEncoder_Int64FromInt32(t *testing.T) {
 }
 
 func TestEncoder_Int64FromInt(t *testing.T) {
+	if strconv.IntSize != 64 {
+		t.Skipf("int size is %d, skipping test", strconv.IntSize)
+	}
 	defer ConfigTeardown()
 
 	schema := "long"
@@ -276,7 +280,8 @@ func TestEncoder_Int64FromInt(t *testing.T) {
 	enc, err := avro.NewEncoder(schema, buf)
 	require.NoError(t, err)
 
-	err = enc.Encode(2147483648)
+	value := int64(2147483648)
+	err = enc.Encode(int(value))
 
 	require.NoError(t, err)
 	assert.Equal(t, []byte{0x80, 0x80, 0x80, 0x80, 0x10}, buf.Bytes())

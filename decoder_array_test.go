@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/hamba/avro/v2"
+	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -141,6 +141,7 @@ func TestDecoder_ArrayMaxAllocationError(t *testing.T) {
 }
 
 func TestDecoder_ArrayExceedMaxSliceAllocationConfig(t *testing.T) {
+	defer ConfigTeardown()
 	avro.DefaultConfig = avro.Config{MaxSliceAllocSize: 5}.Freeze()
 
 	// 10 (long) gets encoded to 0x14
@@ -153,4 +154,29 @@ func TestDecoder_ArrayExceedMaxSliceAllocationConfig(t *testing.T) {
 	err = dec.Decode(&got)
 
 	assert.Error(t, err)
+}
+
+func TestDecoder_ArrayLimitIsCumulativeAcrossBlocks(t *testing.T) {
+	defer ConfigTeardown()
+	avro.DefaultConfig = avro.Config{MaxSliceAllocSize: 5}.Freeze()
+
+	var data bytes.Buffer
+	writer := avro.NewWriter(&data, 64)
+	for range 2 {
+		writer.WriteLong(3)
+		for value := range 3 {
+			writer.WriteLong(int64(value))
+		}
+	}
+	writer.WriteLong(0)
+	require.NoError(t, writer.Flush())
+
+	decoder, err := avro.NewDecoder(`{"type":"array","items":"long"}`, bytes.NewReader(data.Bytes()))
+	require.NoError(t, err)
+
+	var values []int64
+	err = decoder.Decode(&values)
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "MaxSliceAllocSize")
 }

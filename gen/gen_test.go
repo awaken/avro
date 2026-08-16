@@ -2,15 +2,19 @@ package gen_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
+	"go/ast"
 	"go/format"
+	"go/parser"
+	"go/token"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
 
-	"github.com/hamba/avro/v2"
-	"github.com/hamba/avro/v2/gen"
+	"github.com/awaken/avro/v2"
+	"github.com/awaken/avro/v2/gen"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -419,6 +423,47 @@ package {{ .PackageName }}
 	assert.Equal(t, string(want), string(formatted))
 }
 
+func TestStruct_HostileSchemaCannotInjectGoDeclarations(t *testing.T) {
+	avro.SkipNameValidation = true
+	defer func() {
+		avro.SkipNameValidation = false
+	}()
+
+	hostile := "x`; func init() { panic(1) }; var injected = `"
+	schema := map[string]any{
+		"type": "record",
+		"name": "Hostile" + hostile,
+		"fields": []any{
+			map[string]any{
+				"name": "field" + hostile,
+				"type": map[string]any{
+					"type":    "enum",
+					"name":    "Enum" + hostile,
+					"symbols": []string{"SAFE", hostile},
+				},
+			},
+		},
+	}
+	encoded, err := json.Marshal(schema)
+	require.NoError(t, err)
+
+	var output bytes.Buffer
+	err = gen.Struct(string(encoded), &output, gen.Config{
+		PackageName: "securitytest",
+		Encoders:    true,
+	})
+	require.NoError(t, err)
+
+	file, err := parser.ParseFile(token.NewFileSet(), "generated.go", output.Bytes(), 0)
+	require.NoError(t, err)
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && function.Name.Name == "init" {
+			t.Fatal("hostile schema injected an init function")
+		}
+	}
+}
+
 // generate is a utility to run the generation and return the result as a tuple
 func generate(t *testing.T, schema string, gc gen.Config) ([]byte, []string) {
 	t.Helper()
@@ -448,5 +493,5 @@ func removeSpaceAndEmptyLines(goCode []byte) []string {
 // removeMoreThanOneConsecutiveSpaces replaces all sequences of more than one space, with a single one
 func removeMoreThanOneConsecutiveSpaces(lineBytes []byte) string {
 	lines := strings.TrimSpace(string(lineBytes))
-	return strings.Join(regexp.MustCompile("\\s+|\\t+").Split(lines, -1), " ")
+	return strings.Join(regexp.MustCompile(`\s+|\t+`).Split(lines, -1), " ")
 }

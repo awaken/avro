@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/hamba/avro/v2"
+	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -98,4 +98,52 @@ func TestUnmarshal_NilPtr(t *testing.T) {
 	err := avro.Unmarshal(schema, []byte{0x01}, (*bool)(nil))
 
 	assert.Error(t, err)
+}
+
+func FuzzDecoder(f *testing.F) {
+	schema := avro.MustParse(`{
+		"type":"record",
+		"name":"FuzzRecord",
+		"fields":[
+			{"name":"text","type":"string"},
+			{"name":"values","type":{"type":"array","items":"long"}},
+			{"name":"labels","type":{"type":"map","values":"bytes"}},
+			{"name":"choice","type":["null","int"]}
+		]
+	}`)
+	config := avro.Config{
+		MaxByteSliceSize:  1 << 20,
+		MaxSliceAllocSize: 1 << 16,
+		MaxMapAllocSize:   1 << 16,
+	}.Freeze()
+
+	type record struct {
+		Text   string            `avro:"text"`
+		Values []int64           `avro:"values"`
+		Labels map[string][]byte `avro:"labels"`
+		Choice any               `avro:"choice"`
+	}
+
+	seed, err := config.Marshal(schema, record{
+		Text:   "seed",
+		Values: []int64{1, -2, 3},
+		Labels: map[string][]byte{"key": {0, 1, 2}},
+		Choice: map[string]any{"int": 7},
+	})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed)
+	f.Add([]byte{})
+	f.Add([]byte{0xff})
+
+	f.Fuzz(func(_ *testing.T, data []byte) {
+		if len(data) > 4<<20 {
+			return
+		}
+		var value record
+		_ = config.Unmarshal(schema, data, &value)
+		var generic any
+		_ = config.Unmarshal(schema, data, &generic)
+	})
 }

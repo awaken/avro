@@ -11,16 +11,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 
-	"github.com/hamba/avro/v2"
-	"github.com/hamba/avro/v2/internal/bytesx"
+	"github.com/awaken/avro/v2"
+	"github.com/awaken/avro/v2/internal/bytesx"
 	"github.com/klauspost/compress/zstd"
 )
 
 const (
 	schemaKey = "avro.schema"
 	codecKey  = "avro.codec"
+
+	defaultMaxBlockBytes             = 64 << 20
+	defaultMaxDecompressedBlockBytes = 64 << 20
+	defaultMaxBlockRecords           = 1_048_576
 )
 
 var (
@@ -54,9 +59,12 @@ type Header struct {
 }
 
 type decoderConfig struct {
-	DecoderConfig avro.API
-	SchemaCache   *avro.SchemaCache
-	CodecOptions  codecOptions
+	DecoderConfig             avro.API
+	SchemaCache               *avro.SchemaCache
+	CodecOptions              codecOptions
+	MaxBlockBytes             int
+	MaxDecompressedBlockBytes int
+	MaxBlockRecords           int
 }
 
 // DecoderFunc represents a configuration function for Decoder.
@@ -87,10 +95,47 @@ func WithZStandardDecoderOptions(opts ...zstd.DOption) DecoderFunc {
 // WithZStandardDecoder sets a pre-created ZStandard decoder to be reused.
 // This allows sharing a single decoder across multiple OCF decoders for efficiency.
 // The caller is responsible for closing the decoder after all OCF decoders are done.
+// Because the decoder's resource policy cannot be inspected, this option is rejected
+// while the decompressed block limit is active. Call WithMaxDecompressedBlockBytes(-1)
+// only when the shared decoder is independently bounded or the input is trusted.
 func WithZStandardDecoder(dec *zstd.Decoder) DecoderFunc {
 	return func(cfg *decoderConfig) {
 		cfg.CodecOptions.ZStandardOptions.Decoder = dec
 	}
+}
+
+// WithMaxBlockBytes sets the maximum compressed size of one OCF data block.
+// It defaults to 64 MiB. A negative value disables the limit.
+func WithMaxBlockBytes(size int) DecoderFunc {
+	return func(cfg *decoderConfig) {
+		cfg.MaxBlockBytes = size
+	}
+}
+
+// WithMaxDecompressedBlockBytes sets the maximum decompressed size of one OCF
+// data block. It defaults to 64 MiB. A negative value disables the limit.
+func WithMaxDecompressedBlockBytes(size int) DecoderFunc {
+	return func(cfg *decoderConfig) {
+		cfg.MaxDecompressedBlockBytes = size
+	}
+}
+
+// WithMaxBlockRecords sets the maximum record count declared by one OCF block.
+// It defaults to 1,048,576. A negative value disables the limit.
+func WithMaxBlockRecords(count int) DecoderFunc {
+	return func(cfg *decoderConfig) {
+		cfg.MaxBlockRecords = count
+	}
+}
+
+func resolveLimit(value, defaultValue int) int {
+	if value < 0 {
+		return 0
+	}
+	if value == 0 {
+		return defaultValue
+	}
+	return value
 }
 
 // Decoder reads and decodes Avro values from a container file.
@@ -104,7 +149,9 @@ type Decoder struct {
 
 	codec Codec
 
-	count int64
+	count           int64
+	maxBlockBytes   int
+	maxBlockRecords int
 }
 
 // NewDecoder returns a new decoder that reads from reader r.
@@ -120,7 +167,12 @@ func NewDecoder(r io.Reader, opts ...DecoderFunc) (*Decoder, error) {
 		opt(&cfg)
 	}
 
-	reader := avro.NewReader(r, 1024)
+	cfg.MaxBlockBytes = resolveLimit(cfg.MaxBlockBytes, defaultMaxBlockBytes)
+	cfg.MaxDecompressedBlockBytes = resolveLimit(cfg.MaxDecompressedBlockBytes, defaultMaxDecompressedBlockBytes)
+	cfg.MaxBlockRecords = resolveLimit(cfg.MaxBlockRecords, defaultMaxBlockRecords)
+	cfg.CodecOptions.MaxDecompressedBytes = cfg.MaxDecompressedBlockBytes
+
+	reader := avro.NewReader(r, 1024, avro.WithReaderConfig(cfg.DecoderConfig))
 
 	h, err := readHeader(reader, cfg.SchemaCache, cfg.CodecOptions)
 	if err != nil {
@@ -130,13 +182,15 @@ func NewDecoder(r io.Reader, opts ...DecoderFunc) (*Decoder, error) {
 	decReader := bytesx.NewResetReader([]byte{})
 
 	return &Decoder{
-		reader:      reader,
-		resetReader: decReader,
-		decoder:     cfg.DecoderConfig.NewDecoder(h.Schema, decReader),
-		meta:        h.Meta,
-		sync:        h.Sync,
-		codec:       h.Codec,
-		schema:      h.Schema,
+		reader:          reader,
+		resetReader:     decReader,
+		decoder:         cfg.DecoderConfig.NewDecoder(h.Schema, decReader),
+		meta:            h.Meta,
+		sync:            h.Sync,
+		codec:           h.Codec,
+		schema:          h.Schema,
+		maxBlockBytes:   cfg.MaxBlockBytes,
+		maxBlockRecords: cfg.MaxBlockRecords,
 	}, nil
 }
 
@@ -201,35 +255,87 @@ func (d *Decoder) readBlock() int64 {
 	}
 
 	count := d.reader.ReadLong()
-	size := d.reader.ReadLong()
-
-	// Read the blocks data
-	switch {
-	case count > 0:
-		data := make([]byte, size)
-		d.reader.Read(data)
-
-		data, err := d.codec.Decode(data)
-		if err != nil {
-			d.reader.Error = err
-		}
-
-		d.resetReader.Reset(data)
-
-	case size > 0:
-		// Skip the block data when count is 0
-		data := make([]byte, size)
-		d.reader.Read(data)
+	if d.reader.Error != nil {
+		d.reader.Error = errors.New("decoder: invalid block")
+		return 0
+	}
+	if count < 0 {
+		d.reader.ReportError("OCF read block", "negative record count")
+		return 0
+	}
+	if d.maxBlockRecords > 0 && count > int64(d.maxBlockRecords) {
+		d.reader.ReportError("OCF read block", "record count exceeds WithMaxBlockRecords")
+		return 0
 	}
 
-	// Read the sync.
+	size64 := d.reader.ReadLong()
+	if d.reader.Error != nil {
+		d.reader.Error = errors.New("decoder: invalid block")
+		return 0
+	}
+	if size64 < 0 {
+		d.reader.ReportError("OCF read block", "negative block size")
+		return 0
+	}
+	if size64 > math.MaxInt {
+		d.reader.ReportError("OCF read block", "block size exceeds the platform allocation limit")
+		return 0
+	}
+	if d.maxBlockBytes > 0 && size64 > int64(d.maxBlockBytes) {
+		d.reader.ReportError("OCF read block", "block size exceeds WithMaxBlockBytes")
+		return 0
+	}
+
+	data, err := readBlockData(d.reader, int(size64))
+	if err != nil {
+		d.reader.Error = err
+		return 0
+	}
+
 	var sync [16]byte
 	d.reader.Read(sync[:])
-	if d.sync != sync && !errors.Is(d.reader.Error, io.EOF) {
+	if d.reader.Error != nil || d.sync != sync {
 		d.reader.Error = errors.New("decoder: invalid block")
+		return 0
+	}
+
+	if count > 0 {
+		decoded, err := d.codec.Decode(data)
+		if err != nil {
+			d.reader.Error = fmt.Errorf("decoder: decompress block: %w", err)
+			return 0
+		}
+		d.resetReader.Reset(decoded)
 	}
 
 	return count
+}
+
+const blockReadChunkSize = 64 << 10
+
+func readBlockData(reader *avro.Reader, size int) ([]byte, error) {
+	if size == 0 {
+		return nil, nil
+	}
+	if size <= blockReadChunkSize {
+		data := make([]byte, size)
+		reader.Read(data)
+		return data, reader.Error
+	}
+
+	var data bytes.Buffer
+	data.Grow(blockReadChunkSize)
+	chunk := make([]byte, blockReadChunkSize)
+	for remaining := size; remaining > 0; {
+		readSize := min(remaining, len(chunk))
+		reader.Read(chunk[:readSize])
+		if reader.Error != nil {
+			return nil, reader.Error
+		}
+		_, _ = data.Write(chunk[:readSize])
+		remaining -= readSize
+	}
+	return data.Bytes(), nil
 }
 
 type encoderConfig struct {
@@ -622,12 +728,18 @@ func readHeader(reader *avro.Reader, schemaCache *avro.SchemaCache, codecOpts co
 
 func skipToEnd(reader *avro.Reader, sync [16]byte) error {
 	for {
-		_ = reader.ReadLong()
+		count := reader.ReadLong()
 		if errors.Is(reader.Error, io.EOF) {
 			return nil
 		}
+		if count < 0 {
+			return errors.New("ocf decoder: negative record count")
+		}
 		size := reader.ReadLong()
-		reader.SkipNBytes(int(size))
+		if size < 0 {
+			return errors.New("ocf decoder: negative block size")
+		}
+		reader.SkipNBytesInt64(size)
 		if reader.Error != nil {
 			return reader.Error
 		}

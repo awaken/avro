@@ -2,11 +2,12 @@ package avro_test
 
 import (
 	"bytes"
+	"math"
 	"math/big"
 	"testing"
 	"time"
 
-	"github.com/hamba/avro/v2"
+	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -217,4 +218,52 @@ func TestReader_ReadNextUnsupportedType(t *testing.T) {
 	_ = r.ReadNext(schema)
 
 	assert.Error(t, r.Error)
+}
+
+func TestReader_ReadArrayCallbackCanStop(t *testing.T) {
+	var data bytes.Buffer
+	writer := avro.NewWriter(&data, 16)
+	writer.WriteLong(3)
+	require.NoError(t, writer.Flush())
+
+	reader := avro.NewReader(bytes.NewReader(data.Bytes()), 16)
+	calls := 0
+	reader.ReadArrayCB(func(*avro.Reader) bool {
+		calls++
+		return false
+	})
+
+	require.NoError(t, reader.Error)
+	assert.Equal(t, 1, calls)
+}
+
+func TestReader_ReadArrayCallbackEnforcesBudget(t *testing.T) {
+	var data bytes.Buffer
+	writer := avro.NewWriter(&data, 16)
+	writer.WriteLong(3)
+	require.NoError(t, writer.Flush())
+
+	config := avro.Config{MaxSliceAllocSize: 2}.Freeze()
+	reader := avro.NewReader(bytes.NewReader(data.Bytes()), 16, avro.WithReaderConfig(config))
+	calls := 0
+	reader.ReadArrayCB(func(*avro.Reader) bool {
+		calls++
+		return true
+	})
+
+	assert.Zero(t, calls)
+	assert.Error(t, reader.Error)
+}
+
+func TestReader_ReadNextRejectsNarrowedUnionIndex(t *testing.T) {
+	var data bytes.Buffer
+	writer := avro.NewWriter(&data, 16)
+	writer.WriteLong(math.MaxInt64)
+	require.NoError(t, writer.Flush())
+
+	reader := avro.NewReader(bytes.NewReader(data.Bytes()), 16)
+	value := reader.ReadNext(avro.MustParse(`["null","string"]`))
+
+	assert.Nil(t, value)
+	assert.Error(t, reader.Error)
 }

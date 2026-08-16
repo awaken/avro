@@ -1,16 +1,20 @@
 package avro
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"unsafe"
 )
 
 const (
-	maxIntBufSize  = 5
-	maxLongBufSize = 10
+	maxIntBufSize            = 5
+	maxLongBufSize           = 10
+	defaultReaderBufferSize  = 512
+	maxConsecutiveEmptyReads = 100
 )
 
 // ReaderFunc is a function used to customize the Reader.
@@ -36,6 +40,9 @@ type Reader struct {
 
 // NewReader creates a new Reader.
 func NewReader(r io.Reader, bufSize int, opts ...ReaderFunc) *Reader {
+	if bufSize <= 0 {
+		bufSize = defaultReaderBufferSize
+	}
 	reader := &Reader{
 		cfg:    DefaultConfig.(*frozenConfig),
 		reader: r,
@@ -53,10 +60,14 @@ func NewReader(r io.Reader, bufSize int, opts ...ReaderFunc) *Reader {
 
 // Reset resets a Reader with a new byte array attached.
 func (r *Reader) Reset(b []byte) *Reader {
+	if r.cfg == nil {
+		r.cfg = DefaultConfig.(*frozenConfig)
+	}
 	r.reader = nil
 	r.buf = b
 	r.head = 0
 	r.tail = len(b)
+	r.Error = nil
 	return r
 }
 
@@ -78,12 +89,18 @@ func (r *Reader) loadMore() bool {
 		return false
 	}
 
-	for {
+	for emptyReads := 0; ; emptyReads++ {
 		n, err := r.reader.Read(r.buf)
 		if n == 0 {
 			if err != nil {
 				if r.Error == nil {
 					r.Error = err
+				}
+				return false
+			}
+			if emptyReads >= maxConsecutiveEmptyReads {
+				if r.Error == nil {
+					r.Error = io.ErrNoProgress
 				}
 				return false
 			}
@@ -97,16 +114,22 @@ func (r *Reader) loadMore() bool {
 }
 
 func (r *Reader) readByte() byte {
-	if r.head == r.tail {
-		if !r.loadMore() {
-			r.Error = io.ErrUnexpectedEOF
-			return 0
-		}
+	if r.head != r.tail {
+		r.head++
+		return r.buf[r.head-1]
 	}
 
+	return r.readByteSlow()
+}
+
+//go:noinline
+func (r *Reader) readByteSlow() byte {
+	if !r.loadMore() {
+		r.Error = io.ErrUnexpectedEOF
+		return 0
+	}
 	b := r.buf[r.head]
 	r.head++
-
 	return b
 }
 
@@ -158,35 +181,59 @@ func (r *Reader) ReadInt() int32 {
 		return 0
 	}
 
+	// Fast path: enough bytes remain for the largest encoded int.
+	if r.tail-r.head >= maxIntBufSize {
+		var value uint32
+		var shift uint8
+		for index, currentByte := range r.buf[r.head : r.head+maxIntBufSize] {
+			if index == maxIntBufSize-1 && currentByte > 0x0f {
+				r.ReportError("ReadInt", "int overflow")
+				return 0
+			}
+			value |= uint32(currentByte&0x7f) << shift
+			if currentByte&0x80 == 0 {
+				r.head += index + 1
+				return int32((value >> 1) ^ -(value & 1))
+			}
+			shift += 7
+		}
+		r.ReportError("ReadInt", "int overflow")
+		return 0
+	}
+
 	var (
-		n int
-		v uint32
-		s uint8
+		consumed int
+		value    uint32
+		shift    uint8
 	)
 
 	for {
 		tail := r.tail
-		if r.tail-r.head+n > maxIntBufSize {
-			tail = r.head + maxIntBufSize - n
+		if r.tail-r.head+consumed > maxIntBufSize {
+			tail = r.head + maxIntBufSize - consumed
 		}
 
 		// Consume what it is in the buffer.
-		var i int
-		for _, b := range r.buf[r.head:tail] {
-			v |= uint32(b&0x7f) << s
-			if b&0x80 == 0 {
-				r.head += i + 1
-				return int32((v >> 1) ^ -(v & 1))
+		var index int
+		for _, currentByte := range r.buf[r.head:tail] {
+			if consumed+index == maxIntBufSize-1 && currentByte > 0x0f {
+				r.ReportError("ReadInt", "int overflow")
+				return 0
 			}
-			s += 7
-			i++
+			value |= uint32(currentByte&0x7f) << shift
+			if currentByte&0x80 == 0 {
+				r.head += index + 1
+				return int32((value >> 1) ^ -(value & 1))
+			}
+			shift += 7
+			index++
 		}
-		if n >= maxIntBufSize {
+		if consumed >= maxIntBufSize {
 			r.ReportError("ReadInt", "int overflow")
 			return 0
 		}
-		r.head += i
-		n += i
+		r.head += index
+		consumed += index
 
 		// We ran out of buffer and are not at the end of the int,
 		// Read more into the buffer.
@@ -205,35 +252,59 @@ func (r *Reader) ReadLong() int64 {
 		return 0
 	}
 
+	// Fast path: enough bytes remain for the largest encoded long.
+	if r.tail-r.head >= maxLongBufSize {
+		var value uint64
+		var shift uint8
+		for index, currentByte := range r.buf[r.head : r.head+maxLongBufSize] {
+			if index == maxLongBufSize-1 && currentByte > 0x01 {
+				r.ReportError("ReadLong", "int overflow")
+				return 0
+			}
+			value |= uint64(currentByte&0x7f) << shift
+			if currentByte&0x80 == 0 {
+				r.head += index + 1
+				return int64((value >> 1) ^ -(value & 1))
+			}
+			shift += 7
+		}
+		r.ReportError("ReadLong", "int overflow")
+		return 0
+	}
+
 	var (
-		n int
-		v uint64
-		s uint8
+		consumed int
+		value    uint64
+		shift    uint8
 	)
 
 	for {
 		tail := r.tail
-		if r.tail-r.head+n > maxLongBufSize {
-			tail = r.head + maxLongBufSize - n
+		if r.tail-r.head+consumed > maxLongBufSize {
+			tail = r.head + maxLongBufSize - consumed
 		}
 
 		// Consume what it is in the buffer.
-		var i int
-		for _, b := range r.buf[r.head:tail] {
-			v |= uint64(b&0x7f) << s
-			if b&0x80 == 0 {
-				r.head += i + 1
-				return int64((v >> 1) ^ -(v & 1))
+		var index int
+		for _, currentByte := range r.buf[r.head:tail] {
+			if consumed+index == maxLongBufSize-1 && currentByte > 0x01 {
+				r.ReportError("ReadLong", "int overflow")
+				return 0
 			}
-			s += 7
-			i++
+			value |= uint64(currentByte&0x7f) << shift
+			if currentByte&0x80 == 0 {
+				r.head += index + 1
+				return int64((value >> 1) ^ -(value & 1))
+			}
+			shift += 7
+			index++
 		}
-		if n >= maxLongBufSize {
+		if consumed >= maxLongBufSize {
 			r.ReportError("ReadLong", "int overflow")
 			return 0
 		}
-		r.head += i
-		n += i
+		r.head += index
+		consumed += index
 
 		// We ran out of buffer and are not at the end of the long,
 		// Read more into the buffer.
@@ -248,18 +319,14 @@ func (r *Reader) ReadLong() int64 {
 func (r *Reader) ReadFloat() float32 {
 	var buf [4]byte
 	r.Read(buf[:])
-
-	float := *(*float32)(unsafe.Pointer(&buf[0]))
-	return float
+	return math.Float32frombits(binary.LittleEndian.Uint32(buf[:]))
 }
 
 // ReadDouble reads a Double from the Reader.
 func (r *Reader) ReadDouble() float64 {
 	var buf [8]byte
 	r.Read(buf[:])
-
-	float := *(*float64)(unsafe.Pointer(&buf[0]))
-	return float
+	return math.Float64frombits(binary.LittleEndian.Uint64(buf[:]))
 }
 
 // ReadBytes reads Bytes from the Reader.
@@ -278,20 +345,26 @@ func (r *Reader) ReadString() string {
 }
 
 func (r *Reader) readBytes(op string) []byte {
-	size := int(r.ReadLong())
-	if size < 0 {
+	size64 := r.ReadLong()
+	if size64 < 0 {
 		fnName := "Read" + strings.ToTitle(op)
 		r.ReportError(fnName, "invalid "+op+" length")
 		return nil
 	}
-	if size == 0 {
+	if size64 == 0 {
 		return []byte{}
 	}
-	if maxSize := r.cfg.getMaxByteSliceSize(); maxSize > 0 && size > maxSize {
+	if maxSize := r.cfg.getMaxByteSliceSize(); maxSize > 0 && size64 > int64(maxSize) {
 		fnName := "Read" + strings.ToTitle(op)
 		r.ReportError(fnName, "size is greater than `Config.MaxByteSliceSize`")
 		return nil
 	}
+	if size64 > int64(maxAllocSize) {
+		fnName := "Read" + strings.ToTitle(op)
+		r.ReportError(fnName, op+" length exceeds the platform allocation limit")
+		return nil
+	}
+	size := int(size64)
 
 	// The bytes are entirely in the buffer and of a reasonable size.
 	// Use the byte slab.
@@ -299,7 +372,7 @@ func (r *Reader) readBytes(op string) []byte {
 		if cap(r.slab) < size {
 			r.slab = make([]byte, 1024)
 		}
-		dst := r.slab[:size]
+		dst := r.slab[:size:size]
 		r.slab = r.slab[size:]
 		copy(dst, r.buf[r.head:r.head+size])
 		r.head += size
@@ -314,8 +387,22 @@ func (r *Reader) readBytes(op string) []byte {
 // ReadBlockHeader reads a Block Header from the Reader.
 func (r *Reader) ReadBlockHeader() (int64, int64) {
 	length := r.ReadLong()
+	if r.Error != nil {
+		return 0, 0
+	}
 	if length < 0 {
+		if length == math.MinInt64 {
+			r.ReportError("ReadBlockHeader", "block count cannot be math.MinInt64")
+			return 0, 0
+		}
 		size := r.ReadLong()
+		if r.Error != nil {
+			return 0, 0
+		}
+		if size < 0 {
+			r.ReportError("ReadBlockHeader", "invalid negative block size")
+			return 0, 0
+		}
 
 		return -length, size
 	}

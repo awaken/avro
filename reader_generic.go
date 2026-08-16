@@ -97,11 +97,12 @@ func (r *Reader) ReadNext(schema Schema) any {
 		return obj
 	case Union:
 		types := schema.(*UnionSchema).Types()
-		idx := int(r.ReadLong())
-		if idx < 0 || idx > len(types)-1 {
+		idx64 := r.ReadLong()
+		if idx64 < 0 || idx64 > int64(len(types)-1) {
 			r.ReportError("Read", "unknown union type")
 			return nil
 		}
+		idx := int(idx64)
 		schema = types[idx]
 		if schema.Type() == Null {
 			return nil
@@ -128,28 +129,44 @@ func (r *Reader) ReadNext(schema Schema) any {
 
 // ReadArrayCB reads an array with a callback per item.
 func (r *Reader) ReadArrayCB(fn func(*Reader) bool) {
+	remaining := int64(r.cfg.getMaxSliceAllocSize())
 	for {
 		l, _ := r.ReadBlockHeader()
-		if l == 0 {
+		if l == 0 || r.Error != nil {
 			break
 		}
+		if l > remaining {
+			r.ReportError("ReadArrayCB", "size is greater than `Config.MaxSliceAllocSize`")
+			return
+		}
+		remaining -= l
 		for range l {
-			fn(r)
+			if !fn(r) || r.Error != nil {
+				return
+			}
 		}
 	}
 }
 
-// ReadMapCB reads an array with a callback per item.
+// ReadMapCB reads a map with a callback per item.
 func (r *Reader) ReadMapCB(fn func(*Reader, string) bool) {
+	remaining := int64(r.cfg.getMaxMapAllocSize())
 	for {
 		l, _ := r.ReadBlockHeader()
-		if l == 0 {
+		if l == 0 || r.Error != nil {
 			break
 		}
+		if l > remaining {
+			r.ReportError("ReadMapCB", "size is greater than `Config.MaxMapAllocSize`")
+			return
+		}
+		remaining -= l
 
 		for range l {
 			field := r.ReadString()
-			fn(r, field)
+			if r.Error != nil || !fn(r, field) || r.Error != nil {
+				return
+			}
 		}
 	}
 }

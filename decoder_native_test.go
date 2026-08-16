@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hamba/avro/v2"
+	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -100,7 +100,7 @@ func TestDecoder_Int_Long(t *testing.T) {
 	err = dec.Decode(&i)
 
 	require.NoError(t, err)
-	assert.Equal(t, 2147483648, i)
+	assert.Equal(t, int64(2147483648), int64(i))
 }
 
 func TestDecoder_IntShortRead(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/hamba/avro/v2"
+	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -870,6 +870,16 @@ func TestUnionSchema(t *testing.T) {
 		{
 			name:    "Invalid Type",
 			schema:  `["null", "blah"]`,
+			wantErr: require.Error,
+		},
+		{
+			name:    "Empty Union",
+			schema:  `[]`,
+			wantErr: require.Error,
+		},
+		{
+			name:    "Empty Union In Record Field",
+			schema:  `{"type":"record","name":"R","fields":[{"name":"f","type":[]}]}`,
 			wantErr: require.Error,
 		},
 	}
@@ -2274,4 +2284,24 @@ func TestConcurrentParse(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func FuzzSchemaParse(f *testing.F) {
+	for _, schema := range []string{
+		`"null"`,
+		`{"type":"array","items":"long"}`,
+		`{"type":"map","values":"string"}`,
+		`["null","int","string"]`,
+		`{"type":"record","name":"R","fields":[{"name":"value","type":"bytes"}]}`,
+	} {
+		f.Add([]byte(schema))
+	}
+	f.Add([]byte{})
+
+	f.Fuzz(func(_ *testing.T, data []byte) {
+		if len(data) > 4<<20 {
+			return
+		}
+		_, _ = avro.ParseBytes(data)
+	})
 }

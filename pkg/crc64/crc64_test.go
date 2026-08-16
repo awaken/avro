@@ -82,6 +82,29 @@ func TestDigest_BlockSize(t *testing.T) {
 	assert.Equal(t, 1, hash.BlockSize())
 }
 
+func TestDigest_API(t *testing.T) {
+	hash := NewWithByteOrder(LittleEndian)
+
+	written, err := hash.Write([]byte(`"null"`))
+	assert.NoError(t, err)
+	assert.Equal(t, len(`"null"`), written)
+	assert.Equal(t, Size, hash.Size())
+	assert.Equal(t, []byte{0xaa, 0xbb, 0x8a, 0x8f, 0x25, 0xcc, 0xe7, 0x24, 0xdd, 0x63}, hash.Sum([]byte{0xaa, 0xbb}))
+
+	hash.Reset()
+	assert.Equal(t, uint64(Empty), hash.Sum64())
+}
+
+func TestSum(t *testing.T) {
+	assert.Equal(t, [Size]byte{0x63, 0xdd, 0x24, 0xe7, 0xcc, 0x25, 0x8f, 0x8a}, Sum([]byte(`"null"`)))
+}
+
+func TestDigest_UnknownByteOrderPanics(t *testing.T) {
+	assert.Panics(t, func() {
+		_ = newDigest(ByteOrder(99)).sumBytes()
+	})
+}
+
 func TestGoldenSumWithByteOrder(t *testing.T) {
 	tests := []struct {
 		in string

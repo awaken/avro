@@ -26,6 +26,9 @@ type Writer struct {
 
 // NewWriter creates a new Writer.
 func NewWriter(out io.Writer, bufSize int, opts ...WriterFunc) *Writer {
+	if bufSize < 0 {
+		bufSize = 0
+	}
 	writer := &Writer{
 		cfg:   DefaultConfig.(*frozenConfig),
 		out:   out,
@@ -44,6 +47,7 @@ func NewWriter(out io.Writer, bufSize int, opts ...WriterFunc) *Writer {
 func (w *Writer) Reset(out io.Writer) {
 	w.out = out
 	w.buf = w.buf[:0]
+	w.Error = nil
 }
 
 // Buffered returns the number of buffered bytes.
@@ -113,36 +117,27 @@ func (w *Writer) WriteLong(i int64) {
 }
 
 func (w *Writer) encodeInt(i uint64) {
-	if i == 0 {
-		w.writeByte(0)
-		return
-	}
+	w.buf = appendVarint(w.buf, i)
+}
 
-	for i > 0 {
-		b := byte(i) & 0x7F
-		i >>= 7
-
-		if i != 0 {
-			b |= 0x80
-		}
-		w.writeByte(b)
+func appendVarint(buffer []byte, value uint64) []byte {
+	if value < 0x80 {
+		return append(buffer, byte(value))
 	}
+	if value < 0x4000 {
+		return append(buffer, byte(value)|0x80, byte(value>>7))
+	}
+	return binary.AppendUvarint(buffer, value)
 }
 
 // WriteFloat writes a Float to the Writer.
 func (w *Writer) WriteFloat(f float32) {
-	b := make([]byte, 4)
-	binary.LittleEndian.PutUint32(b, math.Float32bits(f))
-
-	w.buf = append(w.buf, b...)
+	w.buf = binary.LittleEndian.AppendUint32(w.buf, math.Float32bits(f))
 }
 
 // WriteDouble writes a Double to the Writer.
 func (w *Writer) WriteDouble(f float64) {
-	b := make([]byte, 8)
-	binary.LittleEndian.PutUint64(b, math.Float64bits(f))
-
-	w.buf = append(w.buf, b...)
+	w.buf = binary.LittleEndian.AppendUint64(w.buf, math.Float64bits(f))
 }
 
 // WriteBytes writes Bytes to the Writer.

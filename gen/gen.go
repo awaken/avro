@@ -9,12 +9,15 @@ import (
 	"io"
 	"maps"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"text/template"
+	"unicode"
 	"unicode/utf8"
 
+	"github.com/awaken/avro/v2"
 	"github.com/ettle/strcase"
-	"github.com/hamba/avro/v2"
 	"golang.org/x/tools/imports"
 )
 
@@ -102,7 +105,6 @@ func StructFromSchema(schema avro.Schema, w io.Writer, cfg Config) error {
 
 	formatted, err := imports.Process("", buf.Bytes(), nil)
 	if err != nil {
-		_, _ = w.Write(buf.Bytes())
 		return fmt.Errorf("generated code could not be formatted: %w", err)
 	}
 
@@ -127,7 +129,7 @@ func WithEncoders(b bool) OptsFunc {
 	return func(g *Generator) {
 		g.encoders = b
 		if b {
-			g.thirdPartyImports = append(g.thirdPartyImports, "github.com/hamba/avro/v2")
+			g.thirdPartyImports = append(g.thirdPartyImports, "github.com/awaken/avro/v2")
 		}
 	}
 }
@@ -326,23 +328,55 @@ func (g *Generator) generate(schema avro.Schema, metadata any) string {
 	}
 }
 
+func sanitizeIdentifier(name string) string {
+	var identifier strings.Builder
+	for _, char := range name {
+		if char == '_' || unicode.IsLetter(char) || unicode.IsDigit(char) {
+			identifier.WriteRune(char)
+		}
+	}
+
+	value := identifier.String()
+	if value == "" {
+		return "_"
+	}
+	first, _ := utf8.DecodeRuneInString(value)
+	if unicode.IsDigit(first) {
+		return "_" + value
+	}
+	return value
+}
+
 func (g *Generator) resolveEnum(s *avro.EnumSchema) string {
-	g.typeenums = append(g.typeenums, newTypeEnum(s.Name(), s.Symbols()))
-	return s.Name()
+	name := sanitizeIdentifier(g.nameCaser.ToPascal(s.Name()))
+	if !g.hasTypeEnum(name) {
+		g.typeenums = append(g.typeenums, newTypeEnum(name, s.Symbols()))
+	}
+	return name
+}
+
+func (g *Generator) hasTypeEnum(name string) bool {
+	for _, enum := range g.typeenums {
+		if enum.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Generator) resolveTypeName(s avro.NamedSchema) string {
 	if g.fullName {
-		return g.nameCaser.ToPascal(s.FullName())
+		return sanitizeIdentifier(g.nameCaser.ToPascal(s.FullName()))
 	}
-	return g.nameCaser.ToPascal(s.Name())
+	return sanitizeIdentifier(g.nameCaser.ToPascal(s.Name()))
 }
 
 func (g *Generator) resolveRecordSchema(schema *avro.RecordSchema, metadata any) string {
 	fields := make([]field, len(schema.Fields()))
 	for i, f := range schema.Fields() {
 		typ := g.generate(f.Type(), metadata)
-		fields[i] = g.newField(g.nameCaser.ToPascal(f.Name()), typ, f.Doc(), f.Name(), f.Props())
+		name := sanitizeIdentifier(g.nameCaser.ToPascal(f.Name()))
+		fields[i] = g.newField(name, typ, f.Doc(), f.Name(), f.Props())
 	}
 
 	typeName := g.resolveTypeName(schema)
@@ -431,7 +465,7 @@ func (g *Generator) resolveLogicalSchema(logicalType avro.LogicalType) string {
 		g.addImport("math/big")
 	}
 	if strings.Contains(typ, "avro") {
-		g.addThirdPartyImport("github.com/hamba/avro/v2")
+		g.addThirdPartyImport("github.com/awaken/avro/v2")
 	}
 	return typ
 }
@@ -465,11 +499,13 @@ func (g *Generator) addThirdPartyImport(pkg string) {
 func (g *Generator) Write(w io.Writer) error {
 	parsed, err := template.New("out").
 		Funcs(template.FuncMap{
-			"kebab":      strcase.ToKebab,
-			"upperCamel": strcase.ToPascal,
-			"camel":      strcase.ToCamel,
-			"snake":      strcase.ToSnake,
-			"replace":    strings.Replace,
+			"kebab":         strcase.ToKebab,
+			"upperCamel":    strcase.ToPascal,
+			"camel":         strcase.ToCamel,
+			"snake":         strcase.ToSnake,
+			"replace":       strings.Replace,
+			"buildTag":      buildTag,
+			"enumConstName": enumConstName,
 		}).
 		Parse(g.template)
 	if err != nil {
@@ -524,6 +560,45 @@ type field struct {
 	AvroFieldName string
 	Tags          map[string]TagStyle
 	Props         map[string]any
+}
+
+func buildTag(f field) string {
+	names := make([]string, 0, len(f.Tags))
+	for name := range f.Tags {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var tag strings.Builder
+	tag.WriteString("avro:")
+	tag.WriteString(strconv.Quote(f.AvroFieldName))
+	for _, name := range names {
+		value := f.AvroFieldName
+		switch f.Tags[name] {
+		case Kebab:
+			value = strcase.ToKebab(value)
+		case UpperCamel:
+			value = strcase.ToPascal(value)
+		case Camel:
+			value = strcase.ToCamel(value)
+		case Snake:
+			value = strcase.ToSnake(value)
+		}
+		tag.WriteByte(' ')
+		tag.WriteString(name)
+		tag.WriteByte(':')
+		tag.WriteString(strconv.Quote(value))
+	}
+
+	value := tag.String()
+	if strings.ContainsRune(value, '`') {
+		return strconv.Quote(value)
+	}
+	return "`" + value + "`"
+}
+
+func enumConstName(typeName, symbol string) string {
+	return sanitizeIdentifier(typeName + strcase.ToPascal(symbol))
 }
 
 type typeenum struct {

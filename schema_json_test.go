@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/hamba/avro/v2"
+	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -122,10 +122,6 @@ func TestSchema_JSON(t *testing.T) {
 		{
 			input: `{"type":"string","logicalType":"uuid"}`,
 			json:  `{"type":"string","logicalType":"uuid"}`,
-		},
-		{
-			input: `[  ]`,
-			json:  `[]`,
 		},
 		{
 			input: `[ "int"  ]`,

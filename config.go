@@ -9,7 +9,8 @@ import (
 )
 
 const (
-	defaultMaxByteSliceSize = 1_048_576 // 1 MiB
+	defaultMaxByteSliceSize  = 1_048_576 // 1 MiB
+	defaultMaxCollectionSize = 1_048_576
 )
 
 // DefaultConfig is the default API.
@@ -52,10 +53,15 @@ type Config struct {
 	// If this size is exceeded, the Reader returns an error. This can be disabled by setting a negative number.
 	MaxByteSliceSize int
 
-	// MaxSliceAllocSize is the maximum size that the decoder will allocate, set to the max heap
-	// allocation size by default.
-	// If this size is exceeded, the decoder returns an error.
+	// MaxSliceAllocSize is the maximum number of elements the decoder will add to one slice.
+	// It defaults to 1,048,576 and is enforced cumulatively across all array blocks.
+	// A negative value disables the limit. If the limit is exceeded, decoding returns an error.
 	MaxSliceAllocSize int
+
+	// MaxMapAllocSize is the maximum number of entries the decoder will add to one map.
+	// It defaults to 1,048,576 and is enforced cumulatively across all map blocks.
+	// A negative value disables the limit. If the limit is exceeded, decoding returns an error.
+	MaxMapAllocSize int
 }
 
 // Freeze makes the configuration immutable.
@@ -299,8 +305,22 @@ func (c *frozenConfig) getMaxByteSliceSize() int {
 
 func (c *frozenConfig) getMaxSliceAllocSize() int {
 	size := c.config.MaxSliceAllocSize
-	if size > maxAllocSize || size <= 0 {
+	if size < 0 || size > maxAllocSize {
 		return maxAllocSize
+	}
+	if size == 0 {
+		return defaultMaxCollectionSize
+	}
+	return size
+}
+
+func (c *frozenConfig) getMaxMapAllocSize() int {
+	size := c.config.MaxMapAllocSize
+	if size < 0 || size > maxAllocSize {
+		return maxAllocSize
+	}
+	if size == 0 {
+		return defaultMaxCollectionSize
 	}
 	return size
 }

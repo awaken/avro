@@ -40,6 +40,7 @@ type arrayDecoder struct {
 
 func (d *arrayDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 	var size int
+	maxSize := int64(r.cfg.getMaxSliceAllocSize())
 	sliceType := d.typ
 
 	if sliceType.UnsafeIsNil(ptr) {
@@ -48,17 +49,16 @@ func (d *arrayDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 
 	for {
 		l, _ := r.ReadBlockHeader()
-		if l == 0 {
+		if l == 0 || r.Error != nil {
 			break
 		}
 
-		start := size
-		size += int(l)
-
-		if size > r.cfg.getMaxSliceAllocSize() {
+		if l > maxSize-int64(size) {
 			r.ReportError("decode array", "size is greater than `Config.MaxSliceAllocSize`")
 			return
 		}
+		start := size
+		size += int(l)
 
 		sliceType.UnsafeGrow(ptr, size)
 

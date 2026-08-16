@@ -1,7 +1,29 @@
 package avro
 
+import "math"
+
+// SkipNBytesInt64 skips n bytes without narrowing an untrusted wire length.
+func (r *Reader) SkipNBytesInt64(n int64) {
+	if n < 0 {
+		r.ReportError("SkipNBytesInt64", "negative byte count")
+		return
+	}
+	for n > 0 {
+		chunk := min(n, int64(math.MaxInt))
+		r.SkipNBytes(int(chunk))
+		if r.Error != nil {
+			return
+		}
+		n -= chunk
+	}
+}
+
 // SkipNBytes skips the given number of bytes in the reader.
 func (r *Reader) SkipNBytes(n int) {
+	if n < 0 {
+		r.ReportError("SkipNBytes", "negative byte count")
+		return
+	}
 	read := 0
 	for read < n {
 		if r.head == r.tail {
@@ -63,17 +85,11 @@ func (r *Reader) SkipDouble() {
 // SkipString skips a String in the reader.
 func (r *Reader) SkipString() {
 	size := r.ReadLong()
-	if size <= 0 {
-		return
-	}
-	r.SkipNBytes(int(size))
+	r.SkipNBytesInt64(size)
 }
 
 // SkipBytes skips Bytes in the reader.
 func (r *Reader) SkipBytes() {
 	size := r.ReadLong()
-	if size <= 0 {
-		return
-	}
-	r.SkipNBytes(int(size))
+	r.SkipNBytesInt64(size)
 }

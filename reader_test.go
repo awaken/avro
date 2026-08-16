@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math"
 	"strconv"
 	"testing"
 
-	"github.com/hamba/avro/v2"
+	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -234,6 +235,12 @@ func TestReader_ReadInt(t *testing.T) {
 			wantErr: require.Error,
 		},
 		{
+			name:    "overflow in final byte",
+			data:    []byte{0xff, 0xff, 0xff, 0xff, 0x10},
+			want:    0,
+			wantErr: require.Error,
+		},
+		{
 			name:    "eof",
 			data:    []byte{0xe2},
 			want:    0,
@@ -351,6 +358,12 @@ func TestReader_ReadLong(t *testing.T) {
 			wantErr: require.Error,
 		},
 		{
+			name:    "overflow in final byte",
+			data:    []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02},
+			want:    0,
+			wantErr: require.Error,
+		},
+		{
 			name:    "eof",
 			data:    []byte{0xe2},
 			want:    0,
@@ -366,6 +379,33 @@ func TestReader_ReadLong(t *testing.T) {
 
 			test.wantErr(t, r.Error)
 			assert.Equal(t, test.want, got)
+		})
+	}
+}
+
+func TestReaderRejectsFinalVarintByteOverflowAcrossSmallBuffers(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		read func(*avro.Reader)
+	}{
+		{
+			name: "int",
+			data: []byte{0xff, 0xff, 0xff, 0xff, 0x10},
+			read: func(reader *avro.Reader) { reader.ReadInt() },
+		},
+		{
+			name: "long",
+			data: []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02},
+			read: func(reader *avro.Reader) { reader.ReadLong() },
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reader := avro.NewReader(bytes.NewReader(test.data), 1)
+			test.read(reader)
+			require.ErrorContains(t, reader.Error, "overflow")
 		})
 	}
 }
@@ -708,9 +748,81 @@ func TestReader_ReadBlockHeader(t *testing.T) {
 	}
 }
 
+func TestReader_ReadBytesDoesNotExposeSlabCapacity(t *testing.T) {
+	var data bytes.Buffer
+	writer := avro.NewWriter(&data, 16)
+	writer.WriteBytes([]byte("a"))
+	writer.WriteBytes([]byte("bc"))
+	require.NoError(t, writer.Flush())
+
+	reader := avro.NewReader(bytes.NewReader(data.Bytes()), 16)
+	first := reader.ReadBytes()
+	appended := append(first, 'x')
+	second := reader.ReadBytes()
+
+	require.NoError(t, reader.Error)
+	assert.Equal(t, []byte("ax"), appended)
+	assert.Equal(t, []byte("bc"), second)
+}
+
+func TestReader_RejectsUnallocatableByteLength(t *testing.T) {
+	var data bytes.Buffer
+	writer := avro.NewWriter(&data, 16)
+	writer.WriteLong(math.MaxInt64)
+	require.NoError(t, writer.Flush())
+
+	config := avro.Config{MaxByteSliceSize: -1}.Freeze()
+	reader := avro.NewReader(bytes.NewReader(data.Bytes()), 16, avro.WithReaderConfig(config))
+
+	assert.Nil(t, reader.ReadBytes())
+	assert.Error(t, reader.Error)
+}
+
+func TestReader_RejectsInvalidBlockHeaders(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []int64
+	}{
+		{name: "minimum count", values: []int64{math.MinInt64}},
+		{name: "negative byte size", values: []int64{-1, -1}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var data bytes.Buffer
+			writer := avro.NewWriter(&data, 16)
+			for _, value := range test.values {
+				writer.WriteLong(value)
+			}
+			require.NoError(t, writer.Flush())
+
+			reader := avro.NewReader(bytes.NewReader(data.Bytes()), 16)
+			length, size := reader.ReadBlockHeader()
+
+			assert.Zero(t, length)
+			assert.Zero(t, size)
+			assert.Error(t, reader.Error)
+		})
+	}
+}
+
+func TestReader_StopsAfterNoProgress(t *testing.T) {
+	reader := avro.NewReader(noProgressReader{}, 16)
+
+	_ = reader.ReadInt()
+
+	assert.ErrorIs(t, reader.Error, io.ErrNoProgress)
+}
+
 type delayedReader struct {
 	count int
 	b     []byte
+}
+
+type noProgressReader struct{}
+
+func (noProgressReader) Read([]byte) (int, error) {
+	return 0, nil
 }
 
 func (r *delayedReader) Read(p []byte) (n int, err error) {

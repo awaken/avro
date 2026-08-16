@@ -57,15 +57,21 @@ type mapDecoder struct {
 }
 
 func (d *mapDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
+	var size int64
 	if d.mapType.UnsafeIsNil(ptr) {
 		d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(0))
 	}
 
 	for {
 		l, _ := r.ReadBlockHeader()
-		if l == 0 {
+		if l == 0 || r.Error != nil {
 			break
 		}
+		if l > int64(r.cfg.getMaxMapAllocSize())-size {
+			r.ReportError("decode map", "size is greater than `Config.MaxMapAllocSize`")
+			return
+		}
+		size += l
 
 		for range l {
 			keyPtr := reflect2.PtrOf(r.ReadString())
@@ -105,15 +111,21 @@ type mapDecoderUnmarshaler struct {
 }
 
 func (d *mapDecoderUnmarshaler) Decode(ptr unsafe.Pointer, r *Reader) {
+	var size int64
 	if d.mapType.UnsafeIsNil(ptr) {
 		d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(0))
 	}
 
 	for {
 		l, _ := r.ReadBlockHeader()
-		if l == 0 {
+		if l == 0 || r.Error != nil {
 			break
 		}
+		if l > int64(r.cfg.getMaxMapAllocSize())-size {
+			r.ReportError("decode map", "size is greater than `Config.MaxMapAllocSize`")
+			return
+		}
+		size += l
 
 		for range l {
 			keyPtr := d.keyType.UnsafeNew()
@@ -125,14 +137,20 @@ func (d *mapDecoderUnmarshaler) Decode(ptr unsafe.Pointer, r *Reader) {
 				keyObj = d.keyType.UnsafeIndirect(keyPtr)
 			}
 			unmarshaler := keyObj.(encoding.TextUnmarshaler)
-			err := unmarshaler.UnmarshalText([]byte(r.ReadString()))
-			if err != nil {
+			key := r.ReadBytes()
+			if r.Error != nil {
+				return
+			}
+			if err := unmarshaler.UnmarshalText(key); err != nil {
 				r.ReportError("mapDecoderUnmarshaler", err.Error())
 				return
 			}
 
 			elemPtr := d.elemType.UnsafeNew()
 			d.decoder.Decode(elemPtr, r)
+			if r.Error != nil {
+				return
+			}
 
 			d.mapType.UnsafeSetIndex(ptr, keyPtr, elemPtr)
 		}

@@ -17,5 +17,6 @@ import (
 //go:nosplit
 func noescape(p unsafe.Pointer) unsafe.Pointer {
 	x := uintptr(p)
+	//lint:ignore SA4016 This identity expression intentionally hides the pointer from escape analysis.
 	return unsafe.Pointer(x ^ 0)
 }

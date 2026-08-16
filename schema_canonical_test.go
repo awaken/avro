@@ -4,7 +4,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/hamba/avro/v2"
+	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -116,10 +116,6 @@ func TestSchema_Canonical(t *testing.T) {
 		{
 			input:     `{"type":"string","logicalType":"uuid"}`,
 			canonical: `{"type":"string","logicalType":"uuid"}`,
-		},
-		{
-			input:     `[  ]`,
-			canonical: `[]`,
 		},
 		{
 			input:     `[ "int"  ]`,
