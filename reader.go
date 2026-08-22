@@ -29,13 +29,14 @@ func WithReaderConfig(cfg API) ReaderFunc {
 
 // Reader is an Avro specific io.Reader.
 type Reader struct {
-	cfg    *frozenConfig
-	reader io.Reader
-	slab   []byte
-	buf    []byte
-	head   int
-	tail   int
-	Error  error
+	cfg        *frozenConfig
+	reader     io.Reader
+	slab       []byte
+	buf        []byte
+	head       int
+	tail       int
+	pendingErr error
+	Error      error
 }
 
 // NewReader creates a new Reader.
@@ -67,6 +68,7 @@ func (r *Reader) Reset(b []byte) *Reader {
 	r.buf = b
 	r.head = 0
 	r.tail = len(b)
+	r.pendingErr = nil
 	r.Error = nil
 	return r
 }
@@ -81,6 +83,14 @@ func (r *Reader) ReportError(operation, msg string) {
 }
 
 func (r *Reader) loadMore() bool {
+	if r.pendingErr != nil {
+		if r.Error == nil {
+			r.Error = r.pendingErr
+		}
+		r.pendingErr = nil
+		return false
+	}
+
 	if r.reader == nil {
 		if r.Error == nil {
 			r.head = r.tail
@@ -109,7 +119,14 @@ func (r *Reader) loadMore() bool {
 
 		r.head = 0
 		r.tail = n
+		r.pendingErr = err
 		return true
+	}
+}
+
+func (r *Reader) reportUnexpectedEOF() {
+	if r.Error == nil || errors.Is(r.Error, io.EOF) {
+		r.Error = io.ErrUnexpectedEOF
 	}
 }
 
@@ -125,7 +142,7 @@ func (r *Reader) readByte() byte {
 //go:noinline
 func (r *Reader) readByteSlow() byte {
 	if !r.loadMore() {
-		r.Error = io.ErrUnexpectedEOF
+		r.reportUnexpectedEOF()
 		return 0
 	}
 	b := r.buf[r.head]
@@ -152,7 +169,7 @@ func (r *Reader) Read(b []byte) {
 	for read < size {
 		if r.head == r.tail {
 			if !r.loadMore() {
-				r.Error = io.ErrUnexpectedEOF
+				r.reportUnexpectedEOF()
 				return
 			}
 		}
@@ -319,6 +336,7 @@ func (r *Reader) ReadLong() int64 {
 func (r *Reader) ReadFloat() float32 {
 	var buf [4]byte
 	r.Read(buf[:])
+
 	return math.Float32frombits(binary.LittleEndian.Uint32(buf[:]))
 }
 
@@ -326,6 +344,7 @@ func (r *Reader) ReadFloat() float32 {
 func (r *Reader) ReadDouble() float64 {
 	var buf [8]byte
 	r.Read(buf[:])
+
 	return math.Float64frombits(binary.LittleEndian.Uint64(buf[:]))
 }
 

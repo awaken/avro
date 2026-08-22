@@ -30,7 +30,7 @@ func TestDecoder_ConvertiblePtrPtr(t *testing.T) {
 	defer ConfigTeardown()
 
 	data := []byte{0x2, 0x90, 0xb2, 0xae, 0xc3, 0xec, 0x5b}
-	schema := `{"type" : ["null", {"type": "long", "logicalType": "timestamp-millis"}]}`
+	schema := `["null", {"type": "long", "logicalType": "timestamp-millis"}]`
 	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
 	require.NoError(t, err)
 
@@ -75,7 +75,7 @@ func TestEncoder_Convertible(t *testing.T) {
 func TestEncoder_ConvertiblePtr(t *testing.T) {
 	defer ConfigTeardown()
 
-	schema := `{"type" : ["null", {"type": "long", "logicalType": "timestamp-millis"}]}`
+	schema := `["null", {"type": "long", "logicalType": "timestamp-millis"}]`
 	buf := bytes.NewBuffer([]byte{})
 	enc, err := avro.NewEncoder(schema, buf)
 	require.NoError(t, err)
@@ -90,7 +90,7 @@ func TestEncoder_ConvertiblePtr(t *testing.T) {
 func TestEncoder_ConvertiblePtrNil(t *testing.T) {
 	defer ConfigTeardown()
 
-	schema := `{"type" : ["null", {"type": "long", "logicalType": "timestamp-millis"}]}`
+	schema := `["null", {"type": "long", "logicalType": "timestamp-millis"}]`
 	buf := bytes.NewBuffer([]byte{})
 	enc, err := avro.NewEncoder(schema, buf)
 	require.NoError(t, err)

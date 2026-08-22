@@ -19,12 +19,20 @@ func TestNewReader(t *testing.T) {
 	assert.IsType(t, &avro.Reader{}, r)
 }
 
+func TestNewReaderZeroBuffer(t *testing.T) {
+	r := avro.NewReader(bytes.NewReader([]byte{0x01}), 0)
+
+	assert.True(t, r.ReadBool())
+	assert.NoError(t, r.Error)
+}
+
 func TestReader_Reset(t *testing.T) {
-	r := &avro.Reader{}
+	r := &avro.Reader{Error: errors.New("test")}
 
 	r.Reset([]byte{0x01})
 
 	assert.True(t, r.ReadBool())
+	assert.NoError(t, r.Error)
 }
 
 func TestReader_ReportError(t *testing.T) {
@@ -119,6 +127,17 @@ func TestReader_Read(t *testing.T) {
 			assert.Equal(t, test.want, got)
 		})
 	}
+}
+
+func TestReader_ReadPreservesDataError(t *testing.T) {
+	want := errors.New("test")
+	r := avro.NewReader(&dataErrorReader{data: []byte{0x01}, err: want}, 2)
+
+	got := make([]byte, 2)
+	r.Read(got)
+
+	assert.ErrorIs(t, r.Error, want)
+	assert.Equal(t, []byte{0x01, 0x00}, got)
 }
 
 func TestReader_ReadBool(t *testing.T) {
@@ -812,6 +831,35 @@ func TestReader_StopsAfterNoProgress(t *testing.T) {
 	_ = reader.ReadInt()
 
 	assert.ErrorIs(t, reader.Error, io.ErrNoProgress)
+}
+
+func TestReader_ReadBlockHeaderInvalid(t *testing.T) {
+	tests := [][]byte{
+		{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01},
+		{0x01, 0x01},
+	}
+
+	for _, data := range tests {
+		r := avro.NewReader(bytes.NewReader(data), 10)
+
+		_, _ = r.ReadBlockHeader()
+
+		assert.Error(t, r.Error)
+	}
+}
+
+type dataErrorReader struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (r *dataErrorReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	return copy(p, r.data), r.err
 }
 
 type delayedReader struct {

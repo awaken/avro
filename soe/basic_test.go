@@ -1,8 +1,10 @@
 package soe_test
 
 import (
+	"io"
 	"testing"
 
+	"github.com/awaken/avro/v2"
 	"github.com/awaken/avro/v2/soe"
 	"github.com/awaken/avro/v2/soe/internal/testdata"
 	"github.com/stretchr/testify/require"
@@ -15,6 +17,20 @@ func newCodec(t *testing.T) *soe.Codec {
 	require.NoError(t, err)
 
 	return codec
+}
+
+func TestCodec_EncodeReturnsIndependentData(t *testing.T) {
+	codec, err := soe.NewCodec(avro.MustParse("null"))
+	require.NoError(t, err)
+
+	first, err := codec.Encode(nil)
+	require.NoError(t, err)
+	want := append([]byte(nil), first...)
+	first[0] = 0
+
+	second, err := codec.Encode(nil)
+	require.NoError(t, err)
+	require.Equal(t, want, second)
 }
 
 // Used to test over all decoder functions.
@@ -113,12 +129,12 @@ func TestCodec_DecodeBadFingerprint(t *testing.T) {
 		require.ErrorContains(t, err, "bad fingerprint")
 	})
 	t.Run("DecodeUnverified", func(t *testing.T) {
-		// DecodeUnverified does not validate the fingerprint, and
-		// successfully decodes empty payload.
+		// DecodeUnverified does not validate the fingerprint, but still
+		// rejects a truncated record payload.
 		var v1 testdata.StringInt
 		err := codec.DecodeUnverified(data, &v1)
 
-		require.NoError(t, err)
+		require.ErrorIs(t, err, io.EOF)
 		require.Equal(t, testdata.StringInt{}, v1)
 	})
 }

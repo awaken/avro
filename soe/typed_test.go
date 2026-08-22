@@ -1,6 +1,7 @@
 package soe_test
 
 import (
+	"io"
 	"testing"
 
 	"github.com/awaken/avro/v2/soe"
@@ -112,12 +113,12 @@ func TestTypedCodec_DecodeBadFingerprint(t *testing.T) {
 		require.ErrorContains(t, err, "bad fingerprint")
 	})
 	t.Run("DecodeUnverified", func(t *testing.T) {
-		// DecodeUnverified does not validate the fingerprint, and
-		// successfully decodes empty payload.
+		// DecodeUnverified does not validate the fingerprint, but still
+		// rejects a truncated record payload.
 		var v1 testdata.Generated
 		err := codec.DecodeUnverified(data, &v1)
 
-		require.NoError(t, err)
+		require.ErrorIs(t, err, io.EOF)
 		require.Equal(t, testdata.Generated{}, v1)
 	})
 }

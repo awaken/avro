@@ -40,7 +40,10 @@ func (c *Codec) Encode(v any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append(c.header, data...), nil
+	result := make([]byte, len(c.header)+len(data))
+	copy(result, c.header)
+	copy(result[len(c.header):], data)
+	return result, nil
 }
 
 // Decode unmarshals a value from SOE-encoded Avro binary, and fails if

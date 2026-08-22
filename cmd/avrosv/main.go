@@ -43,7 +43,10 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if cfg.Verbose {
-		_, _ = fmt.Fprintln(stdout, schema)
+		if _, err := fmt.Fprintln(stdout, schema); err != nil {
+			_, _ = fmt.Fprintf(stderr, "Error: could not write schema: %v\n", err)
+			return 3
+		}
 	}
 
 	return 0

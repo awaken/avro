@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/sha256"
+	stdjson "encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -241,16 +243,13 @@ func newName(n, ns string, aliases []string) (name, error) {
 
 	for part := range strings.SplitSeq(full, ".") {
 		if err := validateName(part); err != nil {
-			return name{}, fmt.Errorf("avro: invalid name part %q in name %q: %w", full, part, err)
+			return name{}, fmt.Errorf("avro: invalid name part %q in name %q: %w", part, full, err)
 		}
 	}
 
 	a := make([]string, 0, len(aliases))
 	for _, alias := range aliases {
 		if !strings.Contains(alias, ".") {
-			if err := validateName(alias); err != nil {
-				return name{}, fmt.Errorf("avro: invalid name %q: %w", alias, err)
-			}
 			if ns == "" {
 				a = append(a, alias)
 				continue
@@ -259,11 +258,6 @@ func newName(n, ns string, aliases []string) (name, error) {
 			continue
 		}
 
-		for part := range strings.SplitSeq(alias, ".") {
-			if err := validateName(part); err != nil {
-				return name{}, fmt.Errorf("avro: invalid name part %q in name %q: %w", full, part, err)
-			}
-		}
 		a = append(a, alias)
 	}
 
@@ -292,7 +286,7 @@ func (n name) FullName() string {
 
 // Aliases returns the fully qualified aliases of a schema.
 func (n name) Aliases() []string {
-	return n.aliases
+	return slices.Clone(n.aliases)
 }
 
 type fingerprinter struct {
@@ -314,31 +308,35 @@ func (f *fingerprinter) Fingerprint(stringer fmt.Stringer) [32]byte {
 // FingerprintUsing returns the fingerprint of the schema using the given algorithm or an error.
 func (f *fingerprinter) FingerprintUsing(typ FingerprintType, stringer fmt.Stringer) ([]byte, error) {
 	if v, ok := f.cache.Load(typ); ok {
-		return v.([]byte), nil
+		return slices.Clone(v.([]byte)), nil
 	}
 
-	data := []byte(stringer.String())
-
-	var fingerprint []byte
-	switch typ {
-	case CRC64Avro:
-		h := crc64.Sum(data)
-		fingerprint = h[:]
-	case CRC64AvroLE:
-		h := crc64.SumWithByteOrder(data, crc64.LittleEndian)
-		fingerprint = h[:]
-	case MD5:
-		h := md5.Sum(data)
-		fingerprint = h[:]
-	case SHA256:
-		h := sha256.Sum256(data)
-		fingerprint = h[:]
-	default:
-		return nil, fmt.Errorf("avro: unknown fingerprint algorithm %s", typ)
+	fingerprint, err := fingerprintUsing(typ, []byte(stringer.String()))
+	if err != nil {
+		return nil, err
 	}
 
 	f.cache.Store(typ, fingerprint)
-	return fingerprint, nil
+	return slices.Clone(fingerprint), nil
+}
+
+func fingerprintUsing(typ FingerprintType, data []byte) ([]byte, error) {
+	switch typ {
+	case CRC64Avro:
+		h := crc64.Sum(data)
+		return h[:], nil
+	case CRC64AvroLE:
+		h := crc64.SumWithByteOrder(data, crc64.LittleEndian)
+		return h[:], nil
+	case MD5:
+		h := md5.Sum(data)
+		return h[:], nil
+	case SHA256:
+		h := sha256.Sum256(data)
+		return h[:], nil
+	default:
+		return nil, fmt.Errorf("avro: unknown fingerprint algorithm %s", typ)
+	}
 }
 
 type cacheFingerprinter struct {
@@ -353,15 +351,17 @@ func (i *cacheFingerprinter) CacheFingerprint(schema Schema, fn func() []byte) [
 		return v.([32]byte)
 	}
 
-	if i.writerFingerprint == nil {
-		fp := schema.Fingerprint()
+	if i.writerFingerprint == nil && fn == nil {
+		fp := LegacyFingerprint(schema)
 		i.cache.Store(fp)
 		return fp
 	}
 
-	fp := schema.Fingerprint()
+	fp := LegacyFingerprint(schema)
 	d := append([]byte{}, fp[:]...)
-	d = append(d, (*i.writerFingerprint)[:]...)
+	if i.writerFingerprint != nil {
+		d = append(d, (*i.writerFingerprint)[:]...)
+	}
 	if fn != nil {
 		d = append(d, fn()...)
 	}
@@ -532,11 +532,7 @@ func (s *PrimitiveSchema) Logical() LogicalSchema {
 
 // String returns the canonical form of the schema.
 func (s *PrimitiveSchema) String() string {
-	if s.logical == nil {
-		return `"` + string(s.typ) + `"`
-	}
-
-	return `{"type":"` + string(s.typ) + `",` + s.logical.String() + `}`
+	return `"` + string(s.typ) + `"`
 }
 
 // MarshalJSON marshals the schema to json.
@@ -592,6 +588,26 @@ type RecordSchema struct {
 
 // NewRecordSchema creates a new record schema instance.
 func NewRecordSchema(name, namespace string, fields []*Field, opts ...SchemaOption) (*RecordSchema, error) {
+	rec, err := newRecordSchema(name, namespace, fields, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	fieldNames := map[string]struct{}{}
+	for _, field := range fields {
+		if field == nil {
+			return nil, errors.New("avro: record fields cannot contain nil")
+		}
+		if _, ok := fieldNames[field.Name()]; ok {
+			return nil, fmt.Errorf("avro: duplicate field name %q", field.Name())
+		}
+		fieldNames[field.Name()] = struct{}{}
+	}
+	rec.fields = slices.Clone(fields)
+	return rec, nil
+}
+
+func newRecordSchema(name, namespace string, fields []*Field, opts ...SchemaOption) (*RecordSchema, error) {
 	var cfg schemaConfig
 	for _, opt := range opts {
 		opt(&cfg)
@@ -623,6 +639,16 @@ func NewErrorRecordSchema(name, namespace string, fields []*Field, opts ...Schem
 	return rec, nil
 }
 
+func newErrorRecordSchema(name, namespace string, fields []*Field, opts ...SchemaOption) (*RecordSchema, error) {
+	rec, err := newRecordSchema(name, namespace, fields, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	rec.isError = true
+	return rec, nil
+}
+
 // Type returns the type of the schema.
 func (s *RecordSchema) Type() Type {
 	return Record
@@ -640,7 +666,7 @@ func (s *RecordSchema) IsError() bool {
 
 // Fields returns the fields of a record.
 func (s *RecordSchema) Fields() []*Field {
-	return s.fields
+	return slices.Clone(s.fields)
 }
 
 // String returns the canonical form of the schema.
@@ -712,12 +738,13 @@ func (s *RecordSchema) FingerprintUsing(typ FingerprintType) ([]byte, error) {
 // CacheFingerprint returns unique identity of the schema.
 func (s *RecordSchema) CacheFingerprint() [32]byte {
 	return s.cacheFingerprinter.CacheFingerprint(s, func() []byte {
-		var defs []any
-		for _, field := range s.fields {
+		defs := make([]any, len(s.fields))
+		for i, field := range s.fields {
 			if !field.HasDefault() {
+				defs[i] = []any{false}
 				continue
 			}
-			defs = append(defs, field.Default())
+			defs[i] = []any{true, field.Default()}
 		}
 		b, _ := jsoniterAPI.Marshal(defs)
 		return b
@@ -758,11 +785,6 @@ func NewField(name string, typ Schema, opts ...SchemaOption) (*Field, error) {
 	if err := validateName(name); err != nil {
 		return nil, err
 	}
-	for _, a := range cfg.aliases {
-		if err := validateName(a); err != nil {
-			return nil, err
-		}
-	}
 
 	switch cfg.order {
 	case "":
@@ -775,7 +797,7 @@ func NewField(name string, typ Schema, opts ...SchemaOption) (*Field, error) {
 	f := &Field{
 		properties: newProperties(cfg.props, fieldReserved),
 		name:       name,
-		aliases:    cfg.aliases,
+		aliases:    slices.Clone(cfg.aliases),
 		doc:        cfg.doc,
 		typ:        typ,
 		order:      cfg.order,
@@ -800,7 +822,7 @@ func (f *Field) Name() string {
 
 // Aliases return the field aliases.
 func (f *Field) Aliases() []string {
-	return f.aliases
+	return slices.Clone(f.aliases)
 }
 
 // Type returns the schema of a field.
@@ -821,7 +843,7 @@ func (f *Field) Default() any {
 		return nil
 	}
 
-	return f.def
+	return cloneDefault(f.def)
 }
 
 func (f *Field) encodeDefault(encode func(any) ([]byte, error)) ([]byte, error) {
@@ -920,7 +942,7 @@ type EnumSchema struct {
 
 // NewEnumSchema creates a new enum schema instance.
 func NewEnumSchema(name, namespace string, symbols []string, opts ...SchemaOption) (*EnumSchema, error) {
-	var cfg schemaConfig
+	cfg := schemaConfig{def: NoDefault}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -947,18 +969,25 @@ func NewEnumSchema(name, namespace string, symbols []string, opts ...SchemaOptio
 	}
 
 	var def string
-	if d, ok := cfg.def.(string); ok && d != "" {
+	switch d := cfg.def.(type) {
+	case noDef:
+	case string:
+		if d == "" {
+			return nil, errors.New("avro: symbol default must be non-empty")
+		}
 		if !hasSymbol(symbols, d) {
 			return nil, fmt.Errorf("avro: symbol default %q must be a symbol", d)
 		}
 		def = d
+	default:
+		return nil, errors.New("avro: symbol default must be a string")
 	}
 
 	return &EnumSchema{
 		name:               n,
 		properties:         newProperties(cfg.props, enumReserved),
 		cacheFingerprinter: cacheFingerprinter{writerFingerprint: cfg.wfp},
-		symbols:            symbols,
+		symbols:            slices.Clone(symbols),
 		def:                def,
 		doc:                cfg.doc,
 	}, nil
@@ -980,7 +1009,7 @@ func (s *EnumSchema) Doc() string {
 
 // Symbols returns the symbols of an enum.
 func (s *EnumSchema) Symbols() []string {
-	return s.symbols
+	return slices.Clone(s.symbols)
 }
 
 // Symbol returns the symbol for the given index.
@@ -1252,7 +1281,7 @@ func NewUnionSchema(types []Schema, opts ...SchemaOption) (*UnionSchema, error) 
 			return nil, errors.New("avro: union type cannot be a union")
 		}
 
-		strType := schemaTypeName(schema)
+		strType := unionTypeName(schema)
 
 		if seen[strType] {
 			return nil, errors.New("avro: union type must be unique")
@@ -1262,7 +1291,7 @@ func NewUnionSchema(types []Schema, opts ...SchemaOption) (*UnionSchema, error) 
 
 	return &UnionSchema{
 		cacheFingerprinter: cacheFingerprinter{writerFingerprint: cfg.wfp},
-		types:              types,
+		types:              slices.Clone(types),
 	}, nil
 }
 
@@ -1273,7 +1302,7 @@ func (s *UnionSchema) Type() Type {
 
 // Types returns the types of a union.
 func (s *UnionSchema) Types() Schemas {
-	return s.types
+	return slices.Clone(s.types)
 }
 
 // Contains returns true if the union contains the given type.
@@ -1404,13 +1433,7 @@ func (s *FixedSchema) Logical() LogicalSchema {
 // String returns the canonical form of the schema.
 func (s *FixedSchema) String() string {
 	size := strconv.Itoa(s.size)
-
-	var logical string
-	if s.logical != nil {
-		logical = "," + s.logical.String()
-	}
-
-	return `{"name":"` + s.FullName() + `","type":"fixed","size":` + size + logical + `}`
+	return `{"name":"` + s.FullName() + `","type":"fixed","size":` + size + `}`
 }
 
 // MarshalJSON marshals the schema to json.
@@ -1640,7 +1663,10 @@ func validateName(name string) error {
 	if SkipNameValidation {
 		return nil
 	}
+	return validateNameStrict(name)
+}
 
+func validateNameStrict(name string) error {
 	if strings.IndexFunc(name[:1], invalidNameFirstChar) > -1 {
 		return fmt.Errorf("invalid name %s", name)
 	}
@@ -1652,11 +1678,11 @@ func validateName(name string) error {
 }
 
 func validateDefault(name string, schema Schema, def any) (any, error) {
-	def, ok := isValidDefault(schema, def)
+	validated, ok := isValidDefault(schema, def)
 	if !ok {
 		return nil, fmt.Errorf("avro: invalid default for field %s. %+v not a %s", name, def, schema.Type())
 	}
-	return def, nil
+	return validated, nil
 }
 
 func isValidDefault(schema Schema, def any) (any, bool) {
@@ -1690,7 +1716,11 @@ func isValidDefault(schema Schema, def any) (any, bool) {
 		if d, ok := def.(string); ok {
 			if b, ok := isValidDefaultBytes(d); ok {
 				if schema.Type() == Fixed {
-					return byteSliceToArray(b, schema.(*FixedSchema).Size()), true
+					size := schema.(*FixedSchema).Size()
+					if len(b) != size {
+						return nil, false
+					}
+					return byteSliceToArray(b, size), true
 				}
 				return b, true
 			}
@@ -1700,6 +1730,13 @@ func isValidDefault(schema Schema, def any) (any, bool) {
 			return def, true
 		}
 	case Int:
+		if number, ok := def.(stdjson.Number); ok {
+			i, err := number.Int64()
+			if err != nil || i < -1<<31 || i > 1<<31-1 {
+				return def, false
+			}
+			return int(i), true
+		}
 		if i, ok := def.(int8); ok {
 			return int(i), true
 		}
@@ -1709,27 +1746,60 @@ func isValidDefault(schema Schema, def any) (any, bool) {
 		if i, ok := def.(int32); ok {
 			return int(i), true
 		}
-		if _, ok := def.(int); ok {
-			return def, true
+		if i, ok := def.(int); ok {
+			if int64(i) < -1<<31 || int64(i) > 1<<31-1 {
+				return def, false
+			}
+			return i, true
 		}
 		if f, ok := def.(float64); ok {
+			if math.Trunc(f) != f || f < -1<<31 || f > 1<<31-1 {
+				return def, false
+			}
 			return int(f), true
 		}
 	case Long:
+		if number, ok := def.(stdjson.Number); ok {
+			i, err := number.Int64()
+			if err != nil {
+				return def, false
+			}
+			return i, true
+		}
 		if _, ok := def.(int64); ok {
 			return def, true
 		}
 		if f, ok := def.(float64); ok {
+			if math.Trunc(f) != f || f < -9223372036854775808.0 || f >= 9223372036854775808.0 {
+				return def, false
+			}
 			return int64(f), true
 		}
 	case Float:
+		if number, ok := def.(stdjson.Number); ok {
+			f, err := number.Float64()
+			if err != nil || f < -math.MaxFloat32 || f > math.MaxFloat32 {
+				return def, false
+			}
+			return float32(f), true
+		}
 		if _, ok := def.(float32); ok {
 			return def, true
 		}
 		if f, ok := def.(float64); ok {
+			if f < -math.MaxFloat32 || f > math.MaxFloat32 {
+				return def, false
+			}
 			return float32(f), true
 		}
 	case Double:
+		if number, ok := def.(stdjson.Number); ok {
+			f, err := number.Float64()
+			if err != nil {
+				return def, false
+			}
+			return f, true
+		}
 		if _, ok := def.(float64); ok {
 			return def, true
 		}
@@ -1740,14 +1810,15 @@ func isValidDefault(schema Schema, def any) (any, bool) {
 		}
 
 		as := schema.(*ArraySchema)
+		validated := make([]any, len(arr))
 		for i, v := range arr {
 			v, ok := isValidDefault(as.Items(), v)
 			if !ok {
 				return nil, false
 			}
-			arr[i] = v
+			validated[i] = v
 		}
-		return arr, true
+		return validated, true
 	case Map:
 		m, ok := def.(map[string]any)
 		if !ok {
@@ -1755,28 +1826,41 @@ func isValidDefault(schema Schema, def any) (any, bool) {
 		}
 
 		ms := schema.(*MapSchema)
+		validated := make(map[string]any, len(m))
 		for k, v := range m {
 			v, ok := isValidDefault(ms.Values(), v)
 			if !ok {
 				return nil, false
 			}
 
-			m[k] = v
+			validated[k] = v
 		}
-		return m, true
+		return validated, true
 	case Union:
 		unionSchema := schema.(*UnionSchema)
-		return isValidDefault(unionSchema.Types()[0], def)
+		for _, typ := range unionSchema.Types() {
+			if validated, ok := isValidDefault(typ, def); ok {
+				return validated, true
+			}
+		}
+		return nil, false
 	case Record:
 		m, ok := def.(map[string]any)
 		if !ok {
 			return nil, false
 		}
 
+		validated := make(map[string]any, len(m))
+		for k, v := range m {
+			validated[k] = cloneDefault(v)
+		}
 		for _, field := range schema.(*RecordSchema).Fields() {
-			fieldDef := field.Default()
-			if newDef, ok := m[field.Name()]; ok {
-				fieldDef = newDef
+			fieldDef, exists := m[field.Name()]
+			if !exists {
+				if !field.HasDefault() {
+					return nil, false
+				}
+				fieldDef = field.Default()
 			}
 
 			v, ok := isValidDefault(field.Type(), fieldDef)
@@ -1784,11 +1868,32 @@ func isValidDefault(schema Schema, def any) (any, bool) {
 				return nil, false
 			}
 
-			m[field.Name()] = v
+			validated[field.Name()] = v
 		}
-		return m, true
+		return validated, true
 	}
 	return nil, false
+}
+
+func cloneDefault(def any) any {
+	switch value := def.(type) {
+	case []byte:
+		return slices.Clone(value)
+	case []any:
+		cloned := make([]any, len(value))
+		for i, item := range value {
+			cloned[i] = cloneDefault(item)
+		}
+		return cloned
+	case map[string]any:
+		cloned := make(map[string]any, len(value))
+		for key, item := range value {
+			cloned[key] = cloneDefault(item)
+		}
+		return cloned
+	default:
+		return def
+	}
 }
 
 func schemaTypeName(schema Schema) string {
@@ -1805,6 +1910,80 @@ func schemaTypeName(schema Schema) string {
 		sname += "." + string(lt)
 	}
 	return sname
+}
+
+func unionTypeName(schema Schema) string {
+	if schema.Type() == Ref {
+		schema = schema.(*RefSchema).Schema()
+	}
+
+	if named, ok := schema.(NamedSchema); ok {
+		return named.FullName()
+	}
+	return string(schema.Type())
+}
+
+// LegacyFingerprint returns the non-standard SHA-256 schema fingerprint used
+// by earlier releases that retained logical annotations in parsing canonical
+// form. It is intended only for migrating persisted fingerprint keys; new keys
+// should use Schema.Fingerprint.
+func LegacyFingerprint(schema Schema) [32]byte {
+	return sha256.Sum256([]byte(LegacyParsingCanonicalForm(schema)))
+}
+
+// LegacyFingerprintUsing returns the non-standard schema fingerprint used by
+// earlier releases for the given algorithm. It is intended only for migrating
+// persisted fingerprint keys; new keys should use Schema.FingerprintUsing.
+func LegacyFingerprintUsing(schema Schema, typ FingerprintType) ([]byte, error) {
+	return fingerprintUsing(typ, []byte(LegacyParsingCanonicalForm(schema)))
+}
+
+// LegacyParsingCanonicalForm returns the non-standard parsing canonical form
+// used by earlier releases, which retained logical type annotations. It is
+// intended for migration and for runtime schemas that must retain logical type
+// behavior while omitting descriptive schema attributes.
+func LegacyParsingCanonicalForm(schema Schema) string {
+	switch s := schema.(type) {
+	case *PrimitiveSchema:
+		if s.logical == nil {
+			return s.String()
+		}
+		return `{"type":"` + string(s.typ) + `",` + s.logical.String() + `}`
+	case *RecordSchema:
+		typ := "record"
+		if s.isError {
+			typ = "error"
+		}
+		fields := ""
+		for _, field := range s.fields {
+			fields += `{"name":"` + field.name + `","type":` + LegacyParsingCanonicalForm(field.typ) + `},`
+		}
+		if fields != "" {
+			fields = fields[:len(fields)-1]
+		}
+		return `{"name":"` + s.FullName() + `","type":"` + typ + `","fields":[` + fields + `]}`
+	case *ArraySchema:
+		return `{"type":"array","items":` + LegacyParsingCanonicalForm(s.items) + `}`
+	case *MapSchema:
+		return `{"type":"map","values":` + LegacyParsingCanonicalForm(s.values) + `}`
+	case *UnionSchema:
+		types := ""
+		for _, typ := range s.types {
+			types += LegacyParsingCanonicalForm(typ) + ","
+		}
+		if types != "" {
+			types = types[:len(types)-1]
+		}
+		return `[` + types + `]`
+	case *FixedSchema:
+		canonical := `{"name":"` + s.FullName() + `","type":"fixed","size":` + strconv.Itoa(s.size)
+		if s.logical != nil {
+			canonical += "," + s.logical.String()
+		}
+		return canonical + `}`
+	default:
+		return schema.String()
+	}
 }
 
 func isValidDefaultBytes(def string) ([]byte, bool) {

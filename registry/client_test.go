@@ -8,10 +8,15 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/awaken/avro/v2"
 	"github.com/awaken/avro/v2/registry"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+const referencedParentSchema = `{"type":"record","name":"Parent","namespace":"com.acme","fields":[{"name":"child","type":"com.acme.Child"}]}`
+
+const resolvedParentSchema = `{"type":"record","name":"Parent","namespace":"com.acme","fields":[{"name":"child","type":{"type":"record","name":"Child","fields":[{"name":"value","type":"string"}]}}]}`
 
 func TestNewClient(t *testing.T) {
 	client, err := registry.NewClient("http://example.com")
@@ -40,7 +45,7 @@ func TestClient_PopulatesError(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Content-Type", "application/vnd.schemaregistry.v1+json")
 		w.WriteHeader(422)
-		_, _ = w.Write([]byte(`{"error_code": 42202, "message": "schema may not be empty"}"`))
+		_, _ = w.Write([]byte(`{"error_code": 42202, "message": "schema may not be empty"}`))
 	}))
 	t.Cleanup(s.Close)
 	client, _ := registry.NewClient(s.URL)
@@ -77,6 +82,7 @@ func TestClient_GetSchema(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "GET", r.Method)
 		assert.Equal(t, "/schemas/ids/5", r.URL.Path)
+		assert.Equal(t, "resolved", r.URL.Query().Get("format"))
 
 		_, _ = w.Write([]byte(`{"schema":"[\"null\",\"string\",\"int\"]"}`))
 	}))
@@ -228,6 +234,21 @@ func TestClient_GetVersions(t *testing.T) {
 	assert.Equal(t, 10, vers[0])
 }
 
+func TestClient_GetVersionsEscapesSubject(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/subjects/path%2Fto%20my.proto%3Fx/versions", r.URL.EscapedPath())
+		assert.Empty(t, r.URL.RawQuery)
+
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	t.Cleanup(s.Close)
+	client, _ := registry.NewClient(s.URL)
+
+	_, err := client.GetVersions(context.Background(), "path/to my.proto?x")
+
+	require.NoError(t, err)
+}
+
 func TestClient_GetVersionsRequestError(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
@@ -256,6 +277,7 @@ func TestClient_GetSchemaByVersion(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "GET", r.Method)
 		assert.Equal(t, "/subjects/foobar/versions/5", r.URL.Path)
+		assert.Equal(t, "resolved", r.URL.Query().Get("format"))
 
 		_, _ = w.Write([]byte(`{"schema":"[\"null\",\"string\",\"int\"]"}`))
 	}))
@@ -308,6 +330,7 @@ func TestClient_GetLatestSchema(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "GET", r.Method)
 		assert.Equal(t, "/subjects/foobar/versions/latest", r.URL.Path)
+		assert.Equal(t, "resolved", r.URL.Query().Get("format"))
 
 		_, _ = w.Write([]byte(`{"schema":"[\"null\",\"string\",\"int\"]"}`))
 	}))
@@ -360,6 +383,7 @@ func TestClient_GetSchemaInfo(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "GET", r.Method)
 		assert.Equal(t, "/subjects/foobar/versions/1", r.URL.Path)
+		assert.Equal(t, "resolved", r.URL.Query().Get("format"))
 
 		_, _ = w.Write([]byte(`{"subject": "foobar", "version": 1, "id": 2, "schema":"[\"null\",\"string\",\"int\"]"}`))
 	}))
@@ -378,6 +402,7 @@ func TestClient_GetSchemaInfoWithMetadata(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "GET", r.Method)
 		assert.Equal(t, "/subjects/foobar/versions/1", r.URL.Path)
+		assert.Equal(t, "resolved", r.URL.Query().Get("format"))
 
 		_, _ = w.Write([]byte(`{"subject": "foobar", "version": 1, "id": 2, "metadata": {"properties": {"foo": "bar", "baz": "quux"}}, "schema":"[\"null\",\"string\",\"int\"]"}`))
 	}))
@@ -434,6 +459,7 @@ func TestClient_GetLatestSchemaInfo(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "GET", r.Method)
 		assert.Equal(t, "/subjects/foobar/versions/latest", r.URL.Path)
+		assert.Equal(t, "resolved", r.URL.Query().Get("format"))
 
 		_, _ = w.Write([]byte(`{"subject": "foobar", "version": 1, "id": 2, "schema":"[\"null\",\"string\",\"int\"]"}`))
 	}))
@@ -501,6 +527,37 @@ func TestClient_CreateSchema(t *testing.T) {
 	assert.Equal(t, `["null","string","int"]`, schema.String())
 }
 
+func TestClient_CreateSchemaWithRefsReturnsResolvedSchema(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/subjects/parent/versions":
+			var payload map[string]any
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+			require.Len(t, payload["references"], 1)
+			_, _ = w.Write([]byte(`{"id":10}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/schemas/ids/10":
+			require.Equal(t, "resolved", r.URL.Query().Get("format"))
+			_ = json.NewEncoder(w).Encode(map[string]string{"schema": resolvedParentSchema})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(s.Close)
+	client, err := registry.NewClient(s.URL)
+	require.NoError(t, err)
+
+	id, schema, err := client.CreateSchema(
+		context.Background(),
+		"parent",
+		referencedParentSchema,
+		registry.SchemaReference{Name: "com.acme.Child", Subject: "child", Version: 1},
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, 10, id)
+	require.Equal(t, avro.MustParse(resolvedParentSchema).String(), schema.String())
+}
+
 func TestClient_CreateSchemaRequestError(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
@@ -556,7 +613,14 @@ func TestClient_IsRegistered(t *testing.T) {
 
 func TestClient_IsRegisteredWithRefs(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "POST", r.Method)
+		if r.Method == http.MethodGet {
+			require.Equal(t, "/schemas/ids/10", r.URL.Path)
+			require.Equal(t, "resolved", r.URL.Query().Get("format"))
+			_ = json.NewEncoder(w).Encode(map[string]string{"schema": resolvedParentSchema})
+			return
+		}
+
+		assert.Equal(t, http.MethodPost, r.Method)
 		assert.Equal(t, "/subjects/test", r.URL.Path)
 
 		body, err := io.ReadAll(r.Body)
@@ -572,7 +636,7 @@ func TestClient_IsRegisteredWithRefs(t *testing.T) {
 		ref, ok := refs[0].(map[string]any)
 		require.True(t, ok)
 
-		assert.Equal(t, "some_schema", ref["name"].(string))
+		assert.Equal(t, "com.acme.Child", ref["name"].(string))
 		assert.Equal(t, "some_subject", ref["subject"].(string))
 		assert.Equal(t, float64(3), ref["version"].(float64))
 
@@ -584,9 +648,9 @@ func TestClient_IsRegisteredWithRefs(t *testing.T) {
 	id, schema, err := client.IsRegisteredWithRefs(
 		context.Background(),
 		"test",
-		"[\"null\",\"string\",\"int\"]",
+		referencedParentSchema,
 		registry.SchemaReference{
-			Name:    "some_schema",
+			Name:    "com.acme.Child",
 			Subject: "some_subject",
 			Version: 3,
 		},
@@ -594,7 +658,66 @@ func TestClient_IsRegisteredWithRefs(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, 10, id)
-	assert.Equal(t, `["null","string","int"]`, schema.String())
+	assert.Equal(t, avro.MustParse(resolvedParentSchema).String(), schema.String())
+}
+
+func TestClient_ReferenceRetrievalsRequestResolvedFormat(t *testing.T) {
+	requests := map[string]int{}
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "resolved", r.URL.Query().Get("format"))
+		requests[r.URL.Path]++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      10,
+			"version": 2,
+			"schema":  resolvedParentSchema,
+		})
+	}))
+	t.Cleanup(s.Close)
+	client, err := registry.NewClient(s.URL)
+	require.NoError(t, err)
+	want := avro.MustParse(resolvedParentSchema).String()
+
+	byID, err := client.GetSchema(context.Background(), 10)
+	require.NoError(t, err)
+	require.Equal(t, want, byID.String())
+
+	byVersion, err := client.GetSchemaByVersion(context.Background(), "parent", 2)
+	require.NoError(t, err)
+	require.Equal(t, want, byVersion.String())
+
+	latest, err := client.GetLatestSchema(context.Background(), "parent")
+	require.NoError(t, err)
+	require.Equal(t, want, latest.String())
+
+	info, err := client.GetSchemaInfo(context.Background(), "parent", 2)
+	require.NoError(t, err)
+	require.Equal(t, want, info.Schema.String())
+
+	latestInfo, err := client.GetLatestSchemaInfo(context.Background(), "parent")
+	require.NoError(t, err)
+	require.Equal(t, want, latestInfo.Schema.String())
+
+	require.Equal(t, map[string]int{
+		"/schemas/ids/10":                  1,
+		"/subjects/parent/versions/2":      2,
+		"/subjects/parent/versions/latest": 2,
+	}, requests)
+}
+
+func TestClient_ResolvedFormatUnsupported(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "resolved", r.URL.Query().Get("format"))
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error_code":42205,"message":"unsupported format resolved"}`))
+	}))
+	t.Cleanup(s.Close)
+	client, err := registry.NewClient(s.URL)
+	require.NoError(t, err)
+
+	_, err = client.GetSchema(context.Background(), 10)
+	require.ErrorContains(t, err, "getting resolved schema 10")
+	require.ErrorContains(t, err, "unsupported format resolved")
 }
 
 func TestClient_IsRegisteredRequestError(t *testing.T) {
@@ -639,7 +762,7 @@ func TestClient_GetGlobalCompatibilityLevel(t *testing.T) {
 		assert.Equal(t, "/config", r.URL.Path)
 
 		_, _ = w.Write([]byte(`{
-			"compatibility": "FULL"
+			"compatibilityLevel": "FULL"
 		  }`))
 	}))
 	t.Cleanup(s.Close)
@@ -669,7 +792,7 @@ func TestClient_GetCompatibilityLevel(t *testing.T) {
 		assert.Equal(t, "GET", r.Method)
 		assert.Equal(t, "/config/"+subject, r.URL.Path)
 
-		_, _ = w.Write([]byte(`{"compatibility":"FULL"}`))
+		_, _ = w.Write([]byte(`{"compatibilityLevel":"FULL"}`))
 	}))
 	t.Cleanup(s.Close)
 	client, _ := registry.NewClient(s.URL)

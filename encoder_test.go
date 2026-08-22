@@ -30,6 +30,19 @@ func TestEncoder_EncodeUnsupportedType(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestEncoder_ResetAfterError(t *testing.T) {
+	defer ConfigTeardown()
+
+	enc, _ := avro.NewEncoder("boolean", errorWriter{})
+	require.Error(t, enc.Encode(true))
+
+	var buf bytes.Buffer
+	enc.Reset(&buf)
+
+	require.NoError(t, enc.Encode(false))
+	assert.Equal(t, []byte{0x00}, buf.Bytes())
+}
+
 func TestMarshal(t *testing.T) {
 	defer ConfigTeardown()
 

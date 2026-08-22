@@ -57,7 +57,7 @@ func TestName_InvalidNameOtherChar(t *testing.T) {
 func TestName_InvalidNamespaceFirstChar(t *testing.T) {
 	_, err := newName("bar", "+foo", nil)
 
-	assert.Error(t, err)
+	assert.EqualError(t, err, `avro: invalid name part "+foo" in name "+foo.bar": invalid name +foo`)
 }
 
 func TestName_InvalidNamespaceOtherChar(t *testing.T) {
@@ -66,28 +66,32 @@ func TestName_InvalidNamespaceOtherChar(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestName_InvalidAliasFirstChar(t *testing.T) {
-	_, err := newName("bar", "foo", []string{"+bar"})
+func TestName_HistoricalAliasFirstChar(t *testing.T) {
+	name, err := newName("bar", "foo", []string{"+bar"})
 
-	assert.Error(t, err)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"foo.+bar"}, name.Aliases())
 }
 
-func TestName_InvalidAliasOtherChar(t *testing.T) {
-	_, err := newName("bar", "foo", []string{"bar+"})
+func TestName_HistoricalAliasOtherChar(t *testing.T) {
+	name, err := newName("bar", "foo", []string{"bar+"})
 
-	assert.Error(t, err)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"foo.bar+"}, name.Aliases())
 }
 
-func TestName_InvalidAliasFQNFirstChar(t *testing.T) {
-	_, err := newName("bar", "foo", []string{"test.+bar"})
+func TestName_HistoricalAliasFQNFirstChar(t *testing.T) {
+	name, err := newName("bar", "foo", []string{"test.+bar"})
 
-	assert.Error(t, err)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"test.+bar"}, name.Aliases())
 }
 
-func TestName_InvalidAliasFQNOtherChar(t *testing.T) {
-	_, err := newName("bar", "foo", []string{"test.bar+"})
+func TestName_HistoricalAliasFQNOtherChar(t *testing.T) {
+	name, err := newName("bar", "foo", []string{"test.bar+"})
 
-	assert.Error(t, err)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"test.bar+"}, name.Aliases())
 }
 
 func TestProperties_PropGetsFromEmptySet(t *testing.T) {
@@ -219,6 +223,24 @@ func TestIsValidDefault(t *testing.T) {
 				return s
 			},
 			def:    1,
+			wantOk: false,
+		},
+		{
+			name: "Fixed Too Short",
+			schemaFn: func() Schema {
+				s, _ := NewFixedSchema("foo", "", 4, nil)
+				return s
+			},
+			def:    "abc",
+			wantOk: false,
+		},
+		{
+			name: "Fixed Too Long",
+			schemaFn: func() Schema {
+				s, _ := NewFixedSchema("foo", "", 4, nil)
+				return s
+			},
+			def:    "abcde",
 			wantOk: false,
 		},
 		{
@@ -383,6 +405,14 @@ func TestRecursionError_Error(t *testing.T) {
 	assert.Equal(t, "", err.Error())
 }
 
+func TestValidateDefault_ErrorReportsOriginalValue(t *testing.T) {
+	union, err := NewUnionSchema([]Schema{NewNullSchema(), NewPrimitiveSchema(String, nil)})
+	require.NoError(t, err)
+
+	_, err = validateDefault("v", union, true)
+	assert.EqualError(t, err, "avro: invalid default for field v. true not a union")
+}
+
 func TestSchema_FingerprintUsingCaches(t *testing.T) {
 	schema := NewPrimitiveSchema(String, nil)
 
@@ -394,6 +424,93 @@ func TestSchema_FingerprintUsingCaches(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, want, value)
 	assert.Equal(t, want, got)
+}
+
+func TestSchema_FingerprintUsingReturnsCopy(t *testing.T) {
+	schema := NewPrimitiveSchema(String, nil)
+
+	fingerprint, err := schema.FingerprintUsing(CRC64Avro)
+	require.NoError(t, err)
+	want := append([]byte(nil), fingerprint...)
+	fingerprint[0] ^= 0xff
+
+	got, err := schema.FingerprintUsing(CRC64Avro)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+}
+
+func TestRecordSchema_CacheFingerprintIncludesDefaultPositions(t *testing.T) {
+	first, err := ParseWithCache(`{"type":"record","name":"R","fields":[{"name":"a","type":"int","default":1},{"name":"b","type":"int"}]}`, "", &SchemaCache{})
+	require.NoError(t, err)
+	second, err := ParseWithCache(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"int","default":1}]}`, "", &SchemaCache{})
+	require.NoError(t, err)
+
+	assert.NotEqual(t, first.CacheFingerprint(), second.CacheFingerprint())
+
+	type onlyB struct {
+		B int `avro:"b"`
+	}
+	api := Config{}.Freeze()
+	_, err = api.Marshal(first, onlyB{B: 2})
+	require.NoError(t, err)
+	_, err = api.Marshal(second, onlyB{B: 2})
+	assert.EqualError(t, err, `avro: record R is missing required field "a"`)
+}
+
+func TestNewRecordSchema_RejectsInvalidFields(t *testing.T) {
+	field, err := NewField("a", NewPrimitiveSchema(Int, nil))
+	require.NoError(t, err)
+
+	_, err = NewRecordSchema("R", "", []*Field{field, field})
+	assert.Error(t, err)
+
+	_, err = NewRecordSchema("R", "", []*Field{nil})
+	assert.Error(t, err)
+}
+
+func TestSchema_CollectionsAndDefaultsAreSnapshots(t *testing.T) {
+	aliases := []string{"OldR"}
+	fieldAliases := []string{"old_a"}
+	defaultValue := map[string]any{"x": float64(1)}
+	field, err := NewField("a", NewMapSchema(NewPrimitiveSchema(Int, nil)), WithAliases(fieldAliases), WithDefault(defaultValue))
+	require.NoError(t, err)
+	fields := []*Field{field}
+	record, err := NewRecordSchema("R", "", fields, WithAliases(aliases))
+	require.NoError(t, err)
+
+	aliases[0] = "Changed"
+	fieldAliases[0] = "changed"
+	defaultValue["x"] = float64(2)
+	fields[0], err = NewField("b", NewPrimitiveSchema(Int, nil))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"OldR"}, record.Aliases())
+	assert.Equal(t, []string{"old_a"}, record.Fields()[0].Aliases())
+	assert.Equal(t, map[string]any{"x": 1}, record.Fields()[0].Default())
+	assert.Equal(t, "a", record.Fields()[0].Name())
+
+	record.Aliases()[0] = "Mutated"
+	record.Fields()[0] = fields[0]
+	record.Fields()[0].Aliases()[0] = "mutated"
+	returnedDefault := record.Fields()[0].Default().(map[string]any)
+	returnedDefault["x"] = 3
+	assert.Equal(t, []string{"OldR"}, record.Aliases())
+	assert.Equal(t, []string{"old_a"}, record.Fields()[0].Aliases())
+	assert.Equal(t, map[string]any{"x": 1}, record.Fields()[0].Default())
+	assert.Equal(t, "a", record.Fields()[0].Name())
+
+	symbols := []string{"A", "B"}
+	enum, err := NewEnumSchema("E", "", symbols)
+	require.NoError(t, err)
+	symbols[0] = "C"
+	enum.Symbols()[0] = "D"
+	assert.Equal(t, []string{"A", "B"}, enum.Symbols())
+
+	types := []Schema{NewNullSchema(), NewPrimitiveSchema(String, nil)}
+	union, err := NewUnionSchema(types)
+	require.NoError(t, err)
+	types[0] = NewPrimitiveSchema(Int, nil)
+	union.Types()[0] = NewPrimitiveSchema(Long, nil)
+	assert.Equal(t, Null, union.Types()[0].Type())
 }
 
 func TestSchema_IsPromotable(t *testing.T) {
@@ -656,4 +773,12 @@ func TestEnumSchema_GetSymbol(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEnumSchema_RejectsInvalidDefaultOptions(t *testing.T) {
+	_, err := NewEnumSchema("foo", "", []string{"BAR"}, WithDefault(""))
+	assert.Error(t, err)
+
+	_, err = NewEnumSchema("foo", "", []string{"BAR"}, WithDefault(1))
+	assert.Error(t, err)
 }

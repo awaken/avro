@@ -2,11 +2,21 @@ package avro_test
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"testing"
 
 	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
 )
+
+type errorReader struct {
+	err error
+}
+
+func (r errorReader) Read([]byte) (int, error) {
+	return 0, r.err
+}
 
 func TestNewDecoder_SchemaError(t *testing.T) {
 	defer ConfigTeardown()
@@ -43,6 +53,18 @@ func TestDecoder_DecodeEmptyReader(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestDecoder_DecodeReaderError(t *testing.T) {
+	defer ConfigTeardown()
+
+	want := errors.New("test")
+	dec, _ := avro.NewDecoder("boolean", errorReader{err: want})
+
+	var b bool
+	err := dec.Decode(&b)
+
+	assert.ErrorIs(t, err, want)
+}
+
 func TestDecoder_DecodeNonPtr(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -74,9 +96,21 @@ func TestUnmarshal(t *testing.T) {
 	schema := avro.MustParse("int")
 
 	var i int
-	err := avro.Unmarshal(schema, []byte{0xE2}, &i)
+	err := avro.Unmarshal(schema, []byte{0x02}, &i)
 
 	assert.NoError(t, err)
+	assert.Equal(t, 1, i)
+}
+
+func TestUnmarshal_TruncatedValue(t *testing.T) {
+	defer ConfigTeardown()
+
+	schema := avro.MustParse("int")
+
+	var i int
+	err := avro.Unmarshal(schema, []byte{0xE2}, &i)
+
+	assert.ErrorIs(t, err, io.EOF)
 }
 
 func TestUnmarshal_Ptr(t *testing.T) {
@@ -146,4 +180,14 @@ func FuzzDecoder(f *testing.F) {
 		var generic any
 		_ = config.Unmarshal(schema, data, &generic)
 	})
+}
+
+func TestUnmarshal_Nil(t *testing.T) {
+	defer ConfigTeardown()
+
+	schema := avro.MustParse("boolean")
+
+	err := avro.Unmarshal(schema, []byte{0x01}, nil)
+
+	assert.Error(t, err)
 }

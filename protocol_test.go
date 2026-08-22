@@ -162,6 +162,13 @@ func TestParseProtocol_DeterminesOneWayMessage(t *testing.T) {
 	assert.True(t, msg.OneWay())
 }
 
+func TestParseProtocol_PreservesLargeLongDefault(t *testing.T) {
+	protocol, err := avro.ParseProtocol(`{"protocol":"test","messages":{"m":{"request":[{"name":"v","type":"long","default":9007199254740993}],"response":"null"}}}`)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(9007199254740993), protocol.Message("m").Request().Fields()[0].Default())
+}
+
 func TestParseProtocol_Docs(t *testing.T) {
 	schema := `{"protocol":"test", "doc": "foo", "messages":{"test":{"request": [{"name": "foobar", "type": "string"}], "doc": "bar"}}}`
 

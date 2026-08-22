@@ -354,11 +354,14 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 			return nil, false, err
 		}
 		if !c.identicalEnumSymbols(r, w) {
-			enum, _ := NewEnumSchema(r.Name(), r.Namespace(), r.Symbols(),
+			opts := []SchemaOption{
 				WithAliases(r.Aliases()),
-				WithDefault(r.Default()),
 				withWriterFingerprint(w.Fingerprint()),
-			)
+			}
+			if r.HasDefault() {
+				opts = append(opts, WithDefault(r.Default()))
+			}
+			enum, _ := NewEnumSchema(r.Name(), r.Namespace(), r.Symbols(), opts...)
 			enum.encodedSymbols = w.Symbols()
 			return enum, true, nil
 		}

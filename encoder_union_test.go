@@ -530,7 +530,7 @@ func TestEncoder_UnionInterfaceRecursiveType(t *testing.T) {
 	"name": "test",
 	"fields" : [
 		{"name": "a", "type": "int"},
-		{"name": "b", "type": [null, "test"]}
+		{"name": "b", "type": ["null", "test"]}
 	]
 }`
 	buf := bytes.NewBuffer([]byte{})
@@ -655,11 +655,13 @@ func TestEncoder_UnionInterfaceNotInSchema(t *testing.T) {
 }
 
 func TestEncoder_UnionResolver(t *testing.T) {
+	largeInt := int64(2147483648)
 	testCases := []struct {
-		name   string
-		schema string
-		value  any
-		want   []byte
+		name             string
+		schema           string
+		value            any
+		want             []byte
+		requires64BitInt bool
 	}{
 		{
 			name:   "Go int8 as Avro int",
@@ -686,10 +688,11 @@ func TestEncoder_UnionResolver(t *testing.T) {
 			want:   []byte{0x2, 0x36},
 		},
 		{
-			name:   "Go int as Avro long",
-			schema: `["null","long"]`,
-			value:  largePlatformInt(),
-			want:   []byte{0x2, 0x80, 0x80, 0x80, 0x80, 0x10},
+			name:             "Go int as Avro long",
+			schema:           `["null","long"]`,
+			value:            int(largeInt),
+			want:             []byte{0x2, 0x80, 0x80, 0x80, 0x80, 0x10},
+			requires64BitInt: true,
 		},
 		{
 			name:   "Go int64 as Avro long",
@@ -773,6 +776,10 @@ func TestEncoder_UnionResolver(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.requires64BitInt && strconv.IntSize != 64 {
+				t.Skipf("int size is %d, skipping test", strconv.IntSize)
+			}
+
 			defer ConfigTeardown()
 
 			buf := bytes.NewBuffer([]byte{})
@@ -785,12 +792,4 @@ func TestEncoder_UnionResolver(t *testing.T) {
 			assert.Equal(t, tc.want, buf.Bytes())
 		})
 	}
-}
-
-func largePlatformInt() any {
-	value := int64(2147483648)
-	if strconv.IntSize == 64 {
-		return int(value)
-	}
-	return value
 }

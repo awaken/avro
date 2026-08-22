@@ -397,7 +397,7 @@ func (g *Generator) rawSchema(schema *avro.RecordSchema) string {
 		}
 		return string(schemaJSON)
 	}
-	return schema.String()
+	return avro.LegacyParsingCanonicalForm(schema)
 }
 
 func (g *Generator) hasTypeDef(name string) bool {

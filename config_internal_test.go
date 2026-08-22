@@ -1,10 +1,13 @@
 package avro
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/modern-go/reflect2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConfig_Freeze(t *testing.T) {
@@ -181,4 +184,42 @@ func TestConfig_DisableCache_DoesNotReuseEncoders(t *testing.T) {
 	enc2 := cfg.EncoderOf(schema, typ)
 
 	assert.NotSame(t, enc1, enc2)
+}
+
+func TestTypeResolver_NameReturnsCopy(t *testing.T) {
+	resolver := NewTypeResolver()
+	typ := reflect2.TypeOf(int(0))
+
+	names, err := resolver.Name(typ)
+	require.NoError(t, err)
+	names[0] = "corrupted"
+
+	names, err = resolver.Name(typ)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"int", "long"}, names)
+}
+
+func TestTypeResolver_ConcurrentRegister(t *testing.T) {
+	type value struct{}
+
+	resolver := NewTypeResolver()
+	const count = 128
+	want := make([]string, count)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range count {
+		want[i] = fmt.Sprintf("name-%03d", i)
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			<-start
+			resolver.Register(name, value{})
+		}(want[i])
+	}
+	close(start)
+	wg.Wait()
+
+	names, err := resolver.Name(reflect2.TypeOf(value{}))
+	require.NoError(t, err)
+	assert.ElementsMatch(t, want, names)
 }

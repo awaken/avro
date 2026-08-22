@@ -156,6 +156,8 @@ func TestDynamicDecoder_DecodeBasePayloadWithExtendedType(t *testing.T) {
 }
 
 func TestDynamicDecoder_DecodeExtendedPayloadWithBaseType(t *testing.T) {
+	require.Equal(t, testdata.Dynamic1Schema.(avro.NamedSchema).FullName(), testdata.Dynamic3Schema.(avro.NamedSchema).FullName())
+
 	// Marshal a Dynamic3 value
 	data := encode(t, testdata.Dynamic3Schema, testdata.Dynamic3{
 		Name:  "Bob",

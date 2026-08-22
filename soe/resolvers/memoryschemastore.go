@@ -35,6 +35,9 @@ func (s *MemorySchemaStore) AddSchema(schema avro.Schema) error {
 
 // GetSchema implements SchemaResolver.
 func (s *MemorySchemaStore) GetSchema(_ context.Context, fingerprint []byte) (avro.Schema, error) {
+	if len(fingerprint) != 8 {
+		return nil, fmt.Errorf("%w: invalid fingerprint length %d", soe.ErrUnknownSchema, len(fingerprint))
+	}
 	key := keyFromFingerprint(fingerprint)
 	schema, ok := s.schemas.Load(key)
 	if !ok {

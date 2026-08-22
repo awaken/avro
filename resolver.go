@@ -11,8 +11,9 @@ import (
 
 // TypeResolver resolves types by name.
 type TypeResolver struct {
-	names sync.Map // map[string]reflect2.Type
-	types sync.Map // map[int][]string
+	names   sync.Map // map[string]reflect2.Type
+	types   sync.Map // map[int][]string
+	typesMu sync.RWMutex
 }
 
 // NewTypeResolver creates a new type resolver with all primitive types
@@ -53,6 +54,9 @@ func (r *TypeResolver) Register(name string, obj any) {
 
 	r.names.Store(name, typ)
 
+	r.typesMu.Lock()
+	defer r.typesMu.Unlock()
+
 	raw, ok := r.types.LoadOrStore(rtype, []string{name})
 	if !ok {
 		return
@@ -66,12 +70,15 @@ func (r *TypeResolver) Register(name string, obj any) {
 func (r *TypeResolver) Name(typ reflect2.Type) ([]string, error) {
 	rtype := typ.RType()
 
+	r.typesMu.RLock()
+	defer r.typesMu.RUnlock()
+
 	names, ok := r.types.Load(rtype)
 	if !ok {
 		return nil, fmt.Errorf("avro: unable to resolve type %s", typ.String())
 	}
 
-	return names.([]string), nil
+	return append([]string(nil), names.([]string)...), nil
 }
 
 // Type gets the type for a name, or an error.

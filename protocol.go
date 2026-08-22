@@ -9,7 +9,6 @@ import (
 	"slices"
 
 	"github.com/go-viper/mapstructure/v2"
-	jsoniter "github.com/json-iterator/go"
 )
 
 var (
@@ -227,7 +226,7 @@ func ParseProtocol(protocol string) (*Protocol, error) {
 	cache := &SchemaCache{}
 
 	var m map[string]any
-	if err := jsoniter.Unmarshal([]byte(protocol), &m); err != nil {
+	if err := schemaJSONAPI.Unmarshal([]byte(protocol), &m); err != nil {
 		return nil, err
 	}
 
@@ -278,6 +277,9 @@ func parseProtocol(m map[string]any, seen seenCache, cache *SchemaCache) (*Proto
 
 			messages[k] = message
 		}
+	}
+	if err := normalizeProperties(p.Props); err != nil {
+		return nil, err
 	}
 
 	return NewProtocol(p.Protocol, p.Namespace, types, messages, WithProtoDoc(p.Doc), WithProtoProps(p.Props))
@@ -372,6 +374,9 @@ func parseMessage(namespace string, m map[string]any, seen seenCache, cache *Sch
 	}
 	if !oneWay && len(errs.Types()) <= 1 && response == nil {
 		oneWay = true
+	}
+	if err := normalizeProperties(msg.Props); err != nil {
+		return nil, err
 	}
 
 	return NewMessage(request, response, errs, oneWay, WithProtoDoc(msg.Doc), WithProtoProps(msg.Props)), nil

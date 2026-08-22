@@ -60,4 +60,4 @@ type Dynamic3 struct {
 	Hobby string `avro:"hobby"`
 }
 
-var Dynamic3Schema = avro.MustParse(`{"name":"dynamic2","type":"record","fields":[{"name":"name","type":"string"},{"name":"age","type":"int"},{"name":"hobby","type":"string"}]}`)
+var Dynamic3Schema = avro.MustParse(`{"name":"dynamic1","type":"record","fields":[{"name":"name","type":"string"},{"name":"age","type":"int"},{"name":"hobby","type":"string"}]}`)

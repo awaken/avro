@@ -67,8 +67,9 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 	flgs.StringVar(&cfg.SchemaRegistry, "schemaregistry", "", "The URL to schema registry, e.g.: http://localhost:8081.")
 	flgs.BoolVar(&cfg.EnumsGen, "enums", false, "Generate Go enums for Avro enums.")
 	var lt logicalTypes
-	flgs.Var(&lt, "logicaltype",
-		"A logical type mapping of the form logicalType,goType[,import]. Can be specified multiple times.")
+	const logicalTypeUsage = "A logical type mapping of the form logicalType,goType[,import]. Can be specified multiple times."
+	flgs.Var(&lt, "logicaltype", logicalTypeUsage)
+	flgs.Var(&lt, "logical-type", logicalTypeUsage)
 
 	flgs.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "Usage: avrogen [options] schemas")
@@ -123,12 +124,17 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 	}
 
 	g := gen.NewGenerator(cfg.Pkg, tags, opts...)
+	fileCache := &avro.SchemaCache{}
 	for _, entry := range flgs.Args() {
 		var schema avro.Schema
 
 		switch cfg.SchemaRegistry {
 		case "":
-			schema, err = avro.ParseFiles(filepath.Clean(entry))
+			var schemaJSON []byte
+			schemaJSON, err = os.ReadFile(filepath.Clean(entry))
+			if err == nil {
+				schema, err = avro.ParseBytesWithCache(schemaJSON, "", fileCache)
+			}
 			if err != nil {
 				_, _ = fmt.Fprintf(stderr, "Error: %v\n", err)
 				return 2
@@ -240,7 +246,7 @@ func parseTags(raw string) (map[string]gen.TagStyle, error) {
 		parts := strings.Split(tag, ":")
 		switch {
 		case len(parts) != 2:
-			return nil, fmt.Errorf("%q is not a valid tag, should be in the formet \"tag:style\"", tag)
+			return nil, fmt.Errorf("%q is not a valid tag, should be in the format \"tag:style\"", tag)
 		case parts[0] == "":
 			return nil, fmt.Errorf("tag name is required in %q", tag)
 		}
@@ -272,6 +278,10 @@ func parseInitialisms(raw string) ([]string, error) {
 
 	result := []string{}
 	for initialism := range strings.SplitSeq(raw, ",") {
+		initialism = strings.TrimSpace(initialism)
+		if initialism == "" {
+			return nil, errors.New("initialism cannot be empty")
+		}
 		if initialism != strings.ToUpper(initialism) {
 			return nil, fmt.Errorf("initialism %q must be fully in upper case", initialism)
 		}

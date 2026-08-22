@@ -813,7 +813,7 @@ func TestEncoder_EncodeCompressesDeflate(t *testing.T) {
 	err = enc.Close()
 
 	require.NoError(t, err)
-	assert.Equal(t, 926, buf.Len())
+	requireDeflateRecord(t, buf.Bytes(), record)
 }
 
 func TestEncoder_EncodeCompressesDeflateWithLevel(t *testing.T) {
@@ -851,7 +851,22 @@ func TestEncoder_EncodeCompressesDeflateWithLevel(t *testing.T) {
 	err = enc.Close()
 
 	require.NoError(t, err)
-	assert.Equal(t, 926, buf.Len())
+	requireDeflateRecord(t, buf.Bytes(), record)
+}
+
+func requireDeflateRecord(t *testing.T, data []byte, want FullRecord) {
+	t.Helper()
+
+	dec, err := ocf.NewDecoder(bytes.NewReader(data))
+	require.NoError(t, err)
+	require.Equal(t, []byte("deflate"), dec.Metadata()["avro.codec"])
+	require.True(t, dec.HasNext())
+
+	var got FullRecord
+	require.NoError(t, dec.Decode(&got))
+	require.Equal(t, want, got)
+	require.False(t, dec.HasNext())
+	require.NoError(t, dec.Error())
 }
 
 func TestEncoder_EncodeCompressesSnappy(t *testing.T) {

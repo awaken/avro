@@ -1,7 +1,6 @@
 package avro
 
 import (
-	"errors"
 	"io"
 	"sync"
 
@@ -181,7 +180,8 @@ func (c *frozenConfig) Unmarshal(schema Schema, data []byte, v any) error {
 	reader.ReadVal(schema, v)
 	err := reader.Error
 
-	if errors.Is(err, io.EOF) {
+	//nolint:errorlint // Only a direct EOF represents an empty zero-width value.
+	if err == io.EOF {
 		return nil
 	}
 

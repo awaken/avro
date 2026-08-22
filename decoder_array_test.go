@@ -2,6 +2,7 @@ package avro_test
 
 import (
 	"bytes"
+	"strconv"
 	"testing"
 
 	"github.com/awaken/avro/v2"
@@ -35,6 +36,21 @@ func TestDecoder_ArraySlice(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, []int{27, 28}, got)
+}
+
+func TestDecoder_ArrayEmptyReplacesDestination(t *testing.T) {
+	defer ConfigTeardown()
+
+	schema := `{"type":"array", "items":"int"}`
+	dec, err := avro.NewDecoder(schema, bytes.NewReader([]byte{0}))
+	require.NoError(t, err)
+
+	got := []int{27, 28}
+	err = dec.Decode(&got)
+
+	require.NoError(t, err)
+	assert.NotNil(t, got)
+	assert.Empty(t, got)
 }
 
 func TestDecoder_ArraySliceShortRead(t *testing.T) {
@@ -142,6 +158,7 @@ func TestDecoder_ArrayMaxAllocationError(t *testing.T) {
 
 func TestDecoder_ArrayExceedMaxSliceAllocationConfig(t *testing.T) {
 	defer ConfigTeardown()
+
 	avro.DefaultConfig = avro.Config{MaxSliceAllocSize: 5}.Freeze()
 
 	// 10 (long) gets encoded to 0x14
@@ -179,4 +196,23 @@ func TestDecoder_ArrayLimitIsCumulativeAcrossBlocks(t *testing.T) {
 
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "MaxSliceAllocSize")
+}
+
+func TestDecoder_ArrayExceedsRuntimeAllocationLimit(t *testing.T) {
+	defer ConfigTeardown()
+	if strconv.IntSize != 64 {
+		t.Skip("the 64-bit allocation boundary is architecture-specific")
+	}
+	avro.DefaultConfig = avro.Config{MaxSliceAllocSize: -1}.Freeze()
+
+	var encoded bytes.Buffer
+	w := avro.NewWriter(&encoded, 16)
+	w.WriteLong(1 << 48)
+	require.NoError(t, w.Flush())
+
+	schema := avro.MustParse(`{"type":"array","items":"long"}`)
+	var got []int64
+	err := avro.Unmarshal(schema, encoded.Bytes(), &got)
+
+	assert.ErrorContains(t, err, "size is greater than the runtime allocation limit")
 }

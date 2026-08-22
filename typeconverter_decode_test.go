@@ -31,7 +31,7 @@ func TestDecoderTypeConverter_UnionResolved(t *testing.T) {
 	defer ConfigTeardown()
 
 	data := []byte{0x02, 0x01}
-	schema := `{"type":["null","boolean"]}`
+	schema := `["null","boolean"]`
 	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
 	require.NoError(t, err)
 
@@ -48,7 +48,7 @@ func TestDecoderTypeConverter_MapUnion(t *testing.T) {
 	defer ConfigTeardown()
 
 	data := []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x87, 0x78}
-	schema := `{"type":["null",{"type":"fixed", "name":"fixed_decimal", "size":6, "logicalType":"decimal", "precision":4, "scale":2}]}`
+	schema := `["null",{"type":"fixed", "name":"fixed_decimal", "size":6, "logicalType":"decimal", "precision":4, "scale":2}]`
 	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
 	require.NoError(t, err)
 
@@ -67,7 +67,8 @@ func TestDecoderTypeConverter_UnionNullableSlice(t *testing.T) {
 
 	data := []byte{0x02, 0x06, 'f', 'o', 'o'}
 	schema := `["null", "bytes"]`
-	dec, _ := avro.NewDecoder(schema, bytes.NewReader(data))
+	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
+	require.NoError(t, err)
 
 	avro.RegisterTypeConverters(avro.TypeConversionFuncs{
 		AvroType: avro.Union,
@@ -81,7 +82,7 @@ func TestDecoderTypeConverter_UnionNullableSlice(t *testing.T) {
 	})
 
 	var got []byte
-	err := dec.Decode(&got)
+	err = dec.Decode(&got)
 
 	want := []byte("FOO")
 	require.NoError(t, err)
@@ -93,7 +94,8 @@ func TestDecoderTypeConverter_UnionNullablePtr(t *testing.T) {
 
 	data := []byte{0x02, 0x36}
 	schema := `["null", "int"]`
-	dec, _ := avro.NewDecoder(schema, bytes.NewReader(data))
+	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
+	require.NoError(t, err)
 
 	avro.RegisterTypeConverters(avro.TypeConversionFuncs{
 		AvroType: avro.Union,
@@ -105,7 +107,7 @@ func TestDecoderTypeConverter_UnionNullablePtr(t *testing.T) {
 	})
 
 	var got *int
-	err := dec.Decode(&got)
+	err = dec.Decode(&got)
 
 	want := int(54)
 	require.NoError(t, err)
@@ -168,7 +170,7 @@ func TestDecoderTypeConverter_ErrorUnionResolved(t *testing.T) {
 	defer ConfigTeardown()
 
 	data := []byte{0x02, 0x01}
-	schema := `{"type":["null","boolean"]}`
+	schema := `["null","boolean"]`
 	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
 	require.NoError(t, err)
 
@@ -187,13 +189,14 @@ func TestDecoderTypeConverter_ErrorUnionNullableSlice(t *testing.T) {
 
 	data := []byte{0x02, 0x06, 'f', 'o', 'o'}
 	schema := `["null", "bytes"]`
-	dec, _ := avro.NewDecoder(schema, bytes.NewReader(data))
+	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
+	require.NoError(t, err)
 
 	testError := errors.New("test error")
 	avro.RegisterTypeConverters(errorConverter(avro.Union, testError))
 
 	var got []byte
-	err := dec.Decode(&got)
+	err = dec.Decode(&got)
 
 	assert.ErrorIs(t, err, testError)
 	assert.Nil(t, got)
@@ -204,13 +207,14 @@ func TestDecoderTypeConverter_ErrorUnionNullablePtr(t *testing.T) {
 
 	data := []byte{0x02, 0x36}
 	schema := `["null", "int"]`
-	dec, _ := avro.NewDecoder(schema, bytes.NewReader(data))
+	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
+	require.NoError(t, err)
 
 	testError := errors.New("test error")
 	avro.RegisterTypeConverters(errorConverter(avro.Union, testError))
 
 	var got *int
-	err := dec.Decode(&got)
+	err = dec.Decode(&got)
 
 	assert.ErrorIs(t, err, testError)
 	assert.Nil(t, got)

@@ -29,7 +29,7 @@ func NewDecoderForSchema(schema Schema, reader io.Reader) *Decoder {
 func (d *Decoder) Decode(v any) error {
 	if d.r.head == d.r.tail && d.r.reader != nil {
 		if !d.r.loadMore() {
-			return io.EOF
+			return d.r.Error
 		}
 	}
 

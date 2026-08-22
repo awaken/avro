@@ -1,7 +1,11 @@
 package avro_test
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -15,11 +19,50 @@ func TestParse_InvalidType(t *testing.T) {
 	schemas := []string{
 		`123`,
 		`{"type": 123}`,
+		`{"type":"record","name":"R","fields":[{"name":"v","type":null}]}`,
+		`{"type":"array","items":null}`,
+		`[null]`,
 	}
 
 	for _, schm := range schemas {
 		_, err := avro.Parse(schm)
 
+		assert.Error(t, err)
+	}
+}
+
+func TestParse_MalformedJSONPreservesSyntaxError(t *testing.T) {
+	for _, schema := range []string{
+		`{"type":"record"`,
+		`["null","int"`,
+		`"unterminated`,
+	} {
+		_, err := avro.Parse(schema)
+		require.ErrorContains(t, err, "invalid schema JSON")
+	}
+}
+
+func TestParse_BareNamedReference(t *testing.T) {
+	cache := &avro.SchemaCache{}
+	_, err := avro.ParseWithCache(`{"type":"record","name":"Referenced","namespace":"example","fields":[]}`, "", cache)
+	require.NoError(t, err)
+
+	schema, err := avro.ParseWithCache("example.Referenced", "", cache)
+	require.NoError(t, err)
+	require.Equal(t, "example.Referenced", schema.(avro.NamedSchema).FullName())
+}
+
+func TestParse_AttributeNamesAreCaseSensitive(t *testing.T) {
+	schemas := []string{
+		`{"type":"record","Name":"R","Fields":[]}`,
+		`{"type":"enum","name":"E","Symbols":["A"]}`,
+		`{"type":"array","Items":"int"}`,
+		`{"type":"map","Values":"int"}`,
+		`{"type":"fixed","name":"F","Size":3}`,
+	}
+
+	for _, schema := range schemas {
+		_, err := avro.ParseWithCache(schema, "", &avro.SchemaCache{})
 		assert.Error(t, err)
 	}
 }
@@ -53,6 +96,60 @@ func TestParseFiles_InvalidSchema(t *testing.T) {
 	_, err := avro.ParseFiles("testdata/bad-schema.avsc")
 
 	assert.Error(t, err)
+}
+
+func TestParseFiles_IsolatedFromDefaultCache(t *testing.T) {
+	const name = "ParseFilesExternalIsolation"
+	external, err := avro.ParseWithCache(`{"type":"record","name":"`+name+`","fields":[]}`, "", &avro.SchemaCache{})
+	require.NoError(t, err)
+	avro.DefaultSchemaCache.Add(name, external)
+
+	dir := avroTestTempDir(t)
+	path := filepath.Join(dir, "external.avsc")
+	require.NoError(t, os.WriteFile(path, []byte(`"`+name+`"`), 0o600))
+
+	_, err = avro.ParseFiles(path)
+	require.ErrorContains(t, err, "unknown type")
+}
+
+func TestParseFiles_ConcurrentInvocationsOwnTheirCaches(t *testing.T) {
+	dir := avroTestTempDir(t)
+	type files struct {
+		name       string
+		definition string
+		reference  string
+	}
+	tests := []files{
+		{name: "ConcurrentOne", definition: filepath.Join(dir, "one-definition.avsc"), reference: filepath.Join(dir, "one-reference.avsc")},
+		{name: "ConcurrentTwo", definition: filepath.Join(dir, "two-definition.avsc"), reference: filepath.Join(dir, "two-reference.avsc")},
+	}
+	for _, test := range tests {
+		require.NoError(t, os.WriteFile(test.definition, []byte(`{"type":"record","name":"`+test.name+`","fields":[]}`), 0o600))
+		require.NoError(t, os.WriteFile(test.reference, []byte(`"`+test.name+`"`), 0o600))
+	}
+
+	errs := make(chan error, 100)
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		test := tests[i%len(tests)]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			schema, err := avro.ParseFiles(test.definition, test.reference)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if got := schema.(avro.NamedSchema).FullName(); got != test.name {
+				errs <- fmt.Errorf("got schema %s, want %s", got, test.name)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		assert.NoError(t, err)
+	}
 }
 
 func TestNullSchema(t *testing.T) {
@@ -244,9 +341,9 @@ func TestRecordSchema(t *testing.T) {
 			wantErr: require.Error,
 		},
 		{
-			name:    "Invalid Alias",
+			name:    "Historical Field Alias",
 			schema:  `{"type":"record", "name":"test", "namespace": "org.hamba.avro", "fields":[{"name": "field", "aliases": ["test+"], "type": "int"}]}`,
-			wantErr: require.Error,
+			wantErr: require.NoError,
 		},
 		{
 			name:    "No Field Type",
@@ -359,9 +456,29 @@ func TestRecordSchema_ValidatesDefault(t *testing.T) {
 			wantErr: assert.NoError,
 		},
 		{
+			name:    "Int Fractional",
+			schema:  `{"type":"record", "name":"test", "namespace": "org.hamba.avro", "fields":[{"name": "a", "type": "int", "default": 1.5}]}`,
+			wantErr: assert.Error,
+		},
+		{
+			name:    "Int Out Of Range",
+			schema:  `{"type":"record", "name":"test", "namespace": "org.hamba.avro", "fields":[{"name": "a", "type": "int", "default": 2147483648}]}`,
+			wantErr: assert.Error,
+		},
+		{
 			name:    "Long",
 			schema:  `{"type":"record", "name":"test", "namespace": "org.hamba.avro", "fields":[{"name": "a", "type": "long", "default": 1}]}`,
 			wantErr: assert.NoError,
+		},
+		{
+			name:    "Long Above Binary64 Exact Range",
+			schema:  `{"type":"record", "name":"test", "namespace": "org.hamba.avro", "fields":[{"name": "a", "type": "long", "default": 9007199254740993}]}`,
+			wantErr: assert.NoError,
+		},
+		{
+			name:    "Long Out Of Range",
+			schema:  `{"type":"record", "name":"test", "namespace": "org.hamba.avro", "fields":[{"name": "a", "type": "long", "default": 9223372036854775808}]}`,
+			wantErr: assert.Error,
 		},
 		{
 			name:    "Float",
@@ -414,8 +531,13 @@ func TestRecordSchema_ValidatesDefault(t *testing.T) {
 			wantErr: assert.NoError,
 		},
 		{
-			name:    "Union Invalid Type",
+			name:    "Union Default Matches Later Type",
 			schema:  `{"type":"record", "name":"test", "namespace": "org.hamba.avro", "fields":[{"name": "a", "type": ["null", "string"], "default": "string"}]}`,
+			wantErr: assert.NoError,
+		},
+		{
+			name:    "Union Default Matches No Type",
+			schema:  `{"type":"record", "name":"test", "namespace": "org.hamba.avro", "fields":[{"name": "a", "type": ["null", "string"], "default": true}]}`,
 			wantErr: assert.Error,
 		},
 		{
@@ -427,6 +549,11 @@ func TestRecordSchema_ValidatesDefault(t *testing.T) {
 			name:    "Record With Nullable Field",
 			schema:  `{"type":"record", "name":"test", "namespace": "org.hamba.avro", "fields":[{"name": "a", "type": {"type":"record", "name": "test2", "fields":[{"name": "b", "type": "int"},{"name": "c", "type": ["null","int"]}]}, "default": {"b": 1, "c": null}}]}`,
 			wantErr: assert.NoError,
+		},
+		{
+			name:    "Record Missing Nullable Field Without Default",
+			schema:  `{"type":"record", "name":"test", "namespace": "org.hamba.avro", "fields":[{"name": "a", "type": {"type":"record", "name": "test2", "fields":[{"name": "b", "type": "int"},{"name": "c", "type": ["null","int"]}]}, "default": {"b": 1}}]}`,
+			wantErr: assert.Error,
 		},
 		{
 			name:    "Record Not Map",
@@ -463,6 +590,57 @@ func TestRecordSchema_ValidatesDefault(t *testing.T) {
 			schema2, err := avro.ParseWithCache(string(b), "", &avro.SchemaCache{})
 			assert.NoError(t, err)
 			assert.Equal(t, schema, schema2)
+		})
+	}
+}
+
+func TestRecordSchema_PreservesLargeLongDefault(t *testing.T) {
+	schema, err := avro.ParseWithCache(`{"type":"record","name":"R","fields":[{"name":"v","type":"long","default":9007199254740993}]}`, "", &avro.SchemaCache{})
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(9007199254740993), schema.(*avro.RecordSchema).Fields()[0].Default())
+}
+
+func TestRecordSchema_UnionDefaultUsesFirstMatchingBranch(t *testing.T) {
+	tests := []struct {
+		name    string
+		schema  string
+		want    any
+		wantErr require.ErrorAssertionFunc
+	}{
+		{
+			name:    "later string",
+			schema:  `{"type":"record","name":"R","fields":[{"name":"v","type":["null","string"],"default":"value"}]}`,
+			want:    "value",
+			wantErr: require.NoError,
+		},
+		{
+			name:    "first ambiguous numeric branch",
+			schema:  `{"type":"record","name":"R","fields":[{"name":"v","type":["long","int"],"default":1}]}`,
+			want:    int64(1),
+			wantErr: require.NoError,
+		},
+		{
+			name:    "later named branch",
+			schema:  `{"type":"record","name":"R","fields":[{"name":"v","type":["null",{"type":"record","name":"Nested","fields":[{"name":"n","type":"int"}]}],"default":{"n":1}}]}`,
+			want:    map[string]any{"n": 1},
+			wantErr: require.NoError,
+		},
+		{
+			name:    "no matching branch",
+			schema:  `{"type":"record","name":"R","fields":[{"name":"v","type":["null","string"],"default":true}]}`,
+			wantErr: require.Error,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			schema, err := avro.ParseWithCache(test.schema, "", &avro.SchemaCache{})
+			test.wantErr(t, err)
+			if err != nil {
+				return
+			}
+			require.Equal(t, test.want, schema.(*avro.RecordSchema).Fields()[0].Default())
 		})
 	}
 }
@@ -626,6 +804,15 @@ func TestRecordSchema_WithAliasReference(t *testing.T) {
 	assert.Equal(t, s.Fingerprint(), s.(*avro.RecordSchema).Fields()[1].Type().Fingerprint())
 }
 
+func TestRecordSchema_WithHistoricalAliasReference(t *testing.T) {
+	schema := `{"type":"record","name":"Current","namespace":"example","aliases":["old-name"],"fields":[{"name":"previous","type":"old-name"}]}`
+
+	parsed, err := avro.ParseWithCache(schema, "", &avro.SchemaCache{})
+	require.NoError(t, err)
+	require.Equal(t, []string{"example.old-name"}, parsed.(avro.NamedSchema).Aliases())
+	require.Equal(t, avro.Ref, parsed.(*avro.RecordSchema).Fields()[0].Type().Type())
+}
+
 func TestEnumSchema(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -700,6 +887,16 @@ func TestEnumSchema(t *testing.T) {
 		{
 			name:    "Invalid Default",
 			schema:  `{"type":"enum", "name":"test", "namespace": "org.hamba.avro", "symbols":["TEST"], "default": "foo"}`,
+			wantErr: require.Error,
+		},
+		{
+			name:    "Empty Default",
+			schema:  `{"type":"enum", "name":"test", "namespace": "org.hamba.avro", "symbols":["TEST"], "default": ""}`,
+			wantErr: require.Error,
+		},
+		{
+			name:    "Invalid Default Type",
+			schema:  `{"type":"enum", "name":"test", "namespace": "org.hamba.avro", "symbols":["TEST"], "default": 1}`,
 			wantErr: require.Error,
 		},
 	}
@@ -847,10 +1044,14 @@ func TestUnionSchema(t *testing.T) {
 			wantErr:         require.NoError,
 		},
 		{
-			name:            "Valid Complex",
-			schema:          `{"type":["null", "int"]}`,
-			wantFingerprint: [32]byte{0xb4, 0x94, 0x95, 0xc5, 0xb1, 0xc2, 0x6f, 0x4, 0x89, 0x6a, 0x5f, 0x68, 0x65, 0xf, 0xe2, 0xb7, 0x64, 0x23, 0x62, 0xc3, 0x41, 0x98, 0xd6, 0xbc, 0x74, 0x65, 0xa1, 0xd9, 0xf7, 0xe1, 0xaf, 0xce},
-			wantErr:         require.NoError,
+			name:    "No Object Wrapped Union",
+			schema:  `{"type":["null", "int"]}`,
+			wantErr: require.Error,
+		},
+		{
+			name:    "No Object Wrapped Union With Discarded Property",
+			schema:  `{"type":["null", "int"],"custom":"value"}`,
+			wantErr: require.Error,
 		},
 		{
 			name:    "No Nested Union Type",
@@ -898,6 +1099,34 @@ func TestUnionSchema(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUnionSchema_RejectsDuplicateUnderlyingLogicalTypes(t *testing.T) {
+	tests := []string{
+		`["string",{"type":"string","logicalType":"uuid"}]`,
+		`["int",{"type":"int","logicalType":"date"}]`,
+		`["int",{"type":"int","logicalType":"time-millis"}]`,
+		`["long",{"type":"long","logicalType":"time-micros"}]`,
+		`["long",{"type":"long","logicalType":"timestamp-millis"}]`,
+		`["long",{"type":"long","logicalType":"timestamp-micros"}]`,
+		`["long",{"type":"long","logicalType":"local-timestamp-millis"}]`,
+		`["long",{"type":"long","logicalType":"local-timestamp-micros"}]`,
+		`["bytes",{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}]`,
+	}
+
+	for _, schema := range tests {
+		_, err := avro.ParseWithCache(schema, "", &avro.SchemaCache{})
+		require.ErrorContains(t, err, "union type must be unique")
+	}
+}
+
+func TestUnionSchema_PreservesLogicalLookupKeys(t *testing.T) {
+	schema, err := avro.ParseWithCache(`[{"type":"int","logicalType":"date"},"string"]`, "", &avro.SchemaCache{})
+	require.NoError(t, err)
+
+	logical, position := schema.(*avro.UnionSchema).Types().Get("int.date")
+	require.Equal(t, 0, position)
+	require.Equal(t, avro.Date, logical.(avro.LogicalTypeSchema).Logical().Type())
 }
 
 func TestUnionSchema_Indices(t *testing.T) {
@@ -989,6 +1218,16 @@ func TestFixedSchema(t *testing.T) {
 			wantErr: require.Error,
 		},
 		{
+			name:    "Fractional Size Value",
+			schema:  `{"type":"fixed", "name":"test", "namespace": "org.hamba.avro", "size": 1.5}`,
+			wantErr: require.Error,
+		},
+		{
+			name:    "Out Of Range Size Value",
+			schema:  `{"type":"fixed", "name":"test", "namespace": "org.hamba.avro", "size": 1e20}`,
+			wantErr: require.Error,
+		},
+		{
 			name:    "Invalid Size Value",
 			schema:  `{"type":"fixed", "name":"test", "namespace": "org.hamba.avro", "size": -1}`,
 			wantErr: require.Error,
@@ -1022,6 +1261,80 @@ func TestFixedSchema_HandlesProps(t *testing.T) {
 	assert.Equal(t, avro.Fixed, s.Type())
 	assert.Equal(t, "bar", s.(*avro.FixedSchema).Prop("foo"))
 	assert.Equal(t, map[string]any{"foo": "bar"}, s.(*avro.FixedSchema).Props())
+}
+
+func TestNamedSchema_ExplicitEmptyNamespace(t *testing.T) {
+	schema, err := avro.ParseWithCache(`{"type":"record","name":"Outer","namespace":"parent","fields":[{"name":"r","type":{"type":"record","name":"R","namespace":"","fields":[]}},{"name":"e","type":{"type":"enum","name":"E","namespace":"","symbols":["A"]}},{"name":"f","type":{"type":"fixed","name":"F","namespace":"","size":1}}]}`, "", &avro.SchemaCache{})
+	require.NoError(t, err)
+
+	fields := schema.(*avro.RecordSchema).Fields()
+	assert.Equal(t, "R", fields[0].Type().(avro.NamedSchema).FullName())
+	assert.Equal(t, "E", fields[1].Type().(avro.NamedSchema).FullName())
+	assert.Equal(t, "F", fields[2].Type().(avro.NamedSchema).FullName())
+}
+
+func TestSchema_LogicalAnnotationsDoNotChangeStandardFingerprints(t *testing.T) {
+	tests := []struct {
+		name    string
+		plain   string
+		logical string
+	}{
+		{
+			name:    "primitive",
+			plain:   `"long"`,
+			logical: `{"type":"long","logicalType":"timestamp-millis"}`,
+		},
+		{
+			name:    "decimal bytes",
+			plain:   `"bytes"`,
+			logical: `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`,
+		},
+		{
+			name:    "fixed",
+			plain:   `{"type":"fixed","name":"F","size":12}`,
+			logical: `{"type":"fixed","name":"F","size":12,"logicalType":"duration"}`,
+		},
+		{
+			name:    "nested",
+			plain:   `{"type":"record","name":"R","fields":[{"name":"v","type":"long"}]}`,
+			logical: `{"type":"record","name":"R","fields":[{"name":"v","type":{"type":"long","logicalType":"timestamp-millis"}}]}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			plain, err := avro.ParseWithCache(test.plain, "", &avro.SchemaCache{})
+			require.NoError(t, err)
+			logical, err := avro.ParseWithCache(test.logical, "", &avro.SchemaCache{})
+			require.NoError(t, err)
+
+			require.Equal(t, plain.String(), logical.String())
+			require.Equal(t, plain.Fingerprint(), logical.Fingerprint())
+			plainCRC, err := plain.FingerprintUsing(avro.CRC64Avro)
+			require.NoError(t, err)
+			logicalCRC, err := logical.FingerprintUsing(avro.CRC64Avro)
+			require.NoError(t, err)
+			require.Equal(t, plainCRC, logicalCRC)
+			require.NotEqual(t, plain.CacheFingerprint(), logical.CacheFingerprint())
+
+			encoded, err := json.Marshal(logical)
+			require.NoError(t, err)
+			require.Contains(t, string(encoded), `"logicalType"`)
+		})
+	}
+}
+
+func TestSchema_LegacyLogicalFingerprintMigration(t *testing.T) {
+	const oldCanonical = `{"name":"R","type":"record","fields":[{"name":"v","type":{"type":"long","logicalType":"timestamp-millis"}}]}`
+	schema, err := avro.ParseWithCache(`{"type":"record","name":"R","fields":[{"name":"v","type":{"type":"long","logicalType":"timestamp-millis"}}]}`, "", &avro.SchemaCache{})
+	require.NoError(t, err)
+
+	require.Equal(t, sha256.Sum256([]byte(oldCanonical)), avro.LegacyFingerprint(schema))
+	legacyCRC, err := avro.LegacyFingerprintUsing(schema, avro.CRC64Avro)
+	require.NoError(t, err)
+	standardCRC, err := schema.FingerprintUsing(avro.CRC64Avro)
+	require.NoError(t, err)
+	require.NotEqual(t, legacyCRC, standardCRC)
 }
 
 func TestSchema_LogicalTypes(t *testing.T) {
@@ -1185,10 +1498,41 @@ func TestSchema_LogicalTypes(t *testing.T) {
 			wantLogical: false,
 		},
 		{
+			name:        "Fixed Decimal Zero Size",
+			schema:      `{"type": "fixed", "name":"test", "size": 0, "logicalType": "decimal", "precision": 1}`,
+			wantType:    avro.Fixed,
+			wantLogical: false,
+		},
+		{
 			name:        "Fixed Decimal Precision Too Large",
 			schema:      `{"type": "fixed", "name":"test", "size": 4, "logicalType": "decimal", "precision": 10}`,
 			wantType:    avro.Fixed,
 			wantLogical: false,
+		},
+		{
+			name:        "Fixed Decimal Precision Exceeds Signed Capacity",
+			schema:      `{"type": "fixed", "name":"test", "size": 3, "logicalType": "decimal", "precision": 7}`,
+			wantType:    avro.Fixed,
+			wantLogical: false,
+		},
+		{
+			name:        "Fixed Decimal Fractional Precision",
+			schema:      `{"type": "fixed", "name":"test", "size": 3, "logicalType": "decimal", "precision": 6.9}`,
+			wantType:    avro.Fixed,
+			wantLogical: false,
+		},
+		{
+			name:        "Fixed Decimal Fractional Scale",
+			schema:      `{"type": "fixed", "name":"test", "size": 3, "logicalType": "decimal", "precision": 6, "scale": 1.9}`,
+			wantType:    avro.Fixed,
+			wantLogical: false,
+		},
+		{
+			name:            "Fixed Decimal Large Size",
+			schema:          `{"type": "fixed", "name":"test", "size": 128, "logicalType": "decimal", "precision": 1}`,
+			wantType:        avro.Fixed,
+			wantLogical:     true,
+			wantLogicalType: avro.Decimal,
 		},
 		{
 			name:        "Fixed Decimal Scale Larger Than Precision",
@@ -1356,6 +1700,57 @@ func TestSchema_MultiFile(t *testing.T) {
 	assert.Equal(t, want, got)
 }
 
+func TestParseWithCache_DoesNotMutateEarlierRecursiveRoots(t *testing.T) {
+	cache := &avro.SchemaCache{}
+	first, err := avro.ParseWithCache(`{"type":"record","name":"A","fields":[{"name":"b","type":{"type":"record","name":"B","fields":[{"name":"a","type":"A"}]}}]}`, "", cache)
+	require.NoError(t, err)
+	wantString := first.String()
+	wantFingerprint := first.Fingerprint()
+
+	second, err := avro.ParseWithCache(`"B"`, "", cache)
+	require.NoError(t, err)
+	require.Equal(t, "B", second.(avro.NamedSchema).FullName())
+	require.Equal(t, wantString, first.String())
+	require.Equal(t, wantFingerprint, first.Fingerprint())
+
+	again, err := avro.ParseWithCache(`"A"`, "", cache)
+	require.NoError(t, err)
+	require.Equal(t, wantString, again.String())
+	require.Equal(t, wantString, first.String())
+	require.Equal(t, wantFingerprint, first.Fingerprint())
+}
+
+func TestParseWithCache_ConcurrentRecursiveRootsAreIndependent(t *testing.T) {
+	cache := &avro.SchemaCache{}
+	first, err := avro.ParseWithCache(`{"type":"record","name":"ConcurrentA","fields":[{"name":"b","type":{"type":"record","name":"ConcurrentB","fields":[{"name":"a","type":"ConcurrentA"}]}}]}`, "", cache)
+	require.NoError(t, err)
+	wantString := first.String()
+	wantFingerprint := first.Fingerprint()
+
+	errs := make(chan error, 200)
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		name := "ConcurrentA"
+		if i%2 == 0 {
+			name = "ConcurrentB"
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := avro.ParseWithCache(`"`+name+`"`, "", cache); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		assert.NoError(t, err)
+	}
+	require.Equal(t, wantString, first.String())
+	require.Equal(t, wantFingerprint, first.Fingerprint())
+}
+
 func TestSchema_DoesNotAllowDuplicateFullNames(t *testing.T) {
 	schm := `
 {
@@ -1377,6 +1772,13 @@ func TestSchema_DoesNotAllowDuplicateFullNames(t *testing.T) {
 
 	_, err := avro.Parse(schm)
 
+	assert.Error(t, err)
+}
+
+func TestSchema_DoesNotAllowDuplicateAliases(t *testing.T) {
+	schema := `{"type":"record","name":"Root","fields":[{"name":"a","type":{"type":"record","name":"A","aliases":["shared"],"fields":[]}},{"name":"b","type":{"type":"record","name":"B","aliases":["shared"],"fields":[]}}]}`
+
+	_, err := avro.ParseWithCache(schema, "", &avro.SchemaCache{})
 	assert.Error(t, err)
 }
 
@@ -2279,7 +2681,7 @@ func TestConcurrentParse(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			_, err := avro.ParseFiles("testdata/concurrent-schema.avsc")
-			require.NoError(t, err)
+			assert.NoError(t, err)
 		}()
 	}
 
@@ -2304,4 +2706,19 @@ func FuzzSchemaParse(f *testing.F) {
 		}
 		_, _ = avro.ParseBytes(data)
 	})
+}
+
+func avroTestTempDir(t *testing.T) string {
+	t.Helper()
+	tempRoot, err := filepath.Abs("../../../tmp")
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(tempRoot, 0o700))
+	tempDir, err := os.MkdirTemp(tempRoot, "avro-schema-test-")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			t.Errorf("remove Avro schema test directory: %v", err)
+		}
+	})
+	return tempDir
 }

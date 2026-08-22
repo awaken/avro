@@ -273,6 +273,7 @@ func TestEncoder_Int64FromInt(t *testing.T) {
 	if strconv.IntSize != 64 {
 		t.Skipf("int size is %d, skipping test", strconv.IntSize)
 	}
+
 	defer ConfigTeardown()
 
 	schema := "long"

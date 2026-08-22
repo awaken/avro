@@ -41,9 +41,9 @@ func NewDecoder(client *Client, opts ...DecoderFunc) *Decoder {
 // The data must be formatted using the Confluent wire format, otherwise
 // and error will be returned.
 // See:
-// https://docs.confluent.io/3.2.0/schema-registry/docs/serializer-formatter.html#wire-format.
+// https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html#wire-format.
 func (d *Decoder) Decode(ctx context.Context, data []byte, v any) error {
-	if len(data) < 6 {
+	if len(data) < 5 {
 		return errors.New("data too short")
 	}
 

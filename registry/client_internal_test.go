@@ -22,3 +22,22 @@ func TestNewClient_WithBasicAuth(t *testing.T) {
 
 	assert.Equal(t, client.creds, creds)
 }
+
+func TestEscapeSubject(t *testing.T) {
+	tests := []struct {
+		name    string
+		subject string
+		want    string
+	}{
+		{name: "plain", subject: "orders-value", want: "orders-value"},
+		{name: "slash", subject: "path/to.proto", want: "path%2Fto.proto"},
+		{name: "dot", subject: ".", want: "%2E"},
+		{name: "dot dot", subject: "..", want: "%2E%2E"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, escapeSubject(test.subject))
+		})
+	}
+}

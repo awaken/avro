@@ -136,6 +136,7 @@ func TestDecoder_MapUnmarshallerMap(t *testing.T) {
 
 	require.NoError(t, err)
 	want := map[textUnmarshallerInt]string{1: "test"}
+	require.Len(t, got, len(want))
 	for k, v := range got {
 		wantVal, ok := want[*k]
 		assert.True(t, ok)

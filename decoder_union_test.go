@@ -309,7 +309,7 @@ func TestDecoder_UnionPtrRecursiveType(t *testing.T) {
 		"name": "test",
 		"fields" : [
 			{"name": "a", "type": "int"},
-			{"name": "b", "type": [null, "test"]}
+			{"name": "b", "type": ["null", "test"]}
 		]
 	}`
 	dec, _ := avro.NewDecoder(schema, bytes.NewReader(data))

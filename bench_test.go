@@ -49,7 +49,9 @@ func BenchmarkSuperheroDecode(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = avro.Unmarshal(schema, data, super)
+		if err := avro.Unmarshal(schema, data, super); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -75,7 +77,9 @@ func BenchmarkSuperheroEncode(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = avro.Marshal(schema, super)
+		if _, err := avro.Marshal(schema, super); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -95,7 +99,9 @@ func BenchmarkPartialSuperheroDecode(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = avro.Unmarshal(schema, data, super)
+		if err := avro.Unmarshal(schema, data, super); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -114,7 +120,9 @@ func BenchmarkSuperheroGenericDecode(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		var m any
-		_ = avro.Unmarshal(schema, data, &m)
+		if err := avro.Unmarshal(schema, data, &m); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -127,20 +135,22 @@ func BenchmarkSuperheroGenericEncode(b *testing.B) {
 	super := map[string]any{
 		"id":             234765,
 		"affiliation_id": 9867,
-		"Name":           "Wolverine",
-		"life":           85.25,
-		"energy":         32.75,
+		"name":           "Wolverine",
+		"life":           float32(85.25),
+		"energy":         float32(32.75),
 		"powers": []map[string]any{
-			{"id": 2345, "name": "Bone Claws", "damage": 5, "energy": 1.15, "passive": false},
-			{"id": 2346, "name": "Regeneration", "damage": -2, "energy": 0.55, "passive": true},
-			{"id": 2347, "name": "Adamant skeleton", "damage": -10, "energy": 0, "passive": true},
+			{"id": 2345, "name": "Bone Claws", "damage": float32(5), "energy": float32(1.15), "passive": false},
+			{"id": 2346, "name": "Regeneration", "damage": float32(-2), "energy": float32(0.55), "passive": true},
+			{"id": 2347, "name": "Adamant skeleton", "damage": float32(-10), "energy": float32(0), "passive": true},
 		},
 	}
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = avro.Marshal(schema, super)
+		if _, err := avro.Marshal(schema, super); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -169,6 +179,8 @@ func BenchmarkSuperheroWriteFlush(b *testing.B) {
 	w := avro.NewWriter(io.Discard, 128)
 	for i := 0; i < b.N; i++ {
 		w.WriteVal(schema, super)
-		_ = w.Flush()
+		if err := w.Flush(); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

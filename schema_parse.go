@@ -1,17 +1,22 @@
 package avro
 
 import (
+	stdjson "encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/go-viper/mapstructure/v2"
 	jsoniter "github.com/json-iterator/go"
 )
+
+var schemaJSONAPI = jsoniter.Config{UseNumber: true}.Froze()
 
 // DefaultSchemaCache is the default cache for schemas.
 var DefaultSchemaCache = &SchemaCache{}
@@ -48,13 +53,14 @@ func MustParse(schema string) Schema {
 // This is useful when your schemas rely on other schemas.
 func ParseFiles(paths ...string) (Schema, error) {
 	var schema Schema
+	cache := &SchemaCache{}
 	for _, path := range paths {
 		s, err := os.ReadFile(filepath.Clean(path))
 		if err != nil {
 			return nil, err
 		}
 
-		schema, err = ParseBytes(s)
+		schema, err = ParseBytesWithCache(s, "", cache)
 		if err != nil {
 			return nil, err
 		}
@@ -71,8 +77,14 @@ func ParseBytes(schema []byte) (Schema, error) {
 // ParseBytesWithCache parses a schema byte slice using the given namespace and schema cache.
 func ParseBytesWithCache(schema []byte, namespace string, cache *SchemaCache) (Schema, error) {
 	var json any
-	if err := jsoniter.Unmarshal(schema, &json); err != nil {
-		json = string(schema)
+	if err := schemaJSONAPI.Unmarshal(schema, &json); err != nil {
+		bareName := strings.TrimSpace(string(schema))
+		if !isBareSchemaName(bareName) {
+			return nil, fmt.Errorf("avro: invalid schema JSON: %w", err)
+		}
+		json = bareName
+	} else if json == nil && strings.TrimSpace(string(schema)) == "null" {
+		json = "null"
 	}
 
 	internalCache := &SchemaCache{}
@@ -86,14 +98,23 @@ func ParseBytesWithCache(schema []byte, namespace string, cache *SchemaCache) (S
 
 	cache.AddAll(internalCache)
 
-	return derefSchema(s), nil
+	return derefSchema(cloneSchemaGraph(s)), nil
+}
+
+func isBareSchemaName(schema string) bool {
+	if schema == "" {
+		return false
+	}
+	for part := range strings.SplitSeq(schema, ".") {
+		if part == "" || validateNameStrict(part) != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func parseType(namespace string, v any, seen seenCache, cache *SchemaCache) (Schema, error) {
 	switch val := v.(type) {
-	case nil:
-		return &NullSchema{}, nil
-
 	case string:
 		return parsePrimitiveType(namespace, val, cache)
 
@@ -127,16 +148,6 @@ func parsePrimitiveType(namespace, s string, cache *SchemaCache) (Schema, error)
 }
 
 func parseComplexType(namespace string, m map[string]any, seen seenCache, cache *SchemaCache) (Schema, error) {
-	if val, ok := m["type"].([]any); ok {
-		// Note: According to the spec, this is not allowed:
-		// 		https://avro.apache.org/docs/1.12.0/specification/#schema-declaration
-		// The "type" property in an object must be a string. A union type will be a slice,
-		// but NOT an object with a "type" property that is a slice.
-		// Might be advisable to remove this call (tradeoff between better conformance
-		// with the spec vs. possible backwards-compatibility issue).
-		return parseUnion(namespace, val, seen, cache)
-	}
-
 	str, ok := m["type"].(string)
 	if !ok {
 		return nil, fmt.Errorf("avro: unknown type: %+v", m)
@@ -195,6 +206,9 @@ func parsePrimitive(typ Type, m map[string]any) (Schema, error) {
 			delete(p.Props, "logicalType")
 		}
 	}
+	if err := normalizeProperties(p.Props); err != nil {
+		return nil, err
+	}
 
 	if typ == Null {
 		return NewNullSchema(WithProps(p.Props)), nil
@@ -244,12 +258,15 @@ func parseRecord(typ Type, namespace string, m map[string]any, seen seenCache, c
 	if err := checkParsedName(r.Name); err != nil {
 		return nil, err
 	}
-	if r.Namespace == "" {
+	if !slices.Contains(meta.Keys, "namespace") {
 		r.Namespace = namespace
 	}
 
 	if !slices.Contains(meta.Keys, "fields") {
 		return nil, errors.New("avro: record must have an array of fields")
+	}
+	if err := normalizeProperties(r.Props); err != nil {
+		return nil, err
 	}
 	fields := make([]*Field, len(r.Fields))
 
@@ -259,11 +276,11 @@ func parseRecord(typ Type, namespace string, m map[string]any, seen seenCache, c
 	)
 	switch typ {
 	case Record:
-		rec, err = NewRecordSchema(r.Name, r.Namespace, fields,
+		rec, err = newRecordSchema(r.Name, r.Namespace, fields,
 			WithAliases(r.Aliases), WithDoc(r.Doc), WithProps(r.Props),
 		)
 	case Error:
-		rec, err = NewErrorRecordSchema(r.Name, r.Namespace, fields,
+		rec, err = newErrorRecordSchema(r.Name, r.Namespace, fields,
 			WithAliases(r.Aliases), WithDoc(r.Doc), WithProps(r.Props),
 		)
 	}
@@ -271,7 +288,7 @@ func parseRecord(typ Type, namespace string, m map[string]any, seen seenCache, c
 		return nil, err
 	}
 
-	if err = seen.Add(rec.FullName()); err != nil {
+	if err = seen.AddSchema(rec); err != nil {
 		return nil, err
 	}
 
@@ -333,6 +350,9 @@ func parseField(namespace string, m map[string]any, seen seenCache, cache *Schem
 	if !slices.Contains(meta.Keys, "default") {
 		f.Default = NoDefault
 	}
+	if err := normalizeProperties(f.Props); err != nil {
+		return nil, err
+	}
 
 	field, err := NewField(f.Name, typ,
 		WithDefault(f.Default), WithAliases(f.Aliases), WithDoc(f.Doc), WithOrder(f.Order), WithProps(f.Props),
@@ -367,18 +387,23 @@ func parseEnum(namespace string, m map[string]any, seen seenCache, cache *Schema
 	if err := checkParsedName(e.Name); err != nil {
 		return nil, err
 	}
-	if e.Namespace == "" {
+	if !slices.Contains(meta.Keys, "namespace") {
 		e.Namespace = namespace
 	}
+	if err := normalizeProperties(e.Props); err != nil {
+		return nil, err
+	}
 
-	enum, err := NewEnumSchema(e.Name, e.Namespace, e.Symbols,
-		WithDefault(e.Default), WithAliases(e.Aliases), WithDoc(e.Doc), WithProps(e.Props),
-	)
+	opts := []SchemaOption{WithAliases(e.Aliases), WithDoc(e.Doc), WithProps(e.Props)}
+	if slices.Contains(meta.Keys, "default") {
+		opts = append(opts, WithDefault(e.Default))
+	}
+	enum, err := NewEnumSchema(e.Name, e.Namespace, e.Symbols, opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	if err = seen.Add(enum.FullName()); err != nil {
+	if err = seen.AddSchema(enum); err != nil {
 		return nil, err
 	}
 
@@ -413,6 +438,9 @@ func parseArray(namespace string, m map[string]any, seen seenCache, cache *Schem
 	if err != nil {
 		return nil, err
 	}
+	if err := normalizeProperties(a.Props); err != nil {
+		return nil, err
+	}
 
 	return NewArraySchema(schema, WithProps(a.Props)), nil
 }
@@ -433,10 +461,13 @@ func parseMap(namespace string, m map[string]any, seen seenCache, cache *SchemaC
 	}
 
 	if !slices.Contains(meta.Keys, "values") {
-		return nil, errors.New("avro: map must have an values key")
+		return nil, errors.New("avro: map must have a values key")
 	}
 	schema, err := parseType(namespace, ms.Values, seen, cache)
 	if err != nil {
+		return nil, err
+	}
+	if err := normalizeProperties(ms.Props); err != nil {
 		return nil, err
 	}
 
@@ -477,7 +508,7 @@ func parseFixed(namespace string, m map[string]any, seen seenCache, cache *Schem
 	if err := checkParsedName(f.Name); err != nil {
 		return nil, err
 	}
-	if f.Namespace == "" {
+	if !slices.Contains(meta.Keys, "namespace") {
 		f.Namespace = namespace
 	}
 
@@ -492,13 +523,16 @@ func parseFixed(namespace string, m map[string]any, seen seenCache, cache *Schem
 			delete(f.Props, "logicalType")
 		}
 	}
+	if err := normalizeProperties(f.Props); err != nil {
+		return nil, err
+	}
 
 	fixed, err := NewFixedSchema(f.Name, f.Namespace, f.Size, logical, WithAliases(f.Aliases), WithProps(f.Props))
 	if err != nil {
 		return nil, err
 	}
 
-	if err = seen.Add(fixed.FullName()); err != nil {
+	if err = seen.AddSchema(fixed); err != nil {
 		return nil, err
 	}
 
@@ -550,9 +584,13 @@ func newDecimalLogicalType(size, prec, scale int) LogicalSchema {
 		return nil
 	}
 
+	if size == 0 {
+		return nil
+	}
+
 	if size > 0 {
-		maxPrecision := int(math.Floor(math.Log10(math.Pow(2, 8*float64(size)) - 1)))
-		if prec > maxPrecision {
+		maxPrecision := math.Floor(math.Log10(2) * (8*float64(size) - 1))
+		if float64(prec) > maxPrecision {
 			return nil
 		}
 	}
@@ -589,6 +627,29 @@ func decodeMap(in, v any, meta *mapstructure.Metadata) error {
 		ZeroFields: true,
 		Metadata:   meta,
 		Result:     v,
+		DecodeHook: func(from, to reflect.Type, data any) (any, error) {
+			if from == nil || to.Kind() != reflect.Int {
+				return data, nil
+			}
+
+			switch value := data.(type) {
+			case stdjson.Number:
+				parsed, err := strconv.ParseInt(value.String(), 10, to.Bits())
+				if err != nil {
+					return nil, fmt.Errorf("%v is not an integer in range: %w", value, err)
+				}
+				return parsed, nil
+			case float64:
+				limit := math.Ldexp(1, to.Bits()-1)
+				if math.Trunc(value) != value || value < -limit || value >= limit {
+					return nil, fmt.Errorf("%v is not an integer in range", value)
+				}
+			}
+			return data, nil
+		},
+		MatchName: func(mapKey, fieldName string) bool {
+			return mapKey == fieldName
+		},
 	}
 
 	decoder, _ := mapstructure.NewDecoder(cfg)
@@ -634,9 +695,62 @@ func (c seenCache) Add(name string) error {
 	return nil
 }
 
+func (c seenCache) AddSchema(schema NamedSchema) error {
+	if err := c.Add(schema.FullName()); err != nil {
+		return err
+	}
+
+	aliases := map[string]struct{}{}
+	for _, alias := range schema.Aliases() {
+		if _, ok := aliases[alias]; ok {
+			return fmt.Errorf("duplicate alias %q", alias)
+		}
+		aliases[alias] = struct{}{}
+
+		if alias == schema.FullName() {
+			continue
+		}
+		if err := c.Add(alias); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func logicalTypeProperty(props map[string]any) string {
 	if lt, ok := props["logicalType"].(string); ok {
 		return lt
 	}
 	return ""
+}
+
+func normalizeProperties(props map[string]any) error {
+	for key, value := range props {
+		normalized, err := normalizePropertyNumbers(value)
+		if err != nil {
+			return fmt.Errorf("avro: invalid numeric property %q: %w", key, err)
+		}
+		props[key] = normalized
+	}
+	return nil
+}
+
+func normalizePropertyNumbers(value any) (any, error) {
+	switch value := value.(type) {
+	case stdjson.Number:
+		return value.Float64()
+	case []any:
+		for i, item := range value {
+			normalized, err := normalizePropertyNumbers(item)
+			if err != nil {
+				return nil, err
+			}
+			value[i] = normalized
+		}
+	case map[string]any:
+		if err := normalizeProperties(value); err != nil {
+			return nil, err
+		}
+	}
+	return value, nil
 }
