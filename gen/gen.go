@@ -120,8 +120,7 @@ func StructFromSchema(schema avro.Schema, w io.Writer, cfg Config) error {
 // OptsFunc is a function that configures a generator.
 type OptsFunc func(*Generator)
 
-// WithFullName configures the generator to use the full name of a record
-// when creating the struct name.
+// WithFullName uses full Avro names for generated record and enum type names.
 func WithFullName(b bool) OptsFunc {
 	return func(g *Generator) {
 		g.fullName = b
@@ -243,6 +242,12 @@ type Generator struct {
 	typedefs          []typedef
 	typeenums         []typeenum
 	nameCaser         *strcase.Caser
+	roots             []avro.Schema
+	named             map[string]avro.NamedSchema
+	checked           map[avro.NamedSchema]bool
+	visited           map[avro.Schema]bool
+	declared          map[string]bool
+	symbols           map[string]string
 }
 
 // NewGenerator returns a generator.
@@ -255,6 +260,7 @@ func NewGenerator(pkg string, tags map[string]TagStyle, opts ...OptsFunc) *Gener
 		pkg:      pkg,
 		tags:     clonedTags,
 	}
+	g.resetGraph()
 
 	for _, opt := range opts {
 		opt(g)
@@ -281,16 +287,20 @@ func (g *Generator) Reset() {
 	g.typedefs = g.typedefs[:0]
 	g.typeenums = g.typeenums[:0]
 	g.err = nil
+	g.resetGraph()
 }
 
-// Parse parses an avro schema into Go types.
+// Parse visits all reachable schema definitions, including references.
+// Equivalent repeated definitions are emitted once; the first metadata is kept.
+// Generation errors are retained until Reset and returned by Write.
 func (g *Generator) Parse(schema avro.Schema) {
-	_ = g.generate(schema, nil)
+	g.ParseWithMetadata(schema, nil)
 }
 
 // ParseWithMetadata parses an avro schema into Go types with arbitrary metadata attached.
 // The metadata is then passed to the template as `Typedefs[].Metadata`.
 func (g *Generator) ParseWithMetadata(schema avro.Schema, metadata any) {
+	g.roots = append(g.roots, schema)
 	_ = g.generate(schema, metadata)
 }
 
@@ -299,6 +309,12 @@ func (g *Generator) generate(schema avro.Schema, metadata any) string {
 		if g.err == nil {
 			g.err = errors.New("cannot generate Go code from a nil schema")
 		}
+		return ""
+	}
+	if g.err != nil {
+		return ""
+	}
+	if named, ok := schema.(avro.NamedSchema); ok && !g.registerNamed(named) {
 		return ""
 	}
 
@@ -434,20 +450,16 @@ func sanitizeIdentifier(name string) string {
 }
 
 func (g *Generator) resolveEnum(s *avro.EnumSchema) string {
-	name := sanitizeIdentifier(g.nameCaser.ToPascal(s.Name()))
-	if !g.hasTypeEnum(name) {
+	name := g.resolveTypeName(s)
+	if !g.declared[s.FullName()] {
+		g.claimName(g.symbols, name, "enum "+s.FullName())
+		for _, symbol := range s.Symbols() {
+			g.claimName(g.symbols, g.enumConstName(name, symbol), "symbol "+s.FullName()+"."+symbol)
+		}
 		g.typeenums = append(g.typeenums, newTypeEnum(name, s.Symbols()))
+		g.declared[s.FullName()] = true
 	}
 	return name
-}
-
-func (g *Generator) hasTypeEnum(name string) bool {
-	for _, enum := range g.typeenums {
-		if enum.Name == name {
-			return true
-		}
-	}
-	return false
 }
 
 func (g *Generator) resolveTypeName(s avro.NamedSchema) string {
@@ -458,22 +470,35 @@ func (g *Generator) resolveTypeName(s avro.NamedSchema) string {
 }
 
 func (g *Generator) resolveRecordSchema(schema *avro.RecordSchema, metadata any) string {
+	typeName := g.resolveTypeName(schema)
+	if g.visited[schema] {
+		return typeName
+	}
+	// Mark the identity before visiting references, including mutual recursion.
+	g.visited[schema] = true
+	g.claimName(g.symbols, typeName, "record "+schema.FullName())
+	names := map[string]string{}
+	if g.encoders {
+		for _, method := range []string{"Schema", "Marshal", "Unmarshal"} {
+			names[method] = "generated method " + method
+		}
+	}
 	fields := make([]field, len(schema.Fields()))
 	for i, f := range schema.Fields() {
 		typ := g.generate(f.Type(), metadata)
 		name := sanitizeIdentifier(g.nameCaser.ToPascal(f.Name()))
+		g.claimName(names, name, "field "+schema.FullName()+"."+f.Name())
 		fields[i] = g.newField(name, typ, f.Doc(), f.Name(), f.Props())
 	}
 
-	typeName := g.resolveTypeName(schema)
 	if g.err != nil {
 		return typeName
 	}
-	if !g.hasTypeDef(typeName) {
-		g.typedefs = append(
-			g.typedefs,
-			newType(typeName, schema.Doc(), fields, g.rawSchema(schema), schema.Props(), metadata),
-		)
+	if !g.declared[schema.FullName()] {
+		def := newType(typeName, schema.Doc(), fields, g.rawSchema(schema), schema.Props(), metadata)
+		def.FullName = schema.FullName()
+		g.typedefs = append(g.typedefs, def)
+		g.declared[schema.FullName()] = true
 	}
 	return typeName
 }
@@ -492,25 +517,8 @@ func (g *Generator) rawSchema(schema *avro.RecordSchema) string {
 	return avro.LegacyParsingCanonicalForm(schema)
 }
 
-func (g *Generator) hasTypeDef(name string) bool {
-	for _, def := range g.typedefs {
-		if def.Name != name {
-			continue
-		}
-		return true
-	}
-	return false
-}
-
 func (g *Generator) resolveRefSchema(s *avro.RefSchema, metadata any) string {
-	schema := s.Schema()
-	if isNilSchema(schema) {
-		return g.generate(schema, metadata)
-	}
-	if sx, ok := schema.(*avro.RecordSchema); ok {
-		return g.resolveTypeName(sx)
-	}
-	return g.generate(schema, metadata)
+	return g.generate(s.Schema(), metadata)
 }
 
 func (g *Generator) resolveUnionTypes(s *avro.UnionSchema, metadata any) string {
@@ -591,13 +599,29 @@ func (g *Generator) addThirdPartyImport(pkg string) {
 	g.thirdPartyImports = append(g.thirdPartyImports, pkg)
 }
 
-// Write writes Go code from the parsed schemas.
+// Write writes Go code from the parsed schemas. Conflicting normalized names,
+// inaccessible identifiers and recursive value types fail before output is written.
+// WithEncoders initializes reachable schemas in a private cache, without changing
+// avro.DefaultSchemaCache. Each Schema method returns its named record schema.
 func (g *Generator) Write(w io.Writer) error {
 	if err := validateStructTagNames(g.tags); err != nil {
 		return err
 	}
 	if g.err != nil {
 		return g.err
+	}
+	if err := g.checkValueCycles(); err != nil {
+		g.err = err
+		return err
+	}
+	schemaDefinitions, err := g.schemaDefinitions()
+	if err != nil {
+		g.err = err
+		return err
+	}
+	schemaCacheName := ""
+	if len(g.typedefs) > 0 {
+		schemaCacheName = "avroSchemaCache" + g.typedefs[0].Name
 	}
 
 	parsed, err := template.New("out").
@@ -608,7 +632,7 @@ func (g *Generator) Write(w io.Writer) error {
 			"snake":         strcase.ToSnake,
 			"replace":       strings.Replace,
 			"buildTag":      buildTag,
-			"enumConstName": enumConstName,
+			"enumConstName": g.enumConstName,
 		}).
 		Parse(g.template)
 	if err != nil {
@@ -633,20 +657,31 @@ func (g *Generator) Write(w io.Writer) error {
 		Typedefs          []typedef
 		Metadata          any
 		Typeenums         []typeenum
+		SchemaDefinitions []string
+		SchemaCacheName   string
 	}{
-		WithEncoders: g.encoders,
-		PackageName:  g.pkg,
-		PackageDoc:   g.pkgdoc,
-		Imports:      imports,
-		Typedefs:     g.typedefs,
-		Metadata:     g.metadata,
-		Typeenums:    g.typeenums,
+		WithEncoders:      g.encoders,
+		PackageName:       g.pkg,
+		PackageDoc:        g.pkgdoc,
+		Imports:           imports,
+		Typedefs:          g.typedefs,
+		Metadata:          g.metadata,
+		Typeenums:         g.typeenums,
+		SchemaDefinitions: schemaDefinitions,
+		SchemaCacheName:   schemaCacheName,
 	}
-	return parsed.Execute(w, data)
+	// Template errors must not publish incomplete Go source.
+	var output bytes.Buffer
+	if err := parsed.Execute(&output, data); err != nil {
+		return err
+	}
+	_, err = w.Write(output.Bytes())
+	return err
 }
 
 type typedef struct {
 	Name     string
+	FullName string
 	Doc      string
 	Fields   []field
 	Schema   string
@@ -722,8 +757,8 @@ func validateStructTagNames(tags map[string]TagStyle) error {
 	return nil
 }
 
-func enumConstName(typeName, symbol string) string {
-	return sanitizeIdentifier(typeName + strcase.ToPascal(symbol))
+func (g *Generator) enumConstName(typeName, symbol string) string {
+	return sanitizeIdentifier(typeName + g.nameCaser.ToPascal(symbol))
 }
 
 type typeenum struct {

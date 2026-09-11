@@ -58,10 +58,16 @@ func createDecoderOfUnion(d *decoderContext, schema *UnionSchema, typ reflect2.T
 		}
 	}
 
+	if schema.encodedTypes != nil {
+		return decoderOfUnionBranches(d, schema, typ)
+	}
 	return &errorDecoder{err: fmt.Errorf("avro: %s is unsupported for Avro %s", typ.String(), schema.Type())}
 }
 
 func createEncoderOfUnion(e *encoderContext, schema *UnionSchema, typ reflect2.Type) ValEncoder {
+	if schema.encodedTypes != nil {
+		return &errorEncoder{err: ErrResolvedSchemaEncoding}
+	}
 	switch typ.Kind() {
 	case reflect.Map:
 		mapType := typ.(reflect2.MapType)
@@ -93,8 +99,8 @@ func createEncoderOfUnion(e *encoderContext, schema *UnionSchema, typ reflect2.T
 func decoderOfMapUnion(d *decoderContext, union *UnionSchema, typ reflect2.Type) ValDecoder {
 	mapType := typ.(*reflect2.UnsafeMapType)
 
-	typeDecs := make([]ValDecoder, len(union.Types()))
-	for i, s := range union.Types() {
+	typeDecs := make([]ValDecoder, len(union.decodeTypes()))
+	for i, s := range union.decodeTypes() {
 		if s.Type() == Null {
 			continue
 		}
@@ -239,27 +245,44 @@ func decoderOfNullableUnion(d *decoderContext, schema Schema, typ reflect2.Type)
 	case *reflect2.UnsafeSliceType:
 		baseTyp = v
 	}
-	decoder := decoderOfType(d, union.Types()[typeIdx], baseTyp)
+	var decoder ValDecoder
+	var decoders []ValDecoder
+	if union.encodedTypes != nil {
+		decoders = make([]ValDecoder, len(union.decodeTypes()))
+		for i, branch := range union.decodeTypes() {
+			if branch.Type() != Null {
+				decoders[i] = decoderOfType(d, branch, baseTyp)
+			}
+		}
+	} else {
+		decoder = decoderOfType(d, union.Types()[typeIdx], baseTyp)
+	}
 
 	return &unionNullableDecoder{
-		schema:  union,
-		typ:     baseTyp,
-		isPtr:   isPtr,
-		decoder: decoder,
+		schema:   union,
+		typ:      baseTyp,
+		isPtr:    isPtr,
+		decoder:  decoder,
+		decoders: decoders,
 	}
 }
 
 type unionNullableDecoder struct {
-	schema  *UnionSchema
-	typ     reflect2.Type
-	isPtr   bool
-	decoder ValDecoder
+	schema   *UnionSchema
+	typ      reflect2.Type
+	isPtr    bool
+	decoder  ValDecoder
+	decoders []ValDecoder
 }
 
 func (d *unionNullableDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
-	_, schema := getUnionSchema(d.schema, r)
+	index, schema := getUnionSchema(d.schema, r)
 	if schema == nil {
 		return
+	}
+	decoder := d.decoder
+	if d.decoders != nil {
+		decoder = d.decoders[index]
 	}
 
 	if schema.Type() == Null {
@@ -316,26 +339,26 @@ func (d *unionNullableDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		if d.typ.UnsafeIsNil(ptr) {
 			// Create a new instance.
 			newPtr := d.typ.UnsafeNew()
-			d.decoder.Decode(newPtr, r)
+			decoder.Decode(newPtr, r)
 			d.typ.UnsafeSet(ptr, newPtr)
 			return
 		}
 
 		// Reuse the existing instance.
-		d.decoder.Decode(ptr, r)
+		decoder.Decode(ptr, r)
 		return
 	}
 
 	if *((*unsafe.Pointer)(ptr)) == nil {
 		// Create new instance.
 		newPtr := d.typ.UnsafeNew()
-		d.decoder.Decode(newPtr, r)
+		decoder.Decode(newPtr, r)
 		*((*unsafe.Pointer)(ptr)) = newPtr
 		return
 	}
 
 	// Reuse existing instance.
-	d.decoder.Decode(*((*unsafe.Pointer)(ptr)), r)
+	decoder.Decode(*((*unsafe.Pointer)(ptr)), r)
 }
 
 func encoderOfUnionConverterCodec(_ *encoderContext, schema Schema, typ reflect2.Type) ValEncoder {
@@ -453,9 +476,9 @@ func (e *unionNullableEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 func decoderOfResolvedUnion(d *decoderContext, schema Schema, _ reflect2.Type) (ValDecoder, error) {
 	union := schema.(*UnionSchema)
 
-	types := make([]reflect2.Type, len(union.Types()))
-	decoders := make([]ValDecoder, len(union.Types()))
-	for i, schema := range union.Types() {
+	types := make([]reflect2.Type, len(union.decodeTypes()))
+	decoders := make([]ValDecoder, len(union.decodeTypes()))
+	for i, schema := range union.decodeTypes() {
 		name := unionResolutionName(schema)
 
 		typ, err := d.cfg.resolver.Type(name)
@@ -566,7 +589,7 @@ func (d *unionResolvedDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 
 func decoderOfUnionConverterCodec(d *decoderContext, schema *UnionSchema, typ reflect2.Type) ValDecoder {
 	anyDecoder := createDecoderOfUnion(d, schema, reflect2.Type2(reflect.TypeFor[any]()))
-	nullable := slices.ContainsFunc(schema.Types(), func(schema Schema) bool {
+	nullable := slices.ContainsFunc(schema.decodeTypes(), func(schema Schema) bool {
 		return schema.Type() == Null
 	})
 
@@ -688,7 +711,7 @@ func (e *unionResolverEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 }
 
 func getUnionSchema(schema *UnionSchema, r *Reader) (int, Schema) {
-	types := schema.Types()
+	types := schema.decodeTypes()
 
 	idx := r.ReadLong()
 	if r.Error != nil {
@@ -700,4 +723,44 @@ func getUnionSchema(schema *UnionSchema, r *Reader) (int, Schema) {
 	}
 
 	return int(idx), types[idx]
+}
+
+// Native destinations dispatch by the original writer index, even when several
+// branches produce the same Go type.
+func decoderOfUnionBranches(d *decoderContext, schema *UnionSchema, typ reflect2.Type) ValDecoder {
+	decoders := make([]ValDecoder, len(schema.decodeTypes()))
+	for i, branch := range schema.decodeTypes() {
+		switch {
+		case branch.Type() == Null:
+			decoders[i] = &unionNullDecoder{typ: typ}
+		case typ.Kind() == reflect.Ptr:
+			decoders[i] = decoderOfPtr(d, branch, typ)
+		default:
+			decoders[i] = decoderOfType(d, branch, typ)
+		}
+	}
+	return &unionBranchDecoder{schema: schema, decoders: decoders}
+}
+
+type unionBranchDecoder struct {
+	schema   *UnionSchema
+	decoders []ValDecoder
+}
+
+func (d *unionBranchDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
+	index, branch := getUnionSchema(d.schema, r)
+	if branch != nil {
+		d.decoders[index].Decode(ptr, r)
+	}
+}
+
+type unionNullDecoder struct{ typ reflect2.Type }
+
+func (d *unionNullDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
+	switch d.typ.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Ptr, reflect.Interface:
+		d.typ.UnsafeSet(ptr, d.typ.UnsafeNew())
+	default:
+		r.ReportError("decode union null", "destination cannot represent null")
+	}
 }

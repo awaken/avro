@@ -432,17 +432,27 @@ func matchRecordFields(reader, writer *RecordSchema) (map[*Field]*Field, error) 
 // and makes necessary adjustments to support the reader schema.
 //
 // It fails if the writer and reader schemas are not compatible.
+// Recursive records retain references to the completed resolution graph.
+// Resolved writer unions are decode-only: their public types, JSON and canonical
+// fingerprints describe the reader union, while CacheFingerprint identifies the
+// writer-indexed decoding plan. Serializing a schema does not preserve that plan;
+// retain both declared schemas and call Resolve again to reconstruct it.
 func (c *SchemaCompatibility) Resolve(reader, writer Schema) (Schema, error) {
 	if err := c.Compatible(reader, writer); err != nil {
 		return nil, err
 	}
 
-	schema, _, err := c.resolve(reader, writer)
-	return schema, err
+	r := newSchemaResolution(c)
+	schema, _, err := r.resolve(reader, writer)
+	if err != nil {
+		return nil, err
+	}
+	r.finish(reader, writer)
+	return schema, nil
 }
 
 // resolve requires the reader's schema to be already compatible with the writer's.
-func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, resolved bool, err error) {
+func (c *schemaResolution) resolve(reader, writer Schema) (schema Schema, resolved bool, err error) {
 	if reader.Type() == Ref {
 		reader = reader.(*RefSchema).Schema()
 	}
@@ -460,7 +470,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 				}
 				sch, _, err := c.resolve(schema, writer)
 				if err != nil {
-					continue
+					return nil, false, err
 				}
 				return sch, true, nil
 			}
@@ -477,7 +487,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 				}
 				schemas = append(schemas, sch)
 			}
-			s, err := NewUnionSchema(schemas, withWriterFingerprint(writer.Fingerprint()))
+			s, err := c.union(reader, writer, schemas)
 			return s, true, err
 		}
 
@@ -487,6 +497,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 				withWriterFingerprint(writer.Fingerprint()),
 			)
 			r.encodedType = writer.Type()
+			c.remember(&r.cacheFingerprinter)
 			return r, true, nil
 		}
 
@@ -510,6 +521,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 					withWriterFingerprint(w.Fingerprint()),
 				)
 				enum.encodedSymbols = w.Symbols()
+				c.remember(&enum.cacheFingerprinter)
 				return enum, true, nil
 			}
 			return nil, false, err
@@ -526,6 +538,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 			}
 			enum, _ := NewEnumSchema(r.Name(), r.Namespace(), r.Symbols(), opts...)
 			enum.encodedSymbols = w.Symbols()
+			c.remember(&enum.cacheFingerprinter)
 			return enum, true, nil
 		}
 		return reader, false, nil
@@ -545,7 +558,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 			schemas = append(schemas, sch)
 			resolved = resolv || resolved
 		}
-		s, err := NewUnionSchema(schemas, withWriterFingerprintIfResolved(writer.Fingerprint(), resolved))
+		s, err := c.union(reader, writer, schemas)
 		if err != nil {
 			return nil, false, err
 		}
@@ -557,10 +570,12 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 		if err != nil {
 			return nil, false, err
 		}
-		return NewArraySchema(schema,
+		array := NewArraySchema(schema,
 			WithProps(reader.(*ArraySchema).Props()),
 			withWriterFingerprintIfResolved(writer.Fingerprint(), resolved),
-		), resolved, nil
+		)
+		c.remember(&array.cacheFingerprinter)
+		return array, resolved, nil
 	}
 
 	if writer.Type() == Map {
@@ -568,10 +583,12 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 		if err != nil {
 			return nil, false, err
 		}
-		return NewMapSchema(schema,
+		m := NewMapSchema(schema,
 			WithProps(reader.(*MapSchema).Props()),
 			withWriterFingerprintIfResolved(writer.Fingerprint(), resolved),
-		), resolved, nil
+		)
+		c.remember(&m.cacheFingerprinter)
+		return m, resolved, nil
 	}
 
 	if writer.Type() == Record {
@@ -581,13 +598,29 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 	return nil, false, fmt.Errorf("failed to resolve composite schema for %s and %s", reader.Type(), writer.Type())
 }
 
-func (c *SchemaCompatibility) resolveRecord(reader, writer Schema) (Schema, bool, error) {
+func (c *schemaResolution) resolveRecord(reader, writer Schema) (Schema, bool, error) {
 	w := writer.(*RecordSchema)
 	r := reader.(*RecordSchema)
+	pair := resolutionPair{reader: r, writer: w}
+	if previous := c.records[pair]; previous != nil {
+		return NewRefSchema(previous.schema), previous.changed || !previous.done, nil
+	}
 	matched, err := matchRecordFields(r, w)
 	if err != nil {
 		return nil, false, err
 	}
+	// Publish only a named placeholder within this call; fields follow below.
+	placeholder, err := newRecordSchema(r.Name(), r.Namespace(), nil,
+		WithAliases(r.Aliases()), WithDoc(r.Doc()), WithProps(r.Props()),
+		withWriterFingerprint(w.Fingerprint()))
+	if err != nil {
+		return nil, false, err
+	}
+	placeholder.isError = r.IsError()
+	entry := &resolvedRecord{schema: placeholder}
+	c.records[pair] = entry
+	c.order = append(c.order, pair)
+	c.remember(&placeholder.cacheFingerprinter)
 	readers := make(map[*Field]*Field, len(matched))
 	for reader, writer := range matched {
 		readers[writer] = reader
@@ -657,19 +690,12 @@ func (c *SchemaCompatibility) resolveRecord(reader, writer Schema) (Schema, bool
 		resolved = true
 	}
 
-	opts := []SchemaOption{
-		WithAliases(r.Aliases()),
-		WithDoc(r.Doc()),
-		WithProps(r.Props()),
-		withWriterFingerprintIfResolved(writer.Fingerprint(), resolved),
+	if err := validateRecordFields(fields); err != nil {
+		return nil, false, err
 	}
-	var schema *RecordSchema
-	if r.IsError() {
-		schema, err = NewErrorRecordSchema(r.Name(), r.Namespace(), fields, opts...)
-	} else {
-		schema, err = NewRecordSchema(r.Name(), r.Namespace(), fields, opts...)
-	}
-	return schema, resolved, err
+	placeholder.fields = fields
+	entry.changed, entry.done = resolved, true
+	return placeholder, resolved, nil
 }
 
 func isNative(typ Type) bool {

@@ -455,78 +455,100 @@ type structDescriptor struct {
 	Fields structFields
 }
 
-type structFields []*structField
+type structFields map[string]*structField
 
 func (sf structFields) Get(name string) *structField {
-	for _, f := range sf {
-		if f.Name == name {
-			return f
-		}
+	f := sf[name]
+	if f == nil || f.ambiguous {
+		return nil
 	}
-
-	return nil
+	return f
 }
 
 type structField struct {
 	Name  string
 	Field []*reflect2.UnsafeStructField
 
-	anon *reflect2.UnsafeStructType
+	tagged    bool
+	ambiguous bool
+}
+
+// add keeps the shallowest candidate, then prefers an explicit name tag.
+// Equally ranked candidates remain unbound, including repeated embedding paths.
+func (sf structFields) add(f *structField) {
+	old := sf[f.Name]
+	if old == nil || len(f.Field) < len(old.Field) ||
+		(len(f.Field) == len(old.Field) && f.tagged && !old.tagged) {
+		sf[f.Name] = f
+	} else if len(f.Field) == len(old.Field) && f.tagged == old.tagged {
+		old.ambiguous = true
+	}
+}
+
+type structScan struct {
+	typ   *reflect2.UnsafeStructType
+	chain []*reflect2.UnsafeStructField
+	paths uint8
 }
 
 func describeStruct(tagKey string, typ reflect2.Type) *structDescriptor {
 	structType := typ.(*reflect2.UnsafeStructType)
 	fields := structFields{}
 
-	var curr []structField
-	next := []structField{{anon: structType}}
-
+	next := []*structScan{{typ: structType, paths: 1}}
 	visited := map[uintptr]bool{}
 
 	for len(next) > 0 {
-		curr, next = next, curr[:0]
+		curr := next
+		next = nil
+		queued := map[uintptr]*structScan{}
 
 		for _, f := range curr {
-			rtype := f.anon.RType()
-			if visited[f.anon.RType()] {
+			rtype := f.typ.RType()
+			if visited[rtype] {
 				continue
 			}
 			visited[rtype] = true
 
-			for i := range f.anon.NumField() {
-				field := f.anon.Field(i).(*reflect2.UnsafeStructField)
+			for i := range f.typ.NumField() {
+				field := f.typ.Field(i).(*reflect2.UnsafeStructField)
 				isUnexported := field.PkgPath() != ""
-
-				chain := make([]*reflect2.UnsafeStructField, len(f.Field)+1)
-				copy(chain, f.Field)
-				chain[len(f.Field)] = field
-
-				if field.Anonymous() {
-					t := field.Type()
-					if t.Kind() == reflect.Ptr {
-						t = t.(*reflect2.UnsafePtrType).Elem()
-					}
-					if t.Kind() != reflect.Struct {
+				t := field.Type()
+				if t.Kind() == reflect.Ptr {
+					t = t.(*reflect2.UnsafePtrType).Elem()
+				}
+				if isUnexported && (!field.Anonymous() || t.Kind() != reflect.Struct) {
+					continue
+				}
+				name, _, _ := strings.Cut(field.Tag().Get(tagKey), ",")
+				if name == "-" {
+					continue
+				}
+				chain := make([]*reflect2.UnsafeStructField, len(f.chain)+1)
+				copy(chain, f.chain)
+				chain[len(f.chain)] = field
+				if field.Anonymous() && t.Kind() == reflect.Struct && name == "" {
+					key := t.RType()
+					if visited[key] {
 						continue
 					}
-
-					next = append(next, structField{Field: chain, anon: t.(*reflect2.UnsafeStructType)})
+					// Two paths already establish ambiguity. Coalescing avoids
+					// enumerating exponentially many paths through diamonds.
+					if entry := queued[key]; entry != nil {
+						entry.paths = min(2, entry.paths+f.paths)
+					} else {
+						entry = &structScan{typ: t.(*reflect2.UnsafeStructType), chain: chain, paths: f.paths}
+						queued[key] = entry
+						next = append(next, entry)
+					}
 					continue
 				}
-
-				// Ignore unexported fields.
-				if isUnexported {
-					continue
+				tagged := name != ""
+				if name == "" {
+					name = field.Name()
 				}
-
-				fieldName := field.Name()
-				if tag, ok := field.Tag().Lookup(tagKey); ok {
-					fieldName, _, _ = strings.Cut(tag, ",")
-				}
-
-				fields = append(fields, &structField{
-					Name:  fieldName,
-					Field: chain,
+				fields.add(&structField{
+					Name: name, Field: chain, tagged: tagged, ambiguous: f.paths > 1,
 				})
 			}
 		}

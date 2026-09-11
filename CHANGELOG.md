@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## v2.31.6 - 2026-09-11
+
+### Fixed
+
+- Resolve recursive record graphs completely, preserving nested promotions,
+  defaults, references, and decoding-cache identities.
+- Preserve original writer-union indexes across typed, generic, nullable, and
+  skip decoding, including branches that promote to the same reader type.
+- Select embedded Go fields by depth and explicit name tags; detect ambiguous
+  matches without allocating unused pointer paths.
+- Generate every reachable named definition, including recursive references;
+  reject conflicting definitions, Go identifier collisions, inaccessible names,
+  and recursive struct-value cycles before writing source.
+- Initialize generated encoders with private schema caches so recursive graphs
+  work independently of `DefaultSchemaCache` and each `Schema` method returns
+  its own record. Apply configured naming to enum types and constants.
+
+### Compatibility
+
+- Ambiguous embedded fields are now unbound: encoding uses a schema default or
+  fails, while decoding skips the value. Use direct fields or distinct name tags.
+- Resolved writer unions are decode-only; encoding returns
+  `ErrResolvedSchemaEncoding`. Encode with the declared writer schema instead.
+- Serialized resolved schemas omit decoding plans. Retain the declared reader
+  and writer schemas and call `Resolve` again when loading them.
+- `WithFullName(true)` includes namespaces in enum names. Custom templates can
+  use `SchemaDefinitions`, `SchemaCacheName`, and typedef `FullName` for shared
+  schema initialization. See the README for details.
+
 ## v2.31.5 - 2026-09-11
 
 ### Dependencies

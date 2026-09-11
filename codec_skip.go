@@ -52,7 +52,12 @@ func (c *skipDecoderContext) create(schema Schema) ValDecoder {
 		return c.create(schema.(*RefSchema).Schema())
 
 	case Enum:
-		return &enumSkipDecoder{symbols: schema.(*EnumSchema).Symbols()}
+		enum := schema.(*EnumSchema)
+		symbols := enum.Symbols()
+		if enum.encodedSymbols != nil {
+			symbols = enum.encodedSymbols
+		}
+		return &enumSkipDecoder{symbols: symbols}
 
 	case Array:
 		return skipDecoderOfArray(c, schema)
@@ -122,9 +127,12 @@ func (c *skipDecoderContext) record(schema Schema) ValDecoder {
 	deferred := &deferDecoder{}
 	c.records[rec] = deferred
 
-	decoders := make([]ValDecoder, len(rec.Fields()))
-	for i, field := range rec.Fields() {
-		decoders[i] = c.create(field.Type())
+	decoders := make([]ValDecoder, 0, len(rec.Fields()))
+	for _, field := range rec.Fields() {
+		// Reader-only defaults occupy no bytes in the writer's record.
+		if field.action != FieldSetDefault {
+			decoders = append(decoders, c.create(field.Type()))
+		}
 	}
 
 	deferred.decoder = &recordSkipDecoder{

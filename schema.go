@@ -1321,6 +1321,10 @@ type UnionSchema struct {
 	cacheFingerprinter
 
 	types Schemas
+
+	// encodedTypes retains one decode plan per original writer branch.
+	// Public types remain a valid, unique reader-side union declaration.
+	encodedTypes Schemas
 }
 
 // NewUnionSchema creates a union schema instance.
@@ -1393,6 +1397,13 @@ func (s *UnionSchema) Type() Type {
 // Types returns the types of a union.
 func (s *UnionSchema) Types() Schemas {
 	return slices.Clone(s.types)
+}
+
+func (s *UnionSchema) decodeTypes() Schemas {
+	if s.encodedTypes != nil {
+		return s.encodedTypes
+	}
+	return s.types
 }
 
 // Contains returns true if the union contains the given type.

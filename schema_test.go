@@ -2848,13 +2848,16 @@ func TestNewSchema_IgnoresInvalidProperties(t *testing.T) {
 
 func TestConcurrentParse(t *testing.T) {
 	var wg sync.WaitGroup
-
-	for i := 0; i < 10000; i++ {
+	// Keep concurrent parsing without exhausting threads on filesystem I/O.
+	const workers = 16
+	for worker := range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := avro.ParseFiles("testdata/concurrent-schema.avsc")
-			assert.NoError(t, err)
+			for i := worker; i < 10000; i += workers {
+				_, err := avro.ParseFiles("testdata/concurrent-schema.avsc")
+				assert.NoError(t, err)
+			}
 		}()
 	}
 

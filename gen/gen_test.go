@@ -2,6 +2,7 @@ package gen_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"go/ast"
@@ -10,10 +11,13 @@ import (
 	"go/token"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/awaken/avro/v2"
 	"github.com/awaken/avro/v2/gen"
@@ -22,6 +26,223 @@ import (
 )
 
 var update = flag.Bool("update", false, "Update golden files")
+
+func TestGeneratorNameCollisions(t *testing.T) {
+	for _, schema := range []string{
+		`{"type":"record","name":"Collision","fields":[{"name":"foo_bar","type":"int"},{"name":"fooBar","type":"int"}]}`,
+		`{"type":"record","name":"Collision","fields":[{"name":"schema","type":"int"}]}`,
+		`{"type":"record","name":"Collision","fields":[{"name":"e","type":{"type":"enum","name":"State","symbols":["foo_bar","fooBar"]}}]}`,
+	} {
+		g := gen.NewGenerator("generated", nil, gen.WithEncoders(true), gen.WithEnums(true))
+		g.Parse(avro.MustParse(schema))
+		var output bytes.Buffer
+		assert.Error(t, g.Write(&output), schema)
+		assert.Empty(t, output.String(), "failed generation must not write partial source")
+	}
+}
+
+func TestGeneratorBlankIdentifiers(t *testing.T) {
+	for _, schema := range []string{
+		`{"type":"record","name":"_","fields":[]}`,
+		`{"type":"record","name":"BlankField","fields":[{"name":"_","type":"int"}]}`,
+		`{"type":"record","name":"BlankEnum","fields":[{"name":"value","type":{"type":"enum","name":"_","symbols":["A"]}}]}`,
+		`{"type":"record","name":"NumericField","fields":[{"name":"_1","type":"int"}]}`,
+	} {
+		g := gen.NewGenerator("generated", nil, gen.WithEnums(true))
+		g.Parse(avro.MustParse(schema))
+		var output bytes.Buffer
+		assert.Error(t, g.Write(&output), schema)
+		assert.Empty(t, output.String())
+	}
+}
+
+func TestGeneratorReferenceDeclaration(t *testing.T) {
+	external := avro.MustParse(`{"type":"record","name":"External","fields":[{"name":"value","type":"int"}]}`).(*avro.RecordSchema)
+	field, err := avro.NewField("value", avro.NewRefSchema(external))
+	require.NoError(t, err)
+	root, err := avro.NewRecordSchema("Root", "", []*avro.Field{field})
+	require.NoError(t, err)
+	for _, encoders := range []bool{false, true} {
+		g := gen.NewGenerator("generated", nil, gen.WithEncoders(encoders))
+		g.Parse(root)
+		empty, err := avro.NewRecordSchema("Empty", "tree", nil)
+		require.NoError(t, err)
+		g.Parse(empty)
+		var output bytes.Buffer
+		require.NoError(t, g.Write(&output))
+		testGeneratedPackage(t, output.Bytes(), `package generated
+import "testing"
+func TestReferencedValue(t *testing.T) {
+ value := Root{Value: External{Value: 7}}
+ if value.Value.Value != 7 { t.Fatal(value) }
+}`)
+	}
+}
+
+func TestGeneratorRecursiveInitialization(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		t.Run(strconv.FormatBool(full), func(t *testing.T) {
+			g := gen.NewGenerator("generated", nil, gen.WithEncoders(true), gen.WithFullSchema(full))
+			g.Parse(avro.MustParse(`{"type":"record","name":"Parent","namespace":"generation","fields":[{"name":"value","type":"int"},{"name":"child","type":{"type":"record","name":"Child","fields":[{"name":"parent","type":["null","Parent"],"default":null}]}}]}`))
+			var output bytes.Buffer
+			require.NoError(t, g.Write(&output))
+			testGeneratedPackage(t, output.Bytes(), `package generated
+import (
+ "testing"
+ "github.com/awaken/avro/v2"
+)
+func TestRecursiveValue(t *testing.T) {
+ value := Parent{Value: 7, Child: Child{Parent: &Parent{Value: 9}}}
+ data, err := value.Marshal()
+ if err != nil { t.Fatal(err) }
+ var got Parent
+ if err := got.Unmarshal(data); err != nil { t.Fatal(err) }
+ if got.Value != 7 || got.Child.Parent.Value != 9 { t.Fatal(got) }
+ if got.Schema().(avro.NamedSchema).FullName() != "generation.Parent" { t.Fatal("parent schema") }
+ if got.Child.Schema().(avro.NamedSchema).FullName() != "generation.Child" { t.Fatal("child schema") }
+ if avro.DefaultSchemaCache.Get("generation.Parent") != nil { t.Fatal("generated code changed the global schema cache") }
+}`)
+		})
+	}
+}
+
+func TestGeneratorNamedTypes(t *testing.T) {
+	schema := avro.MustParse(`{"type":"record","name":"NamedRoot","fields":[{"name":"first","type":{"type":"enum","name":"one.State","symbols":["READY"]}},{"name":"second","type":{"type":"enum","name":"two.State","symbols":["WAIT"]}}]}`)
+	short := gen.NewGenerator("generated", nil, gen.WithEnums(true))
+	short.Parse(schema)
+	require.ErrorContains(t, short.Write(io.Discard), "collides")
+	full := gen.NewGenerator("generated", nil, gen.WithEnums(true), gen.WithFullName(true))
+	full.Parse(schema)
+	var output bytes.Buffer
+	require.NoError(t, full.Write(&output))
+	testGeneratedPackage(t, output.Bytes(), `package generated
+import "testing"
+func TestEnumNames(t *testing.T) {
+ value := NamedRoot{First: OneStateReady, Second: TwoStateWait}
+ if value.First != "READY" || value.Second != "WAIT" { t.Fatal(value) }
+}`)
+	for _, schemas := range [][]string{
+		{`{"type":"record","name":"one.State","fields":[]}`, `{"type":"enum","name":"two.State","symbols":["READY"]}`},
+		{`{"type":"enum","name":"Status","symbols":["READY"]}`, `{"type":"record","name":"StatusReady","fields":[]}`},
+		{`{"type":"record","name":"Same","fields":[]}`, `{"type":"fixed","name":"Same","size":4}`},
+		{`{"type":"record","name":"Same","fields":[{"name":"value","type":"int"}]}`, `{"type":"record","name":"Same","fields":[{"name":"value","type":"string"}]}`},
+	} {
+		g := gen.NewGenerator("generated", nil, gen.WithEnums(true))
+		for _, text := range schemas {
+			g.Parse(avro.MustParse(text))
+		}
+		var output bytes.Buffer
+		err := g.Write(&output)
+		require.Error(t, err)
+		require.Empty(t, output.String())
+		g.Parse(avro.MustParse(`{"type":"record","name":"Good","fields":[]}`))
+		require.Equal(t, err, g.Write(&output), "error remains sticky")
+		g.Reset()
+		g.Parse(avro.MustParse(`{"type":"record","name":"Good","fields":[]}`))
+		require.NoError(t, g.Write(&output))
+		require.NotContains(t, output.String(), "State")
+	}
+}
+
+func TestGeneratorRepeatedGraph(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		g := gen.NewGenerator("generated", nil, gen.WithEncoders(true), gen.WithFullName(true), gen.WithFullSchema(full))
+		schema := avro.MustParse(`{"type":"record","name":"tree.Node","fields":[{"name":"value","type":"int"},{"name":"children","type":{"type":"array","items":"tree.Node"}}]}`)
+		g.Parse(schema)
+		g.Parse(avro.MustParse(`{"type":"record","name":"tree.Node","fields":[{"name":"value","type":"int"},{"name":"children","type":{"type":"array","items":"tree.Node"}}]}`))
+		field, err := avro.NewField("node", avro.NewRefSchema(schema.(*avro.RecordSchema)))
+		require.NoError(t, err)
+		root, err := avro.NewRecordSchema("Root", "tree", []*avro.Field{field})
+		require.NoError(t, err)
+		g.Parse(root)
+		var output bytes.Buffer
+		require.NoError(t, g.Write(&output))
+		require.Equal(t, 1, strings.Count(output.String(), "type TreeNode struct"))
+		testGeneratedPackage(t, output.Bytes(), `package generated
+import "testing"
+func TestTree(t *testing.T) {
+ value := TreeRoot{Node: TreeNode{Value: 1, Children: []TreeNode{{Value: 2}}}}
+ data, err := value.Marshal()
+ if err != nil { t.Fatal(err) }
+ var got TreeRoot
+ if err := got.Unmarshal(data); err != nil { t.Fatal(err) }
+ if got.Node.Value != 1 || len(got.Node.Children) != 1 || got.Node.Children[0].Value != 2 { t.Fatal(got) }
+}`)
+	}
+}
+
+func TestGeneratorNamingOptions(t *testing.T) {
+	schema := avro.MustParse(`{"type":"record","name":"Options","fields":[{"name":"schema","type":"int"},{"name":"cid","type":"int"},{"name":"kind","type":{"type":"enum","name":"Kind","symbols":["CID"]}}]}`)
+	g := gen.NewGenerator("generated", nil, gen.WithInitialisms([]string{"CID"}), gen.WithEnums(true))
+	g.Parse(schema)
+	var output bytes.Buffer
+	require.NoError(t, g.Write(&output))
+	testGeneratedPackage(t, output.Bytes(), `package generated
+import "testing"
+func TestOptions(t *testing.T) {
+ value := Options{Schema: 1, CID: 2, Kind: KindCID}
+ if value.Schema != 1 || value.CID != 2 || value.Kind != "CID" { t.Fatal(value) }
+}`)
+}
+
+func TestGeneratorRejectsValueRecursion(t *testing.T) {
+	for _, text := range []string{
+		`{"type":"record","name":"ValueNode","fields":[{"name":"next","type":"ValueNode"}]}`,
+		`{"type":"record","name":"ValueA","fields":[{"name":"b","type":{"type":"record","name":"ValueB","fields":[{"name":"a","type":"ValueA"}]}}]}`,
+	} {
+		g := gen.NewGenerator("generated", nil)
+		g.Parse(avro.MustParse(text))
+		var output bytes.Buffer
+		require.ErrorContains(t, g.Write(&output), "recursive Go value")
+		require.Empty(t, output.String())
+	}
+}
+
+func TestGeneratorEmptyRecordSchema(t *testing.T) {
+	schema, err := avro.NewRecordSchema("Empty", "", nil)
+	require.NoError(t, err)
+	g := gen.NewGenerator("generated", nil, gen.WithEncoders(true), gen.WithFullSchema(true))
+	g.Parse(schema)
+	var output bytes.Buffer
+	require.NoError(t, g.Write(&output))
+	testGeneratedPackage(t, output.Bytes(), `package generated
+import "testing"
+func TestEmpty(t *testing.T) {
+ var value Empty
+ data, err := value.Marshal()
+ if err != nil || len(data) != 0 { t.Fatal(data, err) }
+}`)
+}
+
+// Compile and execute generated code in a fresh process and scratch module.
+// This prevents an already populated Avro schema cache from masking init bugs.
+func testGeneratedPackage(t *testing.T, source []byte, test string) {
+	t.Helper()
+	root, err := filepath.Abs("../../../../tmp")
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(root, 0o700))
+	dir, err := os.MkdirTemp(root, "avro-generator-")
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, os.RemoveAll(dir)) })
+	module, err := filepath.Abs("..")
+	require.NoError(t, err)
+	mod, err := os.ReadFile(filepath.Join(module, "go.mod"))
+	require.NoError(t, err)
+	mod = bytes.Replace(mod, []byte("module github.com/awaken/avro/v2"), []byte("module generated"), 1)
+	mod = append(mod, []byte("\nrequire github.com/awaken/avro/v2 v2.0.0\nreplace github.com/awaken/avro/v2 => "+strconv.Quote(module)+"\n")...)
+	sum, err := os.ReadFile(filepath.Join(module, "go.sum"))
+	require.NoError(t, err)
+	for name, content := range map[string][]byte{"go.mod": mod, "go.sum": sum, "generated.go": source, "generated_test.go": []byte(test)} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), content, 0o600))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "test", "-p=1", "-count=1", "-timeout=20s", ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOWORK=off")
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(output))
+}
 
 func parseSchemaFileWithCache(t testing.TB, cache *avro.SchemaCache, path string) avro.Schema {
 	t.Helper()
@@ -203,13 +424,16 @@ func TestStruct_EscapeBacktick(t *testing.T) {
 		FullSchema:  true,
 	}
 
-	_, lines := generate(t, schema, gc)
-
-	for _, expected := range []string{
-		"var schemaTest = avro.MustParse(`{\"name\":\"Test\",\"doc\":\"Test record doc with ` + \"`\" + `backticks` + \"`\" + `\",\"type\":\"record\",\"fields\":[{\"name\":\"someString\",\"type\":\"string\"}]}`)",
-	} {
-		assert.Contains(t, lines, expected)
-	}
+	source, _ := generate(t, schema, gc)
+	testGeneratedPackage(t, source, `package something
+import (
+ "testing"
+ "github.com/awaken/avro/v2"
+)
+func TestSchemaDoc(t *testing.T) {
+ var value Test
+ if got := value.Schema().(*avro.RecordSchema).Doc(); got != `+strconv.Quote("Test record doc with `backticks`")+` { t.Fatal(got) }
+}`)
 }
 
 func TestStruct_HandlesAdditionalInitialisms(t *testing.T) {

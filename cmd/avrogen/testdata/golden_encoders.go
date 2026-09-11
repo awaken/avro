@@ -5,6 +5,24 @@ import (
 	"github.com/awaken/avro/v2"
 )
 
+var avroSchemaCacheTest = func() map[string]avro.Schema {
+	cache := &avro.SchemaCache{}
+	if _, err := avro.ParseWithCache("{\"fields\":[{\"name\":\"someString\",\"type\":\"string\"},{\"name\":\"someInt\",\"type\":\"int\"}],\"name\":\"a.b.test\",\"type\":\"record\"}", "", cache); err != nil {
+		panic(err)
+	}
+	schemas := map[string]avro.Schema{}
+	for _, name := range []string{
+		"a.b.test",
+	} {
+		schema := cache.Get(name)
+		if ref, ok := schema.(*avro.RefSchema); ok {
+			schema = ref.Schema()
+		}
+		schemas[name] = schema
+	}
+	return schemas
+}()
+
 // Test is a test struct.
 type Test struct {
 	// SomeString is a string.
@@ -12,7 +30,7 @@ type Test struct {
 	SomeInt    int    `avro:"someInt"`
 }
 
-var schemaTest = avro.MustParse(`{"name":"a.b.test","type":"record","fields":[{"name":"someString","type":"string"},{"name":"someInt","type":"int"}]}`)
+var schemaTest = avroSchemaCacheTest["a.b.test"]
 
 // Schema returns the schema for Test.
 func (o *Test) Schema() avro.Schema {

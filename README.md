@@ -391,6 +391,25 @@ including raw byte, fixed-array and fixed-uint64 representations. Failed decimal
 decodes preserve the destination. Decimal scaling and output use the configured
 byte limit; precision diagnostics report counts without formatting the value.
 
+## Embedded Go fields
+
+Record fields use the shallowest matching Go field. At equal depth, a field with
+an explicit, nonempty name tag wins over untagged fields. Equal-priority matches
+are ambiguous, including the same field reached through multiple embedding paths.
+Declaration order does not break ties.
+
+An ambiguous field is unbound: encoding uses its schema default or reports a
+missing required field; decoding skips its wire value and leaves all competing
+Go fields unchanged. Add a direct field or distinct name tags to disambiguate
+previously accepted layouts.
+
+Anonymous structs are promoted unless explicitly named by a tag. A named
+embedding is one nested field; `-` excludes it. Empty tag names retain the Go
+field name or ordinary anonymous promotion. Tag options do not change selection.
+The configured `TagKey` applies to all these rules. Pointer embeddings follow the
+same rules, and only a selected destination path is allocated. Recursive and
+repeated type graphs are traversed without enumerating every embedding path.
+
 ## Go Version Support
 
 The minimum Go version is 1.26.
@@ -433,3 +452,40 @@ JSON document; operations without a returned value also permit an empty body.
 Oversized responses return `registry.ErrResponseLimit` and close after at most
 one byte beyond the limit. Bodies are not drained after errors. The default HTTP
 client has a timeout; custom clients should also set a timeout or request deadline.
+### Schema resolution
+
+`SchemaCompatibility.Resolve(reader, writer)` supports recursive named records.
+It builds the complete decoding graph before returning, preserving nested
+promotions, defaults and references. Inputs remain unchanged; concurrent calls
+may share the same declared schemas.
+
+Resolved writer unions keep every original wire index, including branches that
+promote to the same reader type. Their public `Types`, JSON and canonical
+fingerprints describe a valid reader union (a one-member union for a non-union
+reader). `CacheFingerprint` also identifies the decoding plan. JSON serialization
+does not retain this plan; store both declared schemas and resolve them again.
+Encoding a resolved writer union returns `ErrResolvedSchemaEncoding`; encode
+using a declared writer schema instead.
+
+### Generator naming and references
+
+The generator visits every reachable record, including `NewRefSchema` targets.
+It emits equivalent repeated definitions once and retains the first metadata.
+Conflicting definitions with the same Avro full name fail generation.
+
+Normalized Go identifiers must be exported and unambiguous. Colliding record or
+enum names, enum constants, fields, and enabled encoder methods produce a sticky
+`Write` error before any source is written; `Reset` clears it. Names such as `_`
+that normalize to inaccessible identifiers are rejected. `WithFullName(true)`
+includes namespaces in both record and enum names. Existing names are otherwise
+retained; the generator does not invent suffixes to resolve collisions.
+
+Generated encoders initialize each reachable definition graph in a private schema
+cache. Recursive references work without preloading `avro.DefaultSchemaCache`,
+and each generated `Schema` method returns its own named record. A cycle made
+only of struct values is rejected because Go requires indirection. Nullable
+pointers, slices, maps and interface unions provide that indirection.
+
+Custom templates can use `SchemaDefinitions`, `SchemaCacheName` and each typedef's
+`FullName` to implement the same initialization. An individual typedef's `Schema`
+can contain references to other definitions and may not parse independently.

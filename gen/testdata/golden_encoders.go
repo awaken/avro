@@ -8,13 +8,39 @@ import (
 	"github.com/awaken/avro/v2"
 )
 
+var avroSchemaCacheInnerRecord = func() map[string]avro.Schema {
+	cache := &avro.SchemaCache{}
+	if _, err := avro.ParseWithCache("{\"fields\":[{\"name\":\"aString\",\"type\":\"string\"},{\"name\":\"aBoolean\",\"type\":\"boolean\"},{\"name\":\"anInt\",\"type\":\"int\"},{\"name\":\"aFloat\",\"type\":\"float\"},{\"name\":\"aDouble\",\"type\":\"double\"},{\"name\":\"aLong\",\"type\":\"long\"},{\"name\":\"justBytes\",\"type\":\"bytes\"},{\"name\":\"primitiveNullableArrayUnion\",\"type\":[\"null\",{\"items\":\"string\",\"type\":\"array\"}]},{\"name\":\"innerRecord\",\"type\":{\"fields\":[{\"name\":\"innerJustBytes\",\"type\":\"bytes\"},{\"name\":\"innerPrimitiveNullableArrayUnion\",\"type\":[\"null\",{\"items\":\"string\",\"type\":\"array\"}]}],\"name\":\"a.c.InnerRecord\",\"type\":\"record\"}},{\"name\":\"anEnum\",\"type\":{\"name\":\"a.b.Cards\",\"type\":\"enum\",\"symbols\":[\"SPADES\",\"HEARTS\",\"DIAMONDS\",\"CLUBS\"]}},{\"name\":\"aFixed\",\"type\":{\"name\":\"a.b.fixedField\",\"type\":\"fixed\",\"size\":7}},{\"name\":\"aLogicalFixed\",\"type\":{\"name\":\"a.b.logicalDuration\",\"type\":\"fixed\",\"size\":12,\"logicalType\":\"duration\"}},{\"name\":\"anotherLogicalFixed\",\"type\":\"a.b.logicalDuration\"},{\"name\":\"mapOfStrings\",\"type\":{\"type\":\"map\",\"values\":\"string\"}},{\"name\":\"mapOfRecords\",\"type\":{\"type\":\"map\",\"values\":{\"fields\":[{\"name\":\"name\",\"type\":\"string\"}],\"name\":\"a.b.RecordInMap\",\"type\":\"record\"}}},{\"name\":\"aDate\",\"type\":{\"type\":\"int\",\"logicalType\":\"date\"}},{\"name\":\"aDuration\",\"type\":{\"type\":\"int\",\"logicalType\":\"time-millis\"}},{\"name\":\"aLongTimeMicros\",\"type\":{\"type\":\"long\",\"logicalType\":\"time-micros\"}},{\"name\":\"aLongTimestampMillis\",\"type\":{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}},{\"name\":\"aLongTimestampMicro\",\"type\":{\"type\":\"long\",\"logicalType\":\"timestamp-micros\"}},{\"name\":\"aBytesDecimal\",\"type\":{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":4,\"scale\":2}},{\"name\":\"aRecordArray\",\"type\":{\"items\":{\"fields\":[{\"name\":\"aString\",\"type\":\"string\"}],\"name\":\"a.b.recordInArray\",\"type\":\"record\"},\"type\":\"array\"}},{\"name\":\"nullableRecordUnion\",\"type\":[\"null\",{\"fields\":[{\"name\":\"aString\",\"type\":\"string\"}],\"name\":\"a.b.recordInNullableUnion\",\"type\":\"record\"}]},{\"name\":\"nonNullableRecordUnion\",\"type\":[{\"fields\":[{\"name\":\"aString\",\"type\":\"string\"}],\"name\":\"a.b.record1InNonNullableUnion\",\"type\":\"record\"},{\"fields\":[{\"name\":\"aString\",\"type\":\"string\"}],\"name\":\"a.b.record2InNonNullableUnion\",\"type\":\"record\"}]},{\"name\":\"nullableRecordUnionWith3Options\",\"type\":[\"null\",{\"fields\":[{\"name\":\"aString\",\"type\":\"string\"}],\"name\":\"a.b.record1InNullableUnion\",\"type\":\"record\"},{\"fields\":[{\"name\":\"aString\",\"type\":\"string\"}],\"name\":\"a.b.record2InNullableUnion\",\"type\":\"record\"}]},{\"name\":\"ref\",\"type\":\"a.b.record2InNullableUnion\"},{\"name\":\"uuid\",\"type\":{\"type\":\"string\",\"logicalType\":\"uuid\"}}],\"name\":\"a.b.test\",\"type\":\"record\"}", "", cache); err != nil {
+		panic(err)
+	}
+	schemas := map[string]avro.Schema{}
+	for _, name := range []string{
+		"a.c.InnerRecord",
+		"a.b.RecordInMap",
+		"a.b.recordInArray",
+		"a.b.recordInNullableUnion",
+		"a.b.record1InNonNullableUnion",
+		"a.b.record2InNonNullableUnion",
+		"a.b.record1InNullableUnion",
+		"a.b.record2InNullableUnion",
+		"a.b.test",
+	} {
+		schema := cache.Get(name)
+		if ref, ok := schema.(*avro.RefSchema); ok {
+			schema = ref.Schema()
+		}
+		schemas[name] = schema
+	}
+	return schemas
+}()
+
 // InnerRecord is a generated struct.
 type InnerRecord struct {
 	InnerJustBytes                   []byte    `avro:"innerJustBytes"`
 	InnerPrimitiveNullableArrayUnion *[]string `avro:"innerPrimitiveNullableArrayUnion"`
 }
 
-var schemaInnerRecord = avro.MustParse(`{"name":"a.c.InnerRecord","type":"record","fields":[{"name":"innerJustBytes","type":"bytes"},{"name":"innerPrimitiveNullableArrayUnion","type":["null",{"type":"array","items":"string"}]}]}`)
+var schemaInnerRecord = avroSchemaCacheInnerRecord["a.c.InnerRecord"]
 
 // Schema returns the schema for InnerRecord.
 func (o *InnerRecord) Schema() avro.Schema {
@@ -36,7 +62,7 @@ type RecordInMap struct {
 	Name string `avro:"name"`
 }
 
-var schemaRecordInMap = avro.MustParse(`{"name":"a.b.RecordInMap","type":"record","fields":[{"name":"name","type":"string"}]}`)
+var schemaRecordInMap = avroSchemaCacheInnerRecord["a.b.RecordInMap"]
 
 // Schema returns the schema for RecordInMap.
 func (o *RecordInMap) Schema() avro.Schema {
@@ -58,7 +84,7 @@ type RecordInArray struct {
 	AString string `avro:"aString"`
 }
 
-var schemaRecordInArray = avro.MustParse(`{"name":"a.b.recordInArray","type":"record","fields":[{"name":"aString","type":"string"}]}`)
+var schemaRecordInArray = avroSchemaCacheInnerRecord["a.b.recordInArray"]
 
 // Schema returns the schema for RecordInArray.
 func (o *RecordInArray) Schema() avro.Schema {
@@ -80,7 +106,7 @@ type RecordInNullableUnion struct {
 	AString string `avro:"aString"`
 }
 
-var schemaRecordInNullableUnion = avro.MustParse(`{"name":"a.b.recordInNullableUnion","type":"record","fields":[{"name":"aString","type":"string"}]}`)
+var schemaRecordInNullableUnion = avroSchemaCacheInnerRecord["a.b.recordInNullableUnion"]
 
 // Schema returns the schema for RecordInNullableUnion.
 func (o *RecordInNullableUnion) Schema() avro.Schema {
@@ -102,7 +128,7 @@ type Record1InNonNullableUnion struct {
 	AString string `avro:"aString"`
 }
 
-var schemaRecord1InNonNullableUnion = avro.MustParse(`{"name":"a.b.record1InNonNullableUnion","type":"record","fields":[{"name":"aString","type":"string"}]}`)
+var schemaRecord1InNonNullableUnion = avroSchemaCacheInnerRecord["a.b.record1InNonNullableUnion"]
 
 // Schema returns the schema for Record1InNonNullableUnion.
 func (o *Record1InNonNullableUnion) Schema() avro.Schema {
@@ -124,7 +150,7 @@ type Record2InNonNullableUnion struct {
 	AString string `avro:"aString"`
 }
 
-var schemaRecord2InNonNullableUnion = avro.MustParse(`{"name":"a.b.record2InNonNullableUnion","type":"record","fields":[{"name":"aString","type":"string"}]}`)
+var schemaRecord2InNonNullableUnion = avroSchemaCacheInnerRecord["a.b.record2InNonNullableUnion"]
 
 // Schema returns the schema for Record2InNonNullableUnion.
 func (o *Record2InNonNullableUnion) Schema() avro.Schema {
@@ -146,7 +172,7 @@ type Record1InNullableUnion struct {
 	AString string `avro:"aString"`
 }
 
-var schemaRecord1InNullableUnion = avro.MustParse(`{"name":"a.b.record1InNullableUnion","type":"record","fields":[{"name":"aString","type":"string"}]}`)
+var schemaRecord1InNullableUnion = avroSchemaCacheInnerRecord["a.b.record1InNullableUnion"]
 
 // Schema returns the schema for Record1InNullableUnion.
 func (o *Record1InNullableUnion) Schema() avro.Schema {
@@ -168,7 +194,7 @@ type Record2InNullableUnion struct {
 	AString string `avro:"aString"`
 }
 
-var schemaRecord2InNullableUnion = avro.MustParse(`{"name":"a.b.record2InNullableUnion","type":"record","fields":[{"name":"aString","type":"string"}]}`)
+var schemaRecord2InNullableUnion = avroSchemaCacheInnerRecord["a.b.record2InNullableUnion"]
 
 // Schema returns the schema for Record2InNullableUnion.
 func (o *Record2InNullableUnion) Schema() avro.Schema {
@@ -218,7 +244,7 @@ type Test struct {
 	UUID                            string                 `avro:"uuid"`
 }
 
-var schemaTest = avro.MustParse(`{"name":"a.b.test","type":"record","fields":[{"name":"aString","type":"string"},{"name":"aBoolean","type":"boolean"},{"name":"anInt","type":"int"},{"name":"aFloat","type":"float"},{"name":"aDouble","type":"double"},{"name":"aLong","type":"long"},{"name":"justBytes","type":"bytes"},{"name":"primitiveNullableArrayUnion","type":["null",{"type":"array","items":"string"}]},{"name":"innerRecord","type":{"name":"a.c.InnerRecord","type":"record","fields":[{"name":"innerJustBytes","type":"bytes"},{"name":"innerPrimitiveNullableArrayUnion","type":["null",{"type":"array","items":"string"}]}]}},{"name":"anEnum","type":{"name":"a.b.Cards","type":"enum","symbols":["SPADES","HEARTS","DIAMONDS","CLUBS"]}},{"name":"aFixed","type":{"name":"a.b.fixedField","type":"fixed","size":7}},{"name":"aLogicalFixed","type":{"name":"a.b.logicalDuration","type":"fixed","size":12,"logicalType":"duration"}},{"name":"anotherLogicalFixed","type":"a.b.logicalDuration"},{"name":"mapOfStrings","type":{"type":"map","values":"string"}},{"name":"mapOfRecords","type":{"type":"map","values":{"name":"a.b.RecordInMap","type":"record","fields":[{"name":"name","type":"string"}]}}},{"name":"aDate","type":{"type":"int","logicalType":"date"}},{"name":"aDuration","type":{"type":"int","logicalType":"time-millis"}},{"name":"aLongTimeMicros","type":{"type":"long","logicalType":"time-micros"}},{"name":"aLongTimestampMillis","type":{"type":"long","logicalType":"timestamp-millis"}},{"name":"aLongTimestampMicro","type":{"type":"long","logicalType":"timestamp-micros"}},{"name":"aBytesDecimal","type":{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}},{"name":"aRecordArray","type":{"type":"array","items":{"name":"a.b.recordInArray","type":"record","fields":[{"name":"aString","type":"string"}]}}},{"name":"nullableRecordUnion","type":["null",{"name":"a.b.recordInNullableUnion","type":"record","fields":[{"name":"aString","type":"string"}]}]},{"name":"nonNullableRecordUnion","type":[{"name":"a.b.record1InNonNullableUnion","type":"record","fields":[{"name":"aString","type":"string"}]},{"name":"a.b.record2InNonNullableUnion","type":"record","fields":[{"name":"aString","type":"string"}]}]},{"name":"nullableRecordUnionWith3Options","type":["null",{"name":"a.b.record1InNullableUnion","type":"record","fields":[{"name":"aString","type":"string"}]},{"name":"a.b.record2InNullableUnion","type":"record","fields":[{"name":"aString","type":"string"}]}]},{"name":"ref","type":"a.b.record2InNullableUnion"},{"name":"uuid","type":{"type":"string","logicalType":"uuid"}}]}`)
+var schemaTest = avroSchemaCacheInnerRecord["a.b.test"]
 
 // Schema returns the schema for Test.
 func (o *Test) Schema() avro.Schema {

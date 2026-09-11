@@ -1,8 +1,12 @@
 package avro_test
 
 import (
+	"context"
 	"encoding/json"
 	"math/big"
+	"os"
+	"os/exec"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"testing"
@@ -12,6 +16,50 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSchemaResolutionRecursive(t *testing.T) {
+	const helper = "AVRO_RESOLUTION_RECURSIVE_HELPER"
+	if os.Getenv(helper) == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSchemaResolutionRecursive$")
+		cmd.Env = append(os.Environ(), helper+"=1", "GOTRACEBACK=none")
+		output, err := cmd.CombinedOutput()
+		require.NoError(t, err, string(output))
+		return
+	}
+	debug.SetMaxStack(256 << 10)
+	schema := avro.MustParse(`{"type":"record","name":"ResolutionNode","fields":[{"name":"value","type":"int"},{"name":"next","type":["null","ResolutionNode"]}]}`)
+	value := map[string]any{"value": 1, "next": map[string]any{"ResolutionNode": map[string]any{"value": 2, "next": nil}}}
+	data, err := avro.Marshal(schema, value)
+	require.NoError(t, err)
+	resolved, err := avro.NewSchemaCompatibility().Resolve(schema, schema)
+	require.NoError(t, err)
+	var got any
+	require.NoError(t, avro.Unmarshal(resolved, data, &got))
+	require.Equal(t, value, got)
+	require.Equal(t, schema.String(), resolved.String())
+}
+
+func TestSchemaResolutionCollapsedUnion(t *testing.T) {
+	reader := avro.MustParse(`"long"`)
+	writer := avro.MustParse(`["int","long"]`)
+	compat := avro.NewSchemaCompatibility()
+	require.NoError(t, compat.Compatible(reader, writer))
+	resolved, err := compat.Resolve(reader, writer)
+	require.NoError(t, err)
+	for _, value := range []map[string]any{{"int": 7}, {"long": int64(1 << 40)}} {
+		data, err := avro.Marshal(writer, value)
+		require.NoError(t, err)
+		var got int64
+		require.NoError(t, avro.Unmarshal(resolved, data, &got))
+		want := int64(7)
+		if v, ok := value["long"].(int64); ok {
+			want = v
+		}
+		require.Equal(t, want, got)
+	}
+}
 
 type blockingCompatibilitySchema struct {
 	typ         avro.Type

@@ -151,7 +151,7 @@ func (r *Reader) ReadNext(schema Schema) any {
 		})
 		return obj
 	case Union:
-		types := schema.(*UnionSchema).Types()
+		types := schema.(*UnionSchema).decodeTypes()
 		idx64 := r.ReadLong()
 		if idx64 < 0 || idx64 > int64(len(types)-1) {
 			r.ReportError("Read", "unknown union type")
