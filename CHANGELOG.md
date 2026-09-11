@@ -10,6 +10,7 @@
   `klauspost/compress` v1.20.0, `x/tools` v0.50.0, `x/mod` v0.41.0,
   `x/sync` v0.23.0, and `testify` v1.12.1.
 - Raise the minimum Go version to 1.26; test Go 1.26 and 1.27 in CI.
+- Run test and fuzz workflows only on manual request (`workflow_dispatch`).
 
 ### Fixed
 
