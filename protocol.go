@@ -3,8 +3,10 @@ package avro
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 
@@ -51,7 +53,8 @@ type Protocol struct {
 	hash string
 }
 
-// NewProtocol creates a protocol instance.
+// NewProtocol creates a protocol with copies of the type and message collections.
+// The referenced schemas and messages must remain immutable after construction.
 func NewProtocol(
 	name, namepsace string,
 	types []NamedSchema,
@@ -67,12 +70,17 @@ func NewProtocol(
 	if err != nil {
 		return nil, err
 	}
+	for _, key := range slices.Sorted(maps.Keys(messages)) {
+		if err := validateName(key); err != nil {
+			return nil, fmt.Errorf("avro: invalid message name %q: %w", key, err)
+		}
+	}
 
 	p := &Protocol{
 		name:       n,
 		properties: newProperties(cfg.props, protocolReserved),
-		types:      types,
-		messages:   messages,
+		types:      slices.Clone(types),
+		messages:   maps.Clone(messages),
 		doc:        cfg.doc,
 	}
 
@@ -97,12 +105,13 @@ func (p *Protocol) Hash() string {
 	return p.hash
 }
 
-// Types returns the types of the protocol.
+// Types returns a copy of the protocol's type list. The schemas are shared.
 func (p *Protocol) Types() []NamedSchema {
-	return p.types
+	return slices.Clone(p.types)
 }
 
-// String returns the canonical form of the protocol.
+// String returns deterministic protocol JSON, sorting messages by name.
+// Declared type and field order is preserved.
 func (p *Protocol) String() string {
 	types := ""
 	for _, f := range p.types {
@@ -113,16 +122,19 @@ func (p *Protocol) String() string {
 	}
 
 	messages := ""
-	for k, m := range p.messages {
-		messages += `"` + k + `":` + m.String() + ","
+	for _, k := range slices.Sorted(maps.Keys(p.messages)) {
+		key, _ := json.Marshal(k)
+		messages += string(key) + `:` + p.messages[k].String() + ","
 	}
 	if len(messages) > 0 {
 		messages = messages[:len(messages)-1]
 	}
 
-	return `{"protocol":"` + p.Name() +
-		`","namespace":"` + p.Namespace() +
-		`","types":[` + types + `],"messages":{` + messages + `}}`
+	name, _ := json.Marshal(p.Name())
+	namespace, _ := json.Marshal(p.Namespace())
+	return `{"protocol":` + string(name) +
+		`,"namespace":` + string(namespace) +
+		`,"types":[` + types + `],"messages":{` + messages + `}}`
 }
 
 // Message is an Avro protocol message.
@@ -137,11 +149,18 @@ type Message struct {
 	doc string
 }
 
-// NewMessage creates a protocol message instance.
+// NewMessage creates a message, treating a nil response as the null schema.
+// The request must be non-nil. Schemas are shared and must remain immutable.
+// Errors, if present, must include the implicit string branch first. A one-way
+// message requires a null response and no declared errors. ParseProtocol validates
+// these constraints when constructing messages from JSON.
 func NewMessage(req *RecordSchema, resp Schema, errors *UnionSchema, oneWay bool, opts ...ProtocolOption) *Message {
 	var cfg protocolConfig
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+	if isNilSchema(resp) {
+		resp = NewNullSchema()
 	}
 
 	return &Message{
@@ -189,13 +208,13 @@ func (m *Message) String() string {
 		fields = fields[:len(fields)-1]
 	}
 
-	str := `{"request":[` + fields + `]`
-	if m.resp != nil {
-		str += `,"response":` + m.resp.String()
-	}
+	str := `{"request":[` + fields + `],"response":` + m.resp.String()
 	if m.errs != nil && len(m.errs.Types()) > 1 {
 		errs, _ := NewUnionSchema(m.errs.Types()[1:])
 		str += `,"errors":` + errs.String()
+	}
+	if m.oneWay {
+		str += `,"one-way":true`
 	}
 	str += "}"
 	return str
@@ -269,8 +288,11 @@ func parseProtocol(m map[string]any, seen seenCache, cache *SchemaCache) (*Proto
 
 	messages := map[string]*Message{}
 	if len(p.Messages) > 0 {
-		for k, msg := range p.Messages {
-			message, err := parseMessage(p.Namespace, msg, seen, cache)
+		for _, k := range slices.Sorted(maps.Keys(p.Messages)) {
+			if err := validateName(k); err != nil {
+				return nil, fmt.Errorf("avro: invalid message name %q: %w", k, err)
+			}
+			message, err := parseMessage(p.Namespace, p.Messages[k], seen, cache)
 			if err != nil {
 				return nil, err
 			}
@@ -314,6 +336,24 @@ type message struct {
 }
 
 func parseMessage(namespace string, m map[string]any, seen seenCache, cache *SchemaCache) (*Message, error) {
+	// Check JSON shapes before decoding can collapse missing and null values.
+	if _, ok := m["request"].([]any); !ok {
+		return nil, errors.New("avro: message request must be an array")
+	}
+	if _, ok := m["response"]; !ok {
+		return nil, errors.New("avro: message response is required")
+	}
+	if value, ok := m["one-way"]; ok {
+		if _, ok := value.(bool); !ok {
+			return nil, errors.New("avro: message one-way must be a boolean")
+		}
+	}
+	if value, ok := m["errors"]; ok {
+		if _, ok := value.([]any); !ok {
+			return nil, errors.New("avro: message errors must be an array")
+		}
+	}
+
 	var (
 		msg  message
 		meta mapstructure.Metadata
@@ -336,16 +376,9 @@ func parseMessage(namespace string, m map[string]any, seen seenCache, cache *Sch
 		fields:     fields,
 	}
 
-	var response Schema
-	if msg.Response != nil {
-		schema, err := parseType(namespace, msg.Response, seen, cache)
-		if err != nil {
-			return nil, err
-		}
-
-		if schema.Type() != Null {
-			response = schema
-		}
+	response, err := parseType(namespace, msg.Response, seen, cache)
+	if err != nil {
+		return nil, err
 	}
 
 	types := []Schema{NewPrimitiveSchema(String, nil)}
@@ -356,8 +389,12 @@ func parseMessage(namespace string, m map[string]any, seen seenCache, cache *Sch
 				return nil, err
 			}
 
-			if rec, ok := schema.(*RecordSchema); ok && !rec.IsError() {
-				return nil, errors.New("avro: errors record schema must be of type error")
+			resolved := schema
+			if ref, ok := schema.(*RefSchema); ok {
+				resolved = ref.Schema()
+			}
+			if rec, ok := resolved.(*RecordSchema); !ok || !rec.IsError() {
+				return nil, errors.New("avro: declared errors must resolve to error records")
 			}
 
 			types = append(types, schema)
@@ -369,11 +406,8 @@ func parseMessage(namespace string, m map[string]any, seen seenCache, cache *Sch
 	}
 
 	oneWay := msg.OneWay
-	if slices.Contains(meta.Keys, "one-way") && oneWay && (len(errs.Types()) > 1 || response != nil) {
-		return nil, errors.New("avro: one-way messages cannot not have a response or errors")
-	}
-	if !oneWay && len(errs.Types()) <= 1 && response == nil {
-		oneWay = true
+	if oneWay && (len(errs.Types()) > 1 || response.Type() != Null) {
+		return nil, errors.New("avro: one-way messages require a null response and no declared errors")
 	}
 	if err := normalizeProperties(msg.Props); err != nil {
 		return nil, err

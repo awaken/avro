@@ -303,3 +303,149 @@ func TestSchema_JSON(t *testing.T) {
 		})
 	}
 }
+
+func TestSchema_JSONEscapesProgrammaticLogicalType(t *testing.T) {
+	logicalType := avro.LogicalType("custom\"\n\\")
+	logical := avro.NewPrimitiveLogicalSchema(logicalType)
+	fixed, err := avro.NewFixedSchema("test", "", 1, logical)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name   string
+		schema avro.Schema
+	}{
+		{name: "primitive", schema: avro.NewPrimitiveSchema(avro.String, logical)},
+		{name: "fixed", schema: fixed},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data, err := json.Marshal(test.schema)
+			require.NoError(t, err)
+
+			var got map[string]any
+			require.NoError(t, json.Unmarshal(data, &got))
+			assert.Equal(t, string(logicalType), got["logicalType"])
+		})
+	}
+}
+
+func TestPrimitiveLogicalSchema_StringEscapesCustomType(t *testing.T) {
+	logicalType := avro.LogicalType("custom\"\n\\")
+	logical := avro.NewPrimitiveLogicalSchema(logicalType)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal([]byte("{"+logical.String()+"}"), &got))
+	assert.Equal(t, string(logicalType), got["logicalType"])
+}
+
+func TestSchema_JSONPreservesBytesAndFixedDefaults(t *testing.T) {
+	const input = `{
+		"type":"record",
+		"name":"Defaults",
+		"fields":[
+			{"name":"bytes","type":"bytes","default":"\u0000\u00ff"},
+			{"name":"fixed","type":{"type":"fixed","name":"F","size":2},"default":"\u0000\u00ff"},
+			{
+				"name":"nested",
+				"type":{"type":"record","name":"Nested","fields":[{"name":"value","type":"bytes"}]},
+				"default":{"value":"\u00ff"}
+			}
+		]
+	}`
+
+	schema, err := avro.ParseWithCache(input, "", &avro.SchemaCache{})
+	require.NoError(t, err)
+	data, err := json.Marshal(schema)
+	require.NoError(t, err)
+
+	var document struct {
+		Fields []struct {
+			Default any `json:"default"`
+		} `json:"fields"`
+	}
+	require.NoError(t, json.Unmarshal(data, &document))
+	require.Len(t, document.Fields, 3)
+	assert.Equal(t, "\x00ÿ", document.Fields[0].Default)
+	assert.Equal(t, "\x00ÿ", document.Fields[1].Default)
+	assert.Equal(t, map[string]any{"value": "ÿ"}, document.Fields[2].Default)
+
+	reparsed, err := avro.ParseBytesWithCache(data, "", &avro.SchemaCache{})
+	require.NoError(t, err)
+	fields := reparsed.(*avro.RecordSchema).Fields()
+	assert.Equal(t, []byte{0, 255}, fields[0].Default())
+	assert.Equal(t, [2]byte{0, 255}, fields[1].Default())
+	assert.Equal(t, map[string]any{"value": []byte{255}}, fields[2].Default())
+}
+
+func TestSchema_JSONPreservesDefaultAfterResolution(t *testing.T) {
+	reader, err := avro.ParseWithCache(
+		`{"type":"record","name":"R","fields":[{"name":"value","type":"bytes","default":"\u00ff"}]}`,
+		"", &avro.SchemaCache{},
+	)
+	require.NoError(t, err)
+	writer, err := avro.ParseWithCache(`{"type":"record","name":"R","fields":[]}`, "", &avro.SchemaCache{})
+	require.NoError(t, err)
+
+	resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+	require.NoError(t, err)
+	data, err := json.Marshal(resolved)
+	require.NoError(t, err)
+
+	reparsed, err := avro.ParseBytesWithCache(data, "", &avro.SchemaCache{})
+	require.NoError(t, err)
+	assert.Equal(t, []byte{255}, reparsed.(*avro.RecordSchema).Fields()[0].Default())
+}
+
+func TestSchema_JSONEscapesNamesWhenValidationIsSkipped(t *testing.T) {
+	old := avro.SkipNameValidation
+	avro.SkipNameValidation = true
+	t.Cleanup(func() {
+		avro.SkipNameValidation = old
+	})
+
+	field, err := avro.NewField(`f"`, avro.NewPrimitiveSchema(avro.Int, nil))
+	require.NoError(t, err)
+	record, err := avro.NewRecordSchema(`R"`, "", []*avro.Field{field})
+	require.NoError(t, err)
+	enum, err := avro.NewEnumSchema(`E"`, "", []string{`A"`}, avro.WithDefault(`A"`))
+	require.NoError(t, err)
+	fixed, err := avro.NewFixedSchema(`F"`, "", 1, nil)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name   string
+		schema avro.Schema
+		want   string
+	}{
+		{
+			name:   "record and field",
+			schema: record,
+			want:   `{"name":"R\"","type":"record","fields":[{"name":"f\"","type":"int"}]}`,
+		},
+		{
+			name:   "enum name and default",
+			schema: enum,
+			want:   `{"name":"E\"","type":"enum","symbols":["A\""],"default":"A\""}`,
+		},
+		{
+			name:   "fixed name",
+			schema: fixed,
+			want:   `{"name":"F\"","type":"fixed","size":1}`,
+		},
+		{
+			name:   "reference name",
+			schema: avro.NewRefSchema(record),
+			want:   `"R\""`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data, err := json.Marshal(test.schema)
+			require.NoError(t, err)
+			assert.Equal(t, test.want, string(data))
+			assert.True(t, json.Valid(data))
+		})
+	}
+}

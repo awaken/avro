@@ -6,7 +6,24 @@ import (
 )
 
 func createSkipDecoder(schema Schema) ValDecoder {
-	switch schema.Type() {
+	c := &skipDecoderContext{records: make(map[*RecordSchema]ValDecoder)}
+	return c.create(schema)
+}
+
+type skipDecoderContext struct {
+	records map[*RecordSchema]ValDecoder
+}
+
+func (c *skipDecoderContext) create(schema Schema) ValDecoder {
+	typ := schema.Type()
+	if primitive, ok := schema.(*PrimitiveSchema); ok && primitive.encodedType != "" {
+		typ = primitive.encodedType
+	}
+
+	switch typ {
+	case Null:
+		return &nullCodec{}
+
 	case Boolean:
 		return &boolSkipDecoder{}
 
@@ -29,19 +46,19 @@ func createSkipDecoder(schema Schema) ValDecoder {
 		return &bytesSkipDecoder{}
 
 	case Record:
-		return skipDecoderOfRecord(schema)
+		return c.record(schema)
 
 	case Ref:
-		return createSkipDecoder(schema.(*RefSchema).Schema())
+		return c.create(schema.(*RefSchema).Schema())
 
 	case Enum:
 		return &enumSkipDecoder{symbols: schema.(*EnumSchema).Symbols()}
 
 	case Array:
-		return skipDecoderOfArray(schema)
+		return skipDecoderOfArray(c, schema)
 
 	case Map:
-		return skipDecoderOfMap(schema)
+		return skipDecoderOfMap(c, schema)
 
 	case Union:
 		return skipDecoderOfUnion(schema)
@@ -96,17 +113,24 @@ func (c *bytesSkipDecoder) Decode(_ unsafe.Pointer, r *Reader) {
 	r.SkipBytes()
 }
 
-func skipDecoderOfRecord(schema Schema) ValDecoder {
+func (c *skipDecoderContext) record(schema Schema) ValDecoder {
 	rec := schema.(*RecordSchema)
+	if decoder, ok := c.records[rec]; ok {
+		return decoder
+	}
+
+	deferred := &deferDecoder{}
+	c.records[rec] = deferred
 
 	decoders := make([]ValDecoder, len(rec.Fields()))
 	for i, field := range rec.Fields() {
-		decoders[i] = createSkipDecoder(field.Type())
+		decoders[i] = c.create(field.Type())
 	}
 
-	return &recordSkipDecoder{
+	deferred.decoder = &recordSkipDecoder{
 		decoders: decoders,
 	}
+	return deferred
 }
 
 type recordSkipDecoder struct {
@@ -124,12 +148,18 @@ type enumSkipDecoder struct {
 }
 
 func (c *enumSkipDecoder) Decode(_ unsafe.Pointer, r *Reader) {
-	r.SkipInt()
+	i := int(r.ReadInt())
+	if r.Error != nil {
+		return
+	}
+	if i < 0 || i >= len(c.symbols) {
+		r.ReportError("decode enum symbol", "unknown enum symbol")
+	}
 }
 
-func skipDecoderOfArray(schema Schema) ValDecoder {
+func skipDecoderOfArray(c *skipDecoderContext, schema Schema) ValDecoder {
 	arr := schema.(*ArraySchema)
-	decoder := createSkipDecoder(arr.Items())
+	decoder := c.create(arr.Items())
 
 	return &sliceSkipDecoder{
 		decoder: decoder,
@@ -161,9 +191,9 @@ func (d *sliceSkipDecoder) Decode(_ unsafe.Pointer, r *Reader) {
 	}
 }
 
-func skipDecoderOfMap(schema Schema) ValDecoder {
+func skipDecoderOfMap(c *skipDecoderContext, schema Schema) ValDecoder {
 	m := schema.(*MapSchema)
-	decoder := createSkipDecoder(m.Values())
+	decoder := c.create(m.Values())
 
 	return &mapSkipDecoder{
 		decoder: decoder,
@@ -230,5 +260,9 @@ type fixedSkipDecoder struct {
 }
 
 func (d *fixedSkipDecoder) Decode(_ unsafe.Pointer, r *Reader) {
+	if err := r.cfg.checkFixedSize(d.size); err != nil {
+		r.ReportError("skip fixed", err.Error())
+		return
+	}
 	r.SkipNBytes(d.size)
 }

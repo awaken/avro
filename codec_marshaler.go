@@ -39,15 +39,23 @@ type textMarshalerCodec struct {
 }
 
 func (c textMarshalerCodec) Decode(ptr unsafe.Pointer, r *Reader) {
+	b := r.ReadBytes()
+	if r.Error != nil {
+		return
+	}
+
 	obj := c.typ.UnsafeIndirect(ptr)
 	if reflect2.IsNil(obj) {
-		ptrType := c.typ.(*reflect2.UnsafePtrType)
+		ptrType, ok := c.typ.(*reflect2.UnsafePtrType)
+		if !ok {
+			r.ReportError("textMarshalerCodec", "cannot initialize type "+c.typ.String())
+			return
+		}
 		newPtr := ptrType.Elem().UnsafeNew()
 		*((*unsafe.Pointer)(ptr)) = newPtr
 		obj = c.typ.UnsafeIndirect(ptr)
 	}
 	unmarshaler := (obj).(encoding.TextUnmarshaler)
-	b := r.ReadBytes()
 	err := unmarshaler.UnmarshalText(b)
 	if err != nil {
 		r.ReportError("textMarshalerCodec", err.Error())

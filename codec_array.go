@@ -115,8 +115,10 @@ func (e *arrayEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 			for j := i; j < i+blockLength && j < length; j++ {
 				elemPtr := e.typ.UnsafeGetIndex(ptr, j)
 				e.encoder.Encode(elemPtr, w)
-				if w.Error != nil && !errors.Is(w.Error, io.EOF) {
-					w.Error = fmt.Errorf("%s: %w", e.typ.String(), w.Error)
+				if w.Error != nil {
+					if !errors.Is(w.Error, io.EOF) {
+						w.Error = fmt.Errorf("%s: %w", e.typ.String(), w.Error)
+					}
 					return count
 				}
 				count++
@@ -124,6 +126,9 @@ func (e *arrayEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 
 			return count
 		})
+		if w.Error != nil {
+			break
+		}
 	}
 
 	w.WriteBlockHeader(0, 0)

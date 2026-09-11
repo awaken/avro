@@ -126,6 +126,22 @@ func TestEncoderTypeConverter_MapRecordMapUnion(t *testing.T) {
 	assert.Equal(t, []byte{0x02, 0x36}, buf.Bytes())
 }
 
+func TestEncoderTypeConverter_MapUnionBranch(t *testing.T) {
+	defer ConfigTeardown()
+
+	schema := `["null", {"type":"fixed", "name":"fixed_decimal", "size":6, "logicalType":"decimal", "precision":5, "scale":2}]`
+	buf := &bytes.Buffer{}
+	enc, err := avro.NewEncoder(schema, buf)
+	require.NoError(t, err)
+
+	avro.RegisterTypeConverters(fixedDecimalConverter)
+
+	err = enc.Encode(map[string]any{"fixed_decimal": "346.8"})
+
+	require.NoError(t, err)
+	assert.Equal(t, []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x87, 0x78}, buf.Bytes())
+}
+
 func TestEncoderTypeConverter_MapRecordUnionFixedDecimal(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -324,5 +340,26 @@ func TestEncoderTypeConverter_ErrorMapUnion(t *testing.T) {
 	err = enc.Encode(val)
 
 	assert.ErrorIs(t, err, testError)
+	assert.Empty(t, buf.Bytes())
+}
+
+func TestEncoderTypeConverter_NilMapUnionReturnsError(t *testing.T) {
+	defer ConfigTeardown()
+
+	buf := &bytes.Buffer{}
+	enc, err := avro.NewEncoder(`["null", "int"]`, buf)
+	require.NoError(t, err)
+
+	avro.RegisterTypeConverters(avro.TypeConversionFuncs{
+		AvroType: avro.Union,
+		EncoderTypeConversion: func(any, avro.Schema) (any, error) {
+			return nil, nil
+		},
+	})
+
+	assert.NotPanics(t, func() {
+		err = enc.Encode(map[string]any{"int": 27})
+	})
+	assert.Error(t, err)
 	assert.Empty(t, buf.Bytes())
 }

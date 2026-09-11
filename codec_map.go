@@ -131,7 +131,11 @@ func (d *mapDecoderUnmarshaler) Decode(ptr unsafe.Pointer, r *Reader) {
 			keyPtr := d.keyType.UnsafeNew()
 			keyObj := d.keyType.UnsafeIndirect(keyPtr)
 			if reflect2.IsNil(keyObj) {
-				ptrType := d.keyType.(*reflect2.UnsafePtrType)
+				ptrType, ok := d.keyType.(*reflect2.UnsafePtrType)
+				if !ok {
+					r.ReportError("mapDecoderUnmarshaler", "cannot initialize map key type "+d.keyType.String())
+					return
+				}
 				newPtr := ptrType.Elem().UnsafeNew()
 				*((*unsafe.Pointer)(keyPtr)) = newPtr
 				keyObj = d.keyType.UnsafeIndirect(keyPtr)
@@ -190,12 +194,15 @@ func (e *mapEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 				keyPtr, elemPtr := iter.UnsafeNext()
 				w.WriteString(*((*string)(keyPtr)))
 				e.encoder.Encode(elemPtr, w)
+				if w.Error != nil {
+					return int64(i)
+				}
 			}
 
 			return int64(i)
 		})
 
-		if wrote == 0 {
+		if w.Error != nil || wrote == 0 {
 			break
 		}
 	}
@@ -249,11 +256,14 @@ func (e *mapEncoderMarshaller) Encode(ptr unsafe.Pointer, w *Writer) {
 				w.WriteString(string(b))
 
 				e.encoder.Encode(elemPtr, w)
+				if w.Error != nil {
+					return int64(i)
+				}
 			}
 			return int64(i)
 		})
 
-		if wrote == 0 {
+		if w.Error != nil || wrote == 0 {
 			break
 		}
 	}

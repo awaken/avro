@@ -2,6 +2,8 @@ package avro_test
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"testing"
 
 	"github.com/awaken/avro/v2"
@@ -111,4 +113,40 @@ func TestEncoder_ArrayError(t *testing.T) {
 	err = enc.Encode([]string{"foo", "bar"})
 
 	assert.Error(t, err)
+}
+
+type arrayMarshalCounter struct {
+	calls *int
+	err   error
+}
+
+func (m arrayMarshalCounter) MarshalText() ([]byte, error) {
+	*m.calls++
+	return nil, m.err
+}
+
+func TestEncoder_ArrayStopsAfterElementError(t *testing.T) {
+	schema, err := avro.Parse(`{"type":"array", "items":"string"}`)
+	require.NoError(t, err)
+
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "ordinary error", err: errors.New("test")},
+		{name: "EOF", err: io.EOF},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			enc := avro.Config{BlockLength: 1}.Freeze().NewEncoder(schema, bytes.NewBuffer(nil))
+			calls := 0
+
+			err := enc.Encode([]arrayMarshalCounter{
+				{calls: &calls, err: test.err},
+				{calls: &calls, err: test.err},
+			})
+
+			require.ErrorIs(t, err, test.err)
+			assert.Equal(t, 1, calls)
+		})
+	}
 }

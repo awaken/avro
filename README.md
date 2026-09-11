@@ -192,7 +192,7 @@ e.g `"map:string"`. Behavior when a type cannot be resolved will depend on your 
 	* !Config.UnionResolutionError && !Config.PartialUnionTypeResolution: the map type above is used
 	* Config.UnionResolutionError && !Config.PartialUnionTypeResolution: an error is returned
 	* !Config.UnionResolutionError && Config.PartialUnionTypeResolution: any registered type will get resolved while any unregistered type will fallback to the map type above.
-	* Config.UnionResolutionError && !Config.PartialUnionTypeResolution: any registered type will get resolved while any unregistered type will return an error.
+	* Config.UnionResolutionError && Config.PartialUnionTypeResolution: any registered type will get resolved while any unregistered type will return an error.
 
 ##### TextMarshaler and TextUnmarshaler
 
@@ -216,11 +216,12 @@ This requires the use of `map[string]any` or `[]any`.
 The type conversion for encoding will receive the original value that is to be encoded, and must return a data type that is compatible with the schema, as specified in the table above.
 The type conversion for decoding will receive the decoded value with a data type that is compatible with the schema, and its return value will be used as the final decoded value.
 
-##### Untrusted Input With Bytes and Strings
+##### Byte and Decimal Limits
 
-For security reasons, the configuration `Config.MaxByteSliceSize` restricts the maximum size of `bytes` and `string` types created
-by the `Reader`. The default maximum size is `1MiB` and is configurable. This is required to stop untrusted input from consuming all memory and
-crashing the application. Should this not be need, setting a negative number will disable the behaviour.
+`Config.MaxByteSliceSize` bounds decoded bytes and strings, encoded/decoded fixed
+values, and decimal scaling operands and output. It defaults to 1 MiB. Decimal
+arithmetic can use several times that amount of temporary memory. A negative
+value disables the configured limit; platform allocation limits still apply.
 
 ## Benchmark
 
@@ -337,7 +338,62 @@ avro.SkipNameValidation = true
 
 Note that this variable is global, so ideally you'd need to unset it after you're done with the invalid schema.
 
+## Protocol compatibility
+
+Protocol JSON sorts message names and preserves declared type and field order.
+`Hash` is the MD5 of that representation. Corrected message ordering and explicit
+null responses change hashes previously produced by older versions; rebuild
+protocol-text caches when upgrading.
+
+Every parsed message requires a request array and a response schema. An empty
+request is `[]`; a null response is `"null"`, not JSON `null`. One-way calls require
+`"one-way":true`, a null response and no declared errors. Omitting the flag, or
+setting it to false, keeps the call two-way. Declared errors must resolve to error
+records. Message names follow the existing name-validation setting.
+
+`NewProtocol` copies its input collections, and `Types` returns a copy of the list.
+Referenced schemas and messages remain shared and must be immutable.
+`NewMessage` treats a nil response as the null schema; its caller must provide a
+non-nil request and valid error and one-way schemas.
+
+## Numeric and date compatibility
+
+Integer codecs reject values outside the destination's width or signedness instead
+of wrapping. Failed integer and time-of-day decodes preserve the destination.
+
+Dates use the input's calendar year, month and day, ignoring its clock and zone.
+Dates outside the signed 32-bit day range are rejected. This changes older output
+for non-midnight or non-UTC inputs.
+
+Time-millis and time-micros values must be at least zero and less than 24 hours.
+Validation includes raw integer representations and occurs before narrowing or
+duration multiplication. Duration encoding still discards positive subunit
+fractions. Values previously accepted outside one day now return an error.
+
+Local timestamps encode the input's wall-clock fields without consulting the host
+zone. Decoding returns those fields in a UTC `time.Time` carrier, including clocks
+that are ambiguous or nonexistent in a daylight-saving zone. That UTC value is a
+civil-time carrier, not an assertion that the original event happened in UTC.
+This changes the location and instant returned by older local-timestamp decoders;
+callers requiring an instant must choose a zone and an ambiguity policy explicitly.
+Ordinary timestamps still encode instants. Both forms reject counts outside the
+signed 64-bit millisecond or microsecond range.
+
+`Config.MaxByteSliceSize` also limits fixed values, including decimals and
+durations, when encoding, decoding or skipping. The default is 1 MiB; a negative
+value disables the configured limit. Oversized values fail before fixed-value
+reflection or allocation. Increase the limit explicitly for larger trusted data.
+
+Decimal encoding requires an exact value at the declared scale. For example,
+`1/4` at scale two encodes as `0.25`; `1/3` returns an error. Encoding never mutates
+the input rational. Encoding and decoding both enforce unscaled digit precision,
+including raw byte, fixed-array and fixed-uint64 representations. Failed decimal
+decodes preserve the destination. Decimal scaling and output use the configured
+byte limit; precision diagnostics report counts without formatting the value.
+
 ## Go Version Support
+
+The minimum Go version is 1.26.
 
 This library supports the last two versions of Go. While the minimum Go version is
 not guaranteed to increase along side Go, it may jump from time to time to support
@@ -348,3 +404,32 @@ additional features. This will be not be considered a breaking change.
 - [Apache Arrow for Go](https://github.com/apache/arrow-go)
 - [confluent-kafka-go](https://github.com/confluentinc/confluent-kafka-go)
 - [pulsar-client-go](https://github.com/apache/pulsar-client-go)
+
+Record field names and aliases share a namespace. Parsing and constructors reject
+repeated aliases and collisions with field names. Alias text remains unrestricted.
+During schema evolution, each reader field may match one writer name through its
+name or aliases. An exact match plus an alias match is ambiguous and is rejected;
+field order does not select a winner. Defaults apply only to unmatched fields.
+Writer aliases do not participate in reader field matching.
+
+SOE decoding requires exactly one datum and rejects trailing payload bytes,
+including in `DecodeUnverified`. APIs from `Config.Freeze` implement
+`ExactUnmarshaler`. Custom APIs used for SOE decoding must implement or forward
+`UnmarshalExact`; otherwise decoding returns `soe.ErrExactAPI`. Custom encoding
+and ordinary `API.Unmarshal` retain their existing contracts. A failed decode
+can partly populate the destination.
+
+OCF decoding requires the declared record count to consume the entire decompressed
+block. Extra bytes, including bytes in a zero-record block, are errors. Empty
+blocks and zero-width records remain valid. Record errors stop iteration and are
+returned by `Error`; the failed destination may be partly populated. Core
+`Decoder.Buffered` reports read-ahead bytes; `DecodeDatum` supports externally
+framed zero-width records without changing stream `Decode` EOF behavior.
+
+Registry responses default to a 4 MiB body limit, including trailing whitespace
+and bytes decoded by the HTTP transport. Configure `registry.WithResponseLimit`
+when larger schemas are required. Successful responses must contain one complete
+JSON document; operations without a returned value also permit an empty body.
+Oversized responses return `registry.ErrResponseLimit` and close after at most
+one byte beyond the limit. Bodies are not drained after errors. The default HTTP
+client has a timeout; custom clients should also set a timeout or request deadline.

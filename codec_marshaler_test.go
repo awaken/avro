@@ -3,6 +3,7 @@ package avro_test
 import (
 	"bytes"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -56,6 +57,31 @@ func TestDecoder_TextUnmarshalerError(t *testing.T) {
 	err = dec.Decode(&ts)
 
 	assert.Error(t, err)
+}
+
+func TestDecoder_TextUnmarshalerNotCalledAfterReadError(t *testing.T) {
+	defer ConfigTeardown()
+
+	dec, err := avro.NewDecoder("string", bytes.NewReader([]byte{0x02}))
+	require.NoError(t, err)
+
+	var got TestUnmarshalCounter
+	err = dec.Decode(&got)
+
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.Zero(t, got)
+}
+
+func TestDecoder_TextUnmarshalerInterface(t *testing.T) {
+	dec, err := avro.NewDecoder(`"string"`, bytes.NewReader([]byte{0x02, 'x'}))
+	require.NoError(t, err)
+	var got interface{ UnmarshalText([]byte) error }
+
+	assert.NotPanics(t, func() {
+		err = dec.Decode(&got)
+	})
+
+	require.Error(t, err)
 }
 
 func TestEncoder_TextMarshaler(t *testing.T) {
@@ -141,4 +167,11 @@ func (t *TestTimestampError) UnmarshalText(data []byte) error {
 
 func (t *TestTimestampError) MarshalText() ([]byte, error) {
 	return nil, errors.New("test")
+}
+
+type TestUnmarshalCounter int
+
+func (t *TestUnmarshalCounter) UnmarshalText([]byte) error {
+	*t++
+	return nil
 }

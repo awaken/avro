@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -55,6 +57,7 @@ var outputTemplate string
 
 var (
 	primitiveMappings = map[avro.Type]string{
+		"null":    "any",
 		"string":  "string",
 		"bytes":   "[]byte",
 		"int":     "int",
@@ -68,6 +71,8 @@ var (
 	}
 )
 
+const avroImport = "github.com/awaken/avro/v2"
+
 // Struct generates Go structs based on the schema and writes them to w.
 func Struct(s string, w io.Writer, cfg Config) error {
 	schema, err := avro.Parse(s)
@@ -80,7 +85,7 @@ func Struct(s string, w io.Writer, cfg Config) error {
 // StructFromSchema generates Go structs based on the schema and writes them to w.
 func StructFromSchema(schema avro.Schema, w io.Writer, cfg Config) error {
 	rec, ok := schema.(*avro.RecordSchema)
-	if !ok {
+	if !ok || rec == nil {
 		return errors.New("can only generate Go code from Record Schemas")
 	}
 
@@ -128,9 +133,6 @@ func WithFullName(b bool) OptsFunc {
 func WithEncoders(b bool) OptsFunc {
 	return func(g *Generator) {
 		g.encoders = b
-		if b {
-			g.thirdPartyImports = append(g.thirdPartyImports, "github.com/awaken/avro/v2")
-		}
 	}
 }
 
@@ -234,6 +236,7 @@ type Generator struct {
 	initialisms  []string
 	logicalTypes map[avro.LogicalType]LogicalType
 	metadata     any
+	err          error
 
 	imports           []string
 	thirdPartyImports []string
@@ -276,6 +279,8 @@ func (g *Generator) Reset() {
 	g.imports = g.imports[:0]
 	g.thirdPartyImports = g.thirdPartyImports[:0]
 	g.typedefs = g.typedefs[:0]
+	g.typeenums = g.typeenums[:0]
+	g.err = nil
 }
 
 // Parse parses an avro schema into Go types.
@@ -290,19 +295,30 @@ func (g *Generator) ParseWithMetadata(schema avro.Schema, metadata any) {
 }
 
 func (g *Generator) generate(schema avro.Schema, metadata any) string {
+	if isNilSchema(schema) {
+		if g.err == nil {
+			g.err = errors.New("cannot generate Go code from a nil schema")
+		}
+		return ""
+	}
+
 	switch s := schema.(type) {
 	case *avro.RefSchema:
 		return g.resolveRefSchema(s, metadata)
 	case *avro.RecordSchema:
 		return g.resolveRecordSchema(s, metadata)
+	case *avro.NullSchema:
+		return "any"
 	case *avro.PrimitiveSchema:
 		typ := primitiveMappings[s.Type()]
-		if ls := s.Logical(); ls != nil {
-			typ = g.resolveLogicalSchema(ls.Type())
-		}
 		if g.strictTypes {
 			if newTyp, ok := strictTypeMappings[typ]; ok {
 				typ = newTyp
+			}
+		}
+		if ls := s.Logical(); ls != nil && validLogicalSchema(s, ls) {
+			if logicalType := g.resolveLogicalSchema(ls.Type()); logicalType != "" {
+				typ = logicalType
 			}
 		}
 		return typ
@@ -315,8 +331,10 @@ func (g *Generator) generate(schema avro.Schema, metadata any) string {
 		return "string"
 	case *avro.FixedSchema:
 		typ := fmt.Sprintf("[%d]byte", s.Size())
-		if ls := s.Logical(); ls != nil {
-			typ = g.resolveLogicalSchema(ls.Type())
+		if ls := s.Logical(); ls != nil && validLogicalSchema(s, ls) {
+			if logicalType := g.resolveLogicalSchema(ls.Type()); logicalType != "" {
+				typ = logicalType
+			}
 		}
 		return typ
 	case *avro.MapSchema:
@@ -324,8 +342,76 @@ func (g *Generator) generate(schema avro.Schema, metadata any) string {
 	case *avro.UnionSchema:
 		return g.resolveUnionTypes(s, metadata)
 	default:
+		if g.err == nil {
+			g.err = fmt.Errorf("unsupported schema implementation %T", schema)
+		}
 		return ""
 	}
+}
+
+func isNilSchema(schema avro.Schema) bool {
+	if schema == nil {
+		return true
+	}
+
+	value := reflect.ValueOf(schema)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func validLogicalSchema(schema avro.Schema, logical avro.LogicalSchema) bool {
+	switch logical.Type() {
+	case avro.UUID:
+		return schema.Type() == avro.String
+	case avro.Date, avro.TimeMillis:
+		return schema.Type() == avro.Int
+	case avro.TimeMicros, avro.TimestampMillis, avro.TimestampMicros,
+		avro.LocalTimestampMillis, avro.LocalTimestampMicros:
+		return schema.Type() == avro.Long
+	case avro.Duration:
+		fixed, ok := schema.(*avro.FixedSchema)
+		return ok && fixed.Size() == 12
+	case avro.Decimal:
+		return validDecimalLogicalSchema(schema, logical)
+	default:
+		return true
+	}
+}
+
+func validDecimalLogicalSchema(schema avro.Schema, logical avro.LogicalSchema) bool {
+	decimal, ok := logical.(*avro.DecimalLogicalSchema)
+	if !ok || decimal == nil {
+		return false
+	}
+
+	size := -1
+	switch s := schema.(type) {
+	case *avro.PrimitiveSchema:
+		if s.Type() != avro.Bytes {
+			return false
+		}
+	case *avro.FixedSchema:
+		size = s.Size()
+	default:
+		return false
+	}
+
+	precision, scale := decimal.Precision(), decimal.Scale()
+	if precision <= 0 || size == 0 || scale < 0 || scale > precision {
+		return false
+	}
+	if size > 0 {
+		maxPrecision := math.Floor(math.Log10(2) * (8*float64(size) - 1))
+		if float64(precision) > maxPrecision {
+			return false
+		}
+	}
+
+	return true
 }
 
 func sanitizeIdentifier(name string) string {
@@ -380,6 +466,9 @@ func (g *Generator) resolveRecordSchema(schema *avro.RecordSchema, metadata any)
 	}
 
 	typeName := g.resolveTypeName(schema)
+	if g.err != nil {
+		return typeName
+	}
 	if !g.hasTypeDef(typeName) {
 		g.typedefs = append(
 			g.typedefs,
@@ -393,7 +482,10 @@ func (g *Generator) rawSchema(schema *avro.RecordSchema) string {
 	if g.fullSchema {
 		schemaJSON, err := schema.MarshalJSON()
 		if err != nil {
-			panic(fmt.Errorf("failed to marshal raw schema for '%s': %w", schema.FullName(), err))
+			if g.err == nil {
+				g.err = fmt.Errorf("failed to marshal raw schema for '%s': %w", schema.FullName(), err)
+			}
+			return ""
 		}
 		return string(schemaJSON)
 	}
@@ -411,16 +503,20 @@ func (g *Generator) hasTypeDef(name string) bool {
 }
 
 func (g *Generator) resolveRefSchema(s *avro.RefSchema, metadata any) string {
-	if sx, ok := s.Schema().(*avro.RecordSchema); ok {
+	schema := s.Schema()
+	if isNilSchema(schema) {
+		return g.generate(schema, metadata)
+	}
+	if sx, ok := schema.(*avro.RecordSchema); ok {
 		return g.resolveTypeName(sx)
 	}
-	return g.generate(s.Schema(), metadata)
+	return g.generate(schema, metadata)
 }
 
 func (g *Generator) resolveUnionTypes(s *avro.UnionSchema, metadata any) string {
 	types := make([]string, 0, len(s.Types()))
 	for _, elem := range s.Types() {
-		if _, ok := elem.(*avro.NullSchema); ok {
+		if elem.Type() == avro.Null {
 			continue
 		}
 		types = append(types, g.generate(elem, metadata))
@@ -447,7 +543,7 @@ func (g *Generator) resolveLogicalSchema(logicalType avro.LogicalType) string {
 
 	var typ string
 	switch logicalType {
-	case "date", "timestamp-millis", "timestamp-micros":
+	case "date", "timestamp-millis", "timestamp-micros", "local-timestamp-millis", "local-timestamp-micros":
 		typ = "time.Time"
 	case "time-millis", "time-micros":
 		typ = "time.Duration"
@@ -465,7 +561,7 @@ func (g *Generator) resolveLogicalSchema(logicalType avro.LogicalType) string {
 		g.addImport("math/big")
 	}
 	if strings.Contains(typ, "avro") {
-		g.addThirdPartyImport("github.com/awaken/avro/v2")
+		g.addThirdPartyImport(avroImport)
 	}
 	return typ
 }
@@ -497,6 +593,13 @@ func (g *Generator) addThirdPartyImport(pkg string) {
 
 // Write writes Go code from the parsed schemas.
 func (g *Generator) Write(w io.Writer) error {
+	if err := validateStructTagNames(g.tags); err != nil {
+		return err
+	}
+	if g.err != nil {
+		return g.err
+	}
+
 	parsed, err := template.New("out").
 		Funcs(template.FuncMap{
 			"kebab":         strcase.ToKebab,
@@ -512,6 +615,15 @@ func (g *Generator) Write(w io.Writer) error {
 		return err
 	}
 
+	thirdPartyImports := slices.Clone(g.thirdPartyImports)
+	if g.encoders {
+		thirdPartyImports = slices.DeleteFunc(thirdPartyImports, func(pkg string) bool {
+			return pkg == avroImport
+		})
+		thirdPartyImports = append([]string{avroImport}, thirdPartyImports...)
+	}
+	imports := slices.Concat(g.imports, thirdPartyImports)
+
 	data := struct {
 		WithEncoders      bool
 		PackageName       string
@@ -525,7 +637,7 @@ func (g *Generator) Write(w io.Writer) error {
 		WithEncoders: g.encoders,
 		PackageName:  g.pkg,
 		PackageDoc:   g.pkgdoc,
-		Imports:      append(g.imports, g.thirdPartyImports...),
+		Imports:      imports,
 		Typedefs:     g.typedefs,
 		Metadata:     g.metadata,
 		Typeenums:    g.typeenums,
@@ -595,6 +707,19 @@ func buildTag(f field) string {
 		return strconv.Quote(value)
 	}
 	return "`" + value + "`"
+}
+
+func validateStructTagNames(tags map[string]TagStyle) error {
+	names := slices.Sorted(maps.Keys(tags))
+	for _, name := range names {
+		if name == "" || !utf8.ValidString(name) || strings.IndexFunc(name, func(r rune) bool {
+			return r <= ' ' || r == ':' || r == '"' || r == 0x7f
+		}) >= 0 {
+			return fmt.Errorf("invalid struct tag name %q", name)
+		}
+	}
+
+	return nil
 }
 
 func enumConstName(typeName, symbol string) string {

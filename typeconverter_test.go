@@ -3,9 +3,58 @@ package avro_test
 import (
 	"fmt"
 	"math/big"
+	"testing"
 
 	"github.com/awaken/avro/v2"
+	"github.com/stretchr/testify/assert"
 )
+
+func TestTypeConverters_RegisterIgnoresNil(t *testing.T) {
+	tests := []struct {
+		name string
+		conv avro.TypeConverter
+	}{
+		{name: "nil interface"},
+		{name: "typed nil", conv: (*avro.TypeConversionFuncs)(nil)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			converters := avro.NewTypeConverters()
+
+			assert.NotPanics(t, func() {
+				converters.RegisterTypeConverters(tt.conv)
+			})
+			_, err := converters.DecodeTypeConvert(nil, avro.NewPrimitiveSchema(avro.Boolean, nil))
+			assert.Error(t, err)
+		})
+	}
+}
+
+func TestTypeConverters_RejectNilSchema(t *testing.T) {
+	var typedNil *avro.PrimitiveSchema
+	tests := []struct {
+		name   string
+		schema avro.Schema
+	}{
+		{name: "nil interface"},
+		{name: "typed nil", schema: typedNil},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			converters := avro.NewTypeConverters()
+			assert.NotPanics(t, func() {
+				_, err := converters.EncodeTypeConvert(nil, test.schema)
+				assert.Error(t, err)
+			})
+			assert.NotPanics(t, func() {
+				_, err := converters.DecodeTypeConvert(nil, test.schema)
+				assert.Error(t, err)
+			})
+		})
+	}
+}
 
 var (
 	boolConverter = avro.TypeConversionFuncs{

@@ -3,6 +3,7 @@ package avro_test
 import (
 	"bytes"
 	"errors"
+	"io"
 	"testing"
 
 	"github.com/awaken/avro/v2"
@@ -48,7 +49,7 @@ func TestDecoderTypeConverter_MapUnion(t *testing.T) {
 	defer ConfigTeardown()
 
 	data := []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x87, 0x78}
-	schema := `["null",{"type":"fixed", "name":"fixed_decimal", "size":6, "logicalType":"decimal", "precision":4, "scale":2}]`
+	schema := `["null",{"type":"fixed", "name":"fixed_decimal", "size":6, "logicalType":"decimal", "precision":5, "scale":2}]`
 	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
 	require.NoError(t, err)
 
@@ -118,7 +119,7 @@ func TestDecoderTypeConverter_FixedRat(t *testing.T) {
 	defer ConfigTeardown()
 
 	data := []byte{0x00, 0x00, 0x00, 0x00, 0x87, 0x78}
-	schema := `{"type":"fixed", "name":"fixed_decimal", "size":6, "logicalType":"decimal", "precision":4, "scale":2}`
+	schema := `{"type":"fixed", "name":"fixed_decimal", "size":6, "logicalType":"decimal", "precision":5, "scale":2}`
 	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
 	require.NoError(t, err)
 
@@ -218,4 +219,112 @@ func TestDecoderTypeConverter_ErrorUnionNullablePtr(t *testing.T) {
 
 	assert.ErrorIs(t, err, testError)
 	assert.Nil(t, got)
+}
+
+func TestDecoderTypeConverter_UnionNullableRejectsWrongType(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		data   []byte
+		value  func() any
+	}{
+		{
+			name:   "slice",
+			schema: `["null", "bytes"]`,
+			data:   []byte{0x02, 0x02, 'a'},
+			value: func() any {
+				var value []byte
+				return &value
+			},
+		},
+		{
+			name:   "pointer",
+			schema: `["null", "int"]`,
+			data:   []byte{0x02, 0x02},
+			value: func() any {
+				var value *int
+				return &value
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := avro.Config{}.Freeze()
+			cfg.RegisterTypeConverters(avro.TypeConversionFuncs{
+				AvroType: avro.Union,
+				DecoderTypeConversion: func(any, avro.Schema) (any, error) {
+					return "wrong", nil
+				},
+			})
+			dec := cfg.NewDecoder(avro.MustParse(tt.schema), bytes.NewReader(tt.data))
+
+			assert.NotPanics(t, func() {
+				err := dec.Decode(tt.value())
+				assert.ErrorContains(t, err, "cannot assign string")
+			})
+		})
+	}
+}
+
+func TestDecoderTypeConverter_NotCalledAfterDecodeError(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		data   []byte
+		typ    avro.Type
+		value  func() any
+	}{
+		{
+			name:   "dynamic",
+			schema: "string",
+			data:   []byte{0x02},
+			typ:    avro.String,
+			value: func() any {
+				var value any
+				return &value
+			},
+		},
+		{
+			name:   "nullable union",
+			schema: `["null","string"]`,
+			data:   []byte{0x02, 0x02},
+			typ:    avro.Union,
+			value: func() any {
+				var value *string
+				return &value
+			},
+		},
+		{
+			name:   "resolved union",
+			schema: `["null","string"]`,
+			data:   []byte{0x02, 0x02},
+			typ:    avro.Union,
+			value: func() any {
+				var value any
+				return &value
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			schema := avro.MustParse(tt.schema)
+			cfg := avro.Config{}.Freeze()
+			calls := 0
+			cfg.RegisterTypeConverters(avro.TypeConversionFuncs{
+				AvroType: tt.typ,
+				DecoderTypeConversion: func(in any, _ avro.Schema) (any, error) {
+					calls++
+					return in, nil
+				},
+			})
+			dec := cfg.NewDecoder(schema, bytes.NewReader(tt.data))
+
+			err := dec.Decode(tt.value())
+
+			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+			assert.Zero(t, calls)
+		})
+	}
 }

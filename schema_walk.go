@@ -152,6 +152,7 @@ func cloneField(field *Field, cloned map[Schema]Schema) *Field {
 		doc:        field.doc,
 		hasDef:     field.hasDef,
 		def:        cloneDefault(field.def),
+		jsonDef:    cloneDefault(field.jsonDef),
 		order:      field.order,
 		action:     field.action,
 	}

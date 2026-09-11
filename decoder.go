@@ -33,6 +33,23 @@ func (d *Decoder) Decode(v any) error {
 		}
 	}
 
+	return d.DecodeDatum(v)
+}
+
+// Buffered returns the number of unread bytes held by the decoder. It excludes
+// bytes not yet read from the underlying reader.
+func (d *Decoder) Buffered() int {
+	return d.r.tail - d.r.head
+}
+
+// DecodeDatum decodes one datum whose presence is established by external
+// framing, such as an OCF record count. Unlike Decode, it does not probe for
+// stream EOF before decoding, so zero-width values need no input bytes.
+func (d *Decoder) DecodeDatum(v any) error {
+	if d.r.Error != nil {
+		return d.r.Error
+	}
+
 	d.r.ReadVal(d.s, v)
 
 	//nolint:errorlint // Only direct EOF errors should be discarded.

@@ -2,6 +2,7 @@ package avro_test
 
 import (
 	"bytes"
+	"io"
 	"math/big"
 	"testing"
 	"time"
@@ -39,6 +40,28 @@ func TestDecoder_UnionMap(t *testing.T) {
 	assert.Equal(t, map[string]any{"string": "foo"}, got)
 }
 
+type unionMapInterface interface {
+	Value() string
+}
+
+type unionMapString string
+
+func (s unionMapString) Value() string {
+	return string(s)
+}
+
+func TestDecoder_UnionMapRejectsNonEmptyInterface(t *testing.T) {
+	data := []byte{0x02, 0x06, 0x66, 0x6F, 0x6F}
+	dec, err := avro.NewDecoder(`["null", "string"]`, bytes.NewReader(data))
+	require.NoError(t, err)
+
+	var got map[string]unionMapInterface
+	assert.NotPanics(t, func() {
+		err = dec.Decode(&got)
+	})
+	assert.Error(t, err)
+}
+
 func TestDecoder_UnionMapNamed(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -67,6 +90,109 @@ func TestDecoder_UnionMapNull(t *testing.T) {
 	assert.Equal(t, map[string]any(nil), got)
 }
 
+func TestDecoder_UnionTruncatedIndexDoesNotSelectNull(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		value  func() (any, func(*testing.T))
+	}{
+		{
+			name:   "map",
+			schema: `["null", "string"]`,
+			value: func() (any, func(*testing.T)) {
+				got := map[string]any{"string": "old"}
+				return &got, func(t *testing.T) {
+					assert.Equal(t, map[string]any{"string": "old"}, got)
+				}
+			},
+		},
+		{
+			name:   "slice",
+			schema: `["null", {"type":"array", "items":"int"}]`,
+			value: func() (any, func(*testing.T)) {
+				got := []int{27}
+				return &got, func(t *testing.T) {
+					assert.Equal(t, []int{27}, got)
+				}
+			},
+		},
+		{
+			name:   "pointer",
+			schema: `["null", "int"]`,
+			value: func() (any, func(*testing.T)) {
+				i := 27
+				got := &i
+				return &got, func(t *testing.T) {
+					require.NotNil(t, got)
+					assert.Equal(t, 27, *got)
+				}
+			},
+		},
+		{
+			name:   "interface",
+			schema: `["null", "string"]`,
+			value: func() (any, func(*testing.T)) {
+				var got any = "old"
+				return &got, func(t *testing.T) {
+					assert.Equal(t, "old", got)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value, check := test.value()
+			dec, err := avro.NewDecoder(test.schema, bytes.NewReader([]byte{0x80}))
+			require.NoError(t, err)
+
+			err = dec.Decode(value)
+
+			require.Error(t, err)
+			check(t)
+		})
+	}
+}
+
+func TestDecoder_UnionIndexUsesLongEncoding(t *testing.T) {
+	data := []byte{0x82, 0x80, 0x80, 0x80, 0x80, 0x00, 0x04, 'o', 'k'}
+	dec, err := avro.NewDecoder(`["null", "string"]`, bytes.NewReader(data))
+	require.NoError(t, err)
+
+	var got *string
+	err = dec.Decode(&got)
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "ok", *got)
+}
+
+func TestDecoder_UnionMapNullClearsPreviousValue(t *testing.T) {
+	defer ConfigTeardown()
+
+	dec, err := avro.NewDecoder(`["null", "string"]`, bytes.NewReader([]byte{0x00}))
+	require.NoError(t, err)
+
+	got := map[string]any{"string": "stale"}
+	err = dec.Decode(&got)
+
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
+func TestDecoder_UnionMapReplacesPreviousBranch(t *testing.T) {
+	defer ConfigTeardown()
+
+	dec, err := avro.NewDecoder(`["null", "string", "int"]`, bytes.NewReader([]byte{0x04, 0x36}))
+	require.NoError(t, err)
+
+	got := map[string]any{"string": "stale"}
+	err = dec.Decode(&got)
+
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"int": 27}, got)
+}
+
 func TestDecoder_UnionMapWithTime(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -84,7 +210,7 @@ func TestDecoder_UnionMapWithTime(t *testing.T) {
 func TestDecoder_UnionMapWithDuration(t *testing.T) {
 	defer ConfigTeardown()
 
-	data := []byte{0x02, 0xAA, 0xB4, 0xDE, 0x75}
+	data := []byte{0x02, 0x9C, 0x85, 0xE3, 0x0B}
 	schema := `["null", {"type": "int", "logicalType": "time-millis"}]`
 	dec, _ := avro.NewDecoder(schema, bytes.NewReader(data))
 
@@ -92,7 +218,7 @@ func TestDecoder_UnionMapWithDuration(t *testing.T) {
 	err := dec.Decode(&got)
 
 	require.NoError(t, err)
-	assert.Equal(t, 123456789*time.Millisecond, got["int.time-millis"])
+	assert.Equal(t, 12345678*time.Millisecond, got["int.time-millis"])
 }
 
 func TestDecoder_UnionMapWithDecimal(t *testing.T) {
@@ -100,7 +226,7 @@ func TestDecoder_UnionMapWithDecimal(t *testing.T) {
 
 	t.Run("low scale", func(t *testing.T) {
 		data := []byte{0x02, 0x6, 0x00, 0x87, 0x78}
-		schema := `["null", {"type": "bytes", "logicalType": "decimal", "precision": 4, "scale": 2}]`
+		schema := `["null", {"type": "bytes", "logicalType": "decimal", "precision": 5, "scale": 2}]`
 		dec, _ := avro.NewDecoder(schema, bytes.NewReader(data))
 
 		var got map[string]any
@@ -247,11 +373,13 @@ func TestDecoder_UnionNullableSliceNull(t *testing.T) {
 	schema := `["null", "bytes"]`
 	dec, _ := avro.NewDecoder(schema, bytes.NewReader(data))
 
-	var got []byte
+	got := []byte("old")
 	err := dec.Decode(&got)
 
 	require.NoError(t, err)
 	assert.Nil(t, got)
+	assert.Zero(t, len(got))
+	assert.Zero(t, cap(got))
 }
 
 func TestDecoder_UnionNullableSliceNotNullButEmpty(t *testing.T) {
@@ -539,6 +667,68 @@ func TestDecoder_UnionConverterFromAnyInterface(t *testing.T) {
 	assert.Equal(t, "foo", rec.B)
 }
 
+func TestDecoder_UnionConverterIntoValue(t *testing.T) {
+	defer ConfigTeardown()
+
+	avro.Register("test", TestRecord{})
+
+	data := []byte{0x02, 0x36, 0x06, 0x66, 0x6F, 0x6F}
+	schema := `["int", {"type": "record", "name": "test", "fields" : [{"name": "a", "type": "long"}, {"name": "b", "type": "string"}]}]`
+	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
+	require.NoError(t, err)
+
+	var got UnionRecord
+	err = dec.Decode(&got)
+
+	require.NoError(t, err)
+	require.NotNil(t, got.Test)
+	assert.Equal(t, int64(27), got.Test.A)
+	assert.Equal(t, "foo", got.Test.B)
+}
+
+func TestDecoder_NullableUnionRejectsValueStruct(t *testing.T) {
+	defer ConfigTeardown()
+
+	data := []byte{0x02, 0x36, 0x06, 0x66, 0x6F, 0x6F}
+	schema := `["null", {"type": "record", "name": "test", "fields" : [{"name": "a", "type": "long"}, {"name": "b", "type": "string"}]}]`
+	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
+	require.NoError(t, err)
+
+	got := TestRecord{A: 7, B: "old"}
+	assert.NotPanics(t, func() {
+		err = dec.Decode(&got)
+	})
+	assert.Error(t, err)
+	assert.Equal(t, TestRecord{A: 7, B: "old"}, got)
+}
+
+type TestCountingUnionConverter struct {
+	Calls int
+}
+
+func (c *TestCountingUnionConverter) FromAny(any) error {
+	c.Calls++
+	return nil
+}
+
+func (*TestCountingUnionConverter) ToAny() (any, error) {
+	return nil, nil
+}
+
+func TestDecoder_UnionConverterNotCalledAfterDecodeError(t *testing.T) {
+	dec, err := avro.NewDecoder(`["string","int"]`, bytes.NewReader([]byte{0x00, 0x02}))
+	require.NoError(t, err)
+
+	var got *TestCountingUnionConverter
+	err = dec.Decode(&got)
+
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.Nil(t, got)
+	if got != nil {
+		assert.Zero(t, got.Calls)
+	}
+}
+
 func TestDecoder_NullableUnionConverterFromAnyInterface(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -554,6 +744,34 @@ func TestDecoder_NullableUnionConverterFromAnyInterface(t *testing.T) {
 	require.NoError(t, err)
 	assert.IsType(t, &UnionRecord{}, got)
 	assert.Nil(t, got)
+}
+
+func TestDecoder_NullableUnionConverterClearsExistingValue(t *testing.T) {
+	defer ConfigTeardown()
+
+	dec, err := avro.NewDecoder(`["null", "int"]`, bytes.NewReader([]byte{0x00}))
+	require.NoError(t, err)
+
+	i := 27
+	got := &UnionRecord{Int: &i}
+	err = dec.Decode(&got)
+
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
+func TestDecoder_NullableUnionConverterClearsExistingStruct(t *testing.T) {
+	defer ConfigTeardown()
+
+	dec, err := avro.NewDecoder(`["null", "int"]`, bytes.NewReader([]byte{0x00}))
+	require.NoError(t, err)
+
+	i := 27
+	got := UnionRecord{Int: &i}
+	err = dec.Decode(&got)
+
+	require.NoError(t, err)
+	assert.Equal(t, UnionRecord{}, got)
 }
 
 func TestDecoder_UnionInterfaceRecordNotReused(t *testing.T) {
@@ -738,6 +956,27 @@ func TestDecoder_UnionInterfaceDualRecordsPartialResolution(t *testing.T) {
 	assert.Equal(t, "foo", rec.B)
 }
 
+func TestDecoder_UnionInterfacePartialResolutionWithErrors(t *testing.T) {
+	schema := avro.MustParse(`[
+		"string",
+		{"type":"record", "name":"unregistered", "fields":[]}
+	]`)
+	api := avro.Config{
+		PartialUnionTypeResolution: true,
+		UnionResolutionError:       true,
+	}.Freeze()
+
+	dec := api.NewDecoder(schema, bytes.NewReader([]byte{0x00, 0x06, 'f', 'o', 'o'}))
+	var got any
+	err := dec.Decode(&got)
+	require.NoError(t, err)
+	assert.Equal(t, "foo", got)
+
+	dec = api.NewDecoder(schema, bytes.NewReader([]byte{0x02}))
+	err = dec.Decode(&got)
+	require.ErrorContains(t, err, "unknown union type")
+}
+
 func TestDecoder_UnionInterfaceWithTime(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -755,7 +994,7 @@ func TestDecoder_UnionInterfaceWithTime(t *testing.T) {
 func TestDecoder_UnionInterfaceWithDuration(t *testing.T) {
 	defer ConfigTeardown()
 
-	data := []byte{0x02, 0xAA, 0xB4, 0xDE, 0x75}
+	data := []byte{0x02, 0x9C, 0x85, 0xE3, 0x0B}
 	schema := `["null", {"type": "int", "logicalType": "time-millis"}]`
 	dec, _ := avro.NewDecoder(schema, bytes.NewReader(data))
 
@@ -763,7 +1002,7 @@ func TestDecoder_UnionInterfaceWithDuration(t *testing.T) {
 	err := dec.Decode(&got)
 
 	require.NoError(t, err)
-	assert.Equal(t, 123456789*time.Millisecond, got)
+	assert.Equal(t, 12345678*time.Millisecond, got)
 }
 
 func TestDecoder_UnionInterfaceWithDecimal(t *testing.T) {
@@ -771,7 +1010,7 @@ func TestDecoder_UnionInterfaceWithDecimal(t *testing.T) {
 
 	t.Run("low scale", func(t *testing.T) {
 		data := []byte{0x02, 0x6, 0x00, 0x87, 0x78}
-		schema := `["null", {"type": "bytes", "logicalType": "decimal", "precision": 4, "scale": 2}]`
+		schema := `["null", {"type": "bytes", "logicalType": "decimal", "precision": 5, "scale": 2}]`
 		dec, _ := avro.NewDecoder(schema, bytes.NewReader(data))
 
 		var got any
@@ -799,7 +1038,7 @@ func TestDecoder_UnionInterfaceWithDecimal_Negative(t *testing.T) {
 
 	t.Run("low scale", func(t *testing.T) {
 		data := []byte{0x02, 0x6, 0xFF, 0x78, 0x88}
-		schema := `["null", {"type": "bytes", "logicalType": "decimal", "precision": 4, "scale": 2}]`
+		schema := `["null", {"type": "bytes", "logicalType": "decimal", "precision": 5, "scale": 2}]`
 		dec, _ := avro.NewDecoder(schema, bytes.NewReader(data))
 
 		var got any

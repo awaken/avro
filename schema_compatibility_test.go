@@ -1,8 +1,10 @@
 package avro_test
 
 import (
+	"encoding/json"
 	"math/big"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,10 +13,118 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type blockingCompatibilitySchema struct {
+	typ         avro.Type
+	fingerprint [32]byte
+	entered     chan struct{}
+	release     chan struct{}
+	once        sync.Once
+}
+
+func (s *blockingCompatibilitySchema) Type() avro.Type {
+	if s.entered != nil {
+		s.once.Do(func() {
+			close(s.entered)
+			<-s.release
+		})
+	}
+	return s.typ
+}
+
+func (s *blockingCompatibilitySchema) String() string {
+	return `"` + string(s.typ) + `"`
+}
+
+func (s *blockingCompatibilitySchema) Fingerprint() [32]byte {
+	return s.fingerprint
+}
+
+func (s *blockingCompatibilitySchema) FingerprintUsing(avro.FingerprintType) ([]byte, error) {
+	return append([]byte(nil), s.fingerprint[:]...), nil
+}
+
+func (s *blockingCompatibilitySchema) CacheFingerprint() [32]byte {
+	return s.fingerprint
+}
+
 func TestNewSchemaCompatibility(t *testing.T) {
 	sc := avro.NewSchemaCompatibility()
 
 	assert.IsType(t, &avro.SchemaCompatibility{}, sc)
+}
+
+func TestSchemaCompatibility_AliasAmbiguity(t *testing.T) {
+	readers := []string{
+		`{"type":"record","name":"R","fields":[{"name":"value","type":"int","aliases":["a","b"]}]}`,
+		`{"type":"record","name":"R","fields":[{"name":"a","type":"int","aliases":["b"]}]}`,
+		`{"type":"record","name":"R","fields":[{"name":"value","type":"int","aliases":["a","b"],"default":0},{"name":"next","type":["null","R"],"default":null}]}`,
+	}
+	writers := []string{
+		`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"int"}]}`,
+		`{"type":"record","name":"R","fields":[{"name":"b","type":"int"},{"name":"a","type":"int"}]}`,
+	}
+	for _, reader := range readers {
+		for _, writer := range writers {
+			r, err := avro.ParseWithCache(reader, "", nil)
+			require.NoError(t, err)
+			w, err := avro.ParseWithCache(writer, "", nil)
+			require.NoError(t, err)
+			c := avro.NewSchemaCompatibility()
+			require.Error(t, c.Compatible(r, w), "ambiguous reader: %s; writer: %s", reader, writer)
+			_, err = c.Resolve(r, w)
+			require.Error(t, err)
+		}
+	}
+}
+
+func TestSchemaCompatibility_AliasMapping(t *testing.T) {
+	r, err := avro.ParseWithCache(`{"type":"record","name":"R","fields":[{"name":"value","type":"long","aliases":["old"]},{"name":"added","type":"int","default":7}]}`, "", nil)
+	require.NoError(t, err)
+	for _, fields := range []string{
+		`{"name":"skip","type":"int","aliases":["value","added"]},{"name":"old","type":"int"}`,
+		`{"name":"old","type":"int"},{"name":"skip","type":"int","aliases":["value","added"]}`,
+	} {
+		w, err := avro.ParseWithCache(`{"type":"record","name":"R","fields":[`+fields+`]}`, "", nil)
+		require.NoError(t, err)
+		c := avro.NewSchemaCompatibility()
+		require.NoError(t, c.Compatible(r, w))
+		resolved, err := c.Resolve(r, w)
+		require.NoError(t, err)
+		data, err := avro.Marshal(w, map[string]any{"old": 23, "skip": 99})
+		require.NoError(t, err)
+		var got map[string]any
+		require.NoError(t, avro.Unmarshal(resolved, data, &got))
+		require.Equal(t, map[string]any{"value": int64(23), "added": 7}, got)
+	}
+}
+
+func TestSchemaCompatibility_RejectsNilSchemas(t *testing.T) {
+	valid := avro.MustParse(`"int"`)
+	var typedNil *avro.PrimitiveSchema
+
+	tests := []struct {
+		name   string
+		reader avro.Schema
+		writer avro.Schema
+	}{
+		{name: "nil reader", writer: valid},
+		{name: "typed nil reader", reader: typedNil, writer: valid},
+		{name: "nil writer", reader: valid},
+		{name: "typed nil writer", reader: valid, writer: typedNil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compatibility := avro.NewSchemaCompatibility()
+			assert.NotPanics(t, func() {
+				assert.Error(t, compatibility.Compatible(tt.reader, tt.writer))
+			})
+			assert.NotPanics(t, func() {
+				_, err := compatibility.Resolve(tt.reader, tt.writer)
+				assert.Error(t, err)
+			})
+		})
+	}
 }
 
 func TestSchemaCompatibility_Compatible(t *testing.T) {
@@ -294,6 +404,160 @@ func TestSchemaCompatibility_CompatibleUsesCacheWithError(t *testing.T) {
 	err := sc.Compatible(r, w)
 
 	assert.Error(t, err)
+}
+
+func TestSchemaCompatibility_CacheDistinguishesCompatibilityMetadata(t *testing.T) {
+	tests := []struct {
+		name         string
+		compatible   string
+		incompatible string
+		writer       string
+	}{
+		{
+			name:         "field default",
+			compatible:   `{"type":"record","name":"R","fields":[{"name":"a","type":"int","default":0}]}`,
+			incompatible: `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`,
+			writer:       `{"type":"record","name":"R","fields":[]}`,
+		},
+		{
+			name:         "enum default",
+			compatible:   `{"type":"enum","name":"E","symbols":["A"],"default":"A"}`,
+			incompatible: `{"type":"enum","name":"E","symbols":["A"]}`,
+			writer:       `{"type":"enum","name":"E","symbols":["A","B"]}`,
+		},
+		{
+			name:         "field alias",
+			compatible:   `{"type":"record","name":"R","fields":[{"name":"new","aliases":["old"],"type":"int"}]}`,
+			incompatible: `{"type":"record","name":"R","fields":[{"name":"new","type":"int"}]}`,
+			writer:       `{"type":"record","name":"R","fields":[{"name":"old","type":"int"}]}`,
+		},
+		{
+			name:         "record alias",
+			compatible:   `{"type":"record","name":"New","aliases":["Old"],"fields":[]}`,
+			incompatible: `{"type":"record","name":"New","fields":[]}`,
+			writer:       `{"type":"record","name":"Old","fields":[]}`,
+		},
+		{
+			name:         "nested field default",
+			compatible:   `{"type":"record","name":"Outer","fields":[{"name":"inner","type":{"type":"record","name":"Inner","fields":[{"name":"a","type":"int","default":0}]}}]}`,
+			incompatible: `{"type":"record","name":"Outer","fields":[{"name":"inner","type":{"type":"record","name":"Inner","fields":[{"name":"a","type":"int"}]}}]}`,
+			writer:       `{"type":"record","name":"Outer","fields":[{"name":"inner","type":{"type":"record","name":"Inner","fields":[]}}]}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parse := func(raw string) avro.Schema {
+				schema, err := avro.ParseWithCache(raw, "", &avro.SchemaCache{})
+				require.NoError(t, err)
+				return schema
+			}
+
+			compatible := parse(test.compatible)
+			incompatible := parse(test.incompatible)
+			writer := parse(test.writer)
+			require.Equal(t, compatible.Fingerprint(), incompatible.Fingerprint())
+
+			compatibility := avro.NewSchemaCompatibility()
+			require.NoError(t, compatibility.Compatible(compatible, writer))
+			require.Error(t, compatibility.Compatible(incompatible, writer))
+
+			compatibility = avro.NewSchemaCompatibility()
+			require.Error(t, compatibility.Compatible(incompatible, writer))
+			require.NoError(t, compatibility.Compatible(compatible, writer))
+		})
+	}
+}
+
+func TestSchemaCompatibility_DecimalRequiresMatchingScaleAndPrecision(t *testing.T) {
+	tests := []struct {
+		name         string
+		compatible   string
+		incompatible string
+		writer       string
+	}{
+		{
+			name:         "bytes scale",
+			compatible:   `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`,
+			incompatible: `{"type":"bytes","logicalType":"decimal","precision":4,"scale":3}`,
+			writer:       `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`,
+		},
+		{
+			name:         "bytes precision",
+			compatible:   `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`,
+			incompatible: `{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`,
+			writer:       `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`,
+		},
+		{
+			name:         "fixed scale",
+			compatible:   `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":4,"scale":2}`,
+			incompatible: `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":4,"scale":3}`,
+			writer:       `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":4,"scale":2}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parse := func(raw string) avro.Schema {
+				schema, err := avro.ParseWithCache(raw, "", &avro.SchemaCache{})
+				require.NoError(t, err)
+				return schema
+			}
+
+			compatible := parse(test.compatible)
+			incompatible := parse(test.incompatible)
+			writer := parse(test.writer)
+			require.Equal(t, compatible.Fingerprint(), incompatible.Fingerprint())
+
+			compatibility := avro.NewSchemaCompatibility()
+			require.NoError(t, compatibility.Compatible(compatible, writer))
+			require.Error(t, compatibility.Compatible(incompatible, writer))
+
+			compatibility = avro.NewSchemaCompatibility()
+			require.Error(t, compatibility.Compatible(incompatible, writer))
+			require.NoError(t, compatibility.Compatible(compatible, writer))
+		})
+	}
+}
+
+func TestSchemaCompatibility_ConcurrentCallsWaitForFinalResult(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	reader := &blockingCompatibilitySchema{
+		typ:         avro.Int,
+		fingerprint: [32]byte{1},
+		entered:     entered,
+		release:     release,
+	}
+	writer := &blockingCompatibilitySchema{typ: avro.String, fingerprint: [32]byte{2}}
+	compatibility := avro.NewSchemaCompatibility()
+
+	first := make(chan error, 1)
+	go func() {
+		first <- compatibility.Compatible(reader, writer)
+	}()
+	<-entered
+
+	second := make(chan error, 1)
+	go func() {
+		second <- compatibility.Compatible(reader, writer)
+	}()
+
+	var secondErr error
+	early := false
+	select {
+	case secondErr = <-second:
+		early = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(release)
+
+	assert.Error(t, <-first)
+	assert.False(t, early, "concurrent call returned an in-progress recursion marker")
+	if !early {
+		secondErr = <-second
+	}
+	assert.Error(t, secondErr)
 }
 
 func TestSchemaCompatibility_Resolve(t *testing.T) {
@@ -727,7 +991,7 @@ func TestSchemaCompatibility_Resolve(t *testing.T) {
 									"name": "test.fixed",
 									"size": 6,
 									"logicalType":"decimal",
-									"precision":4,
+									"precision":5,
 									"scale":2
 								},
 								"default": "\u0000\u0000\u0000\u0000\u0087\u0078"
@@ -936,6 +1200,21 @@ func TestSchemaCompatibility_ResolveWithRefs(t *testing.T) {
 	assert.Equal(t, want, result)
 }
 
+func TestSchemaCompatibility_ResolvePreservesErrorRecord(t *testing.T) {
+	reader := avro.MustParse(`{"type":"error","name":"Failure","fields":[]}`)
+	writer := avro.MustParse(`{"type":"error","name":"Failure","fields":[]}`)
+
+	resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+	require.NoError(t, err)
+	record, ok := resolved.(*avro.RecordSchema)
+	require.True(t, ok)
+	assert.True(t, record.IsError())
+
+	data, err := json.Marshal(resolved)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"type":"error","name":"Failure","fields":[]}`, string(data))
+}
+
 func TestSchemaCompatibility_ResolveWithComplexUnion(t *testing.T) {
 	r := avro.MustParse(`[
 				{
@@ -1034,4 +1313,78 @@ func TestSchemaCompatibility_ResolveWithEnums(t *testing.T) {
 	assert.NoError(t, err)
 
 	assert.Equal(t, "D", got)
+}
+
+func TestSchemaCompatibilityResolvePreservesMetadata(t *testing.T) {
+	t.Run("record and field", func(t *testing.T) {
+		reader := avro.MustParse(`{
+			"type":"record", "name":"test", "doc":"record doc", "record-meta":"record value",
+			"fields":[{
+				"name":"value", "type":"int", "doc":"field doc", "field-meta":"field value"
+			}]
+		}`)
+		writer := avro.MustParse(`{
+			"type":"record", "name":"test",
+			"fields":[{"name":"value", "type":"int"}]
+		}`)
+
+		resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+		require.NoError(t, err)
+		record := resolved.(*avro.RecordSchema)
+
+		assert.Equal(t, "record doc", record.Doc())
+		assert.Equal(t, "record value", record.Prop("record-meta"))
+		assert.Equal(t, "field doc", record.Fields()[0].Doc())
+		assert.Equal(t, "field value", record.Fields()[0].Prop("field-meta"))
+	})
+
+	t.Run("primitive", func(t *testing.T) {
+		reader := avro.MustParse(`{"type":"long", "meta":"primitive value"}`)
+		writer := avro.MustParse(`"int"`)
+
+		resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+		require.NoError(t, err)
+		primitive := resolved.(*avro.PrimitiveSchema)
+
+		assert.Equal(t, "primitive value", primitive.Prop("meta"))
+	})
+
+	t.Run("enum", func(t *testing.T) {
+		reader := avro.MustParse(`{
+			"type":"enum", "name":"test", "symbols":["A", "B"], "default":"A",
+			"doc":"enum doc", "meta":"enum value"
+		}`)
+		writer := avro.MustParse(`{
+			"type":"enum", "name":"test", "symbols":["B", "C"]
+		}`)
+
+		resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+		require.NoError(t, err)
+		enum := resolved.(*avro.EnumSchema)
+
+		assert.Equal(t, "enum doc", enum.Doc())
+		assert.Equal(t, "enum value", enum.Prop("meta"))
+	})
+
+	t.Run("array", func(t *testing.T) {
+		reader := avro.MustParse(`{"type":"array", "items":"long", "meta":"array value"}`)
+		writer := avro.MustParse(`{"type":"array", "items":"int"}`)
+
+		resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+		require.NoError(t, err)
+		array := resolved.(*avro.ArraySchema)
+
+		assert.Equal(t, "array value", array.Prop("meta"))
+	})
+
+	t.Run("map", func(t *testing.T) {
+		reader := avro.MustParse(`{"type":"map", "values":"double", "meta":"map value"}`)
+		writer := avro.MustParse(`{"type":"map", "values":"float"}`)
+
+		resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+		require.NoError(t, err)
+		avroMap := resolved.(*avro.MapSchema)
+
+		assert.Equal(t, "map value", avroMap.Prop("meta"))
+	})
 }

@@ -74,6 +74,9 @@ type enumTextMarshalerCodec struct {
 
 func (c *enumTextMarshalerCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 	i := int(r.ReadInt())
+	if r.Error != nil {
+		return
+	}
 
 	symbol, ok := c.enum.Symbol(i)
 	if !ok {
@@ -88,7 +91,11 @@ func (c *enumTextMarshalerCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 		obj = c.typ.UnsafeIndirect(ptr)
 	}
 	if reflect2.IsNil(obj) {
-		ptrType := c.typ.(*reflect2.UnsafePtrType)
+		ptrType, ok := c.typ.(*reflect2.UnsafePtrType)
+		if !ok {
+			r.ReportError("decode enum text unmarshaler", "cannot initialize type "+c.typ.String())
+			return
+		}
 		newPtr := ptrType.Elem().UnsafeNew()
 		*((*unsafe.Pointer)(ptr)) = newPtr
 		obj = c.typ.UnsafeIndirect(ptr)

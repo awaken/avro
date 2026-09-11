@@ -8,10 +8,43 @@ import (
 
 	"github.com/awaken/avro/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type errorReader struct {
 	err error
+}
+
+func TestDecoder_Buffered(t *testing.T) {
+	for _, size := range []int{2, 1025} {
+		input := bytes.NewReader(bytes.Repeat([]byte{2}, size))
+		decoder := avro.NewDecoderForSchema(avro.MustParse(`"long"`), input)
+		require.Zero(t, decoder.Buffered())
+		for i := range size {
+			var value int64
+			require.NoError(t, decoder.DecodeDatum(&value))
+			require.Equal(t, int64(1), value)
+			require.Equal(t, size-i-1, decoder.Buffered()+input.Len())
+		}
+		require.ErrorIs(t, decoder.Decode(new(int64)), io.EOF)
+	}
+}
+
+func TestDecoder_DecodeDatum(t *testing.T) {
+	for _, schema := range []string{`"null"`, `{"type":"record","name":"Empty","fields":[]}`} {
+		decoder := avro.NewDecoderForSchema(avro.MustParse(schema), bytes.NewReader(nil))
+		for range 3 {
+			var value any
+			require.NoError(t, decoder.DecodeDatum(&value), "external framing permits zero-width records")
+			require.Zero(t, decoder.Buffered())
+		}
+		require.ErrorIs(t, decoder.Decode(new(any)), io.EOF, "stream decoding must still stop at EOF")
+	}
+
+	decoder := avro.NewDecoderForSchema(avro.MustParse(`"long"`), bytes.NewReader([]byte{0x80}))
+	err := decoder.DecodeDatum(new(int64))
+	require.Error(t, err)
+	require.Equal(t, err, decoder.DecodeDatum(new(int64)))
 }
 
 func (r errorReader) Read([]byte) (int, error) {
@@ -38,6 +71,19 @@ func TestDecoder_DecodeUnsupportedTypeError(t *testing.T) {
 	err := dec.Decode(&b)
 
 	assert.Error(t, err)
+}
+
+func TestDecoder_DecodeUnsupportedTypeIntoInterfaceError(t *testing.T) {
+	schema := avro.NewPrimitiveSchema(avro.Type("test"), nil)
+	dec := avro.NewDecoderForSchema(schema, bytes.NewReader([]byte{0x01}))
+	var got any
+	var err error
+
+	assert.NotPanics(t, func() {
+		err = dec.Decode(&got)
+	})
+	assert.Error(t, err)
+	assert.Nil(t, got)
 }
 
 func TestDecoder_DecodeEmptyReader(t *testing.T) {
@@ -132,6 +178,40 @@ func TestUnmarshal_NilPtr(t *testing.T) {
 	err := avro.Unmarshal(schema, []byte{0x01}, (*bool)(nil))
 
 	assert.Error(t, err)
+}
+
+func TestDecoder_NilSchemaReturnsError(t *testing.T) {
+	var typedNil *avro.PrimitiveSchema
+	tests := []struct {
+		name   string
+		schema avro.Schema
+	}{
+		{name: "nil interface"},
+		{name: "typed nil", schema: typedNil},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name+"/stream", func(t *testing.T) {
+			dec := avro.NewDecoderForSchema(test.schema, bytes.NewReader([]byte{0x01}))
+			var value bool
+			var err error
+
+			assert.NotPanics(t, func() {
+				err = dec.Decode(&value)
+			})
+			assert.Error(t, err)
+		})
+
+		t.Run(test.name+"/unmarshal", func(t *testing.T) {
+			var value bool
+			var err error
+
+			assert.NotPanics(t, func() {
+				err = avro.Unmarshal(test.schema, []byte{0x01}, &value)
+			})
+			assert.Error(t, err)
+		})
+	}
 }
 
 func FuzzDecoder(f *testing.F) {

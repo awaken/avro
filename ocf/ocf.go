@@ -13,9 +13,9 @@ import (
 	"io"
 	"math"
 	"os"
+	"reflect"
 
 	"github.com/awaken/avro/v2"
-	"github.com/awaken/avro/v2/internal/bytesx"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -138,10 +138,24 @@ func resolveLimit(value, defaultValue int) int {
 	return value
 }
 
+func isNilValue(v any) bool {
+	if v == nil {
+		return true
+	}
+
+	value := reflect.ValueOf(v)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
 // Decoder reads and decodes Avro values from a container file.
 type Decoder struct {
 	reader      *avro.Reader
-	resetReader *bytesx.ResetReader
+	resetReader *bytes.Reader
 	decoder     *avro.Decoder
 	meta        map[string][]byte
 	sync        [16]byte
@@ -156,6 +170,10 @@ type Decoder struct {
 
 // NewDecoder returns a new decoder that reads from reader r.
 func NewDecoder(r io.Reader, opts ...DecoderFunc) (*Decoder, error) {
+	if isNilValue(r) {
+		return nil, errors.New("reader cannot be nil")
+	}
+
 	cfg := decoderConfig{
 		DecoderConfig: avro.DefaultConfig,
 		SchemaCache:   avro.DefaultSchemaCache,
@@ -164,7 +182,12 @@ func NewDecoder(r io.Reader, opts ...DecoderFunc) (*Decoder, error) {
 		},
 	}
 	for _, opt := range opts {
-		opt(&cfg)
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	if isNilValue(cfg.DecoderConfig) {
+		return nil, errors.New("decoder config cannot be nil")
 	}
 
 	cfg.MaxBlockBytes = resolveLimit(cfg.MaxBlockBytes, defaultMaxBlockBytes)
@@ -179,7 +202,7 @@ func NewDecoder(r io.Reader, opts ...DecoderFunc) (*Decoder, error) {
 		return nil, fmt.Errorf("decoder: %w", err)
 	}
 
-	decReader := bytesx.NewResetReader([]byte{})
+	decReader := bytes.NewReader(nil)
 
 	return &Decoder{
 		reader:          reader,
@@ -207,9 +230,8 @@ func (d *Decoder) Schema() avro.Schema {
 
 // HasNext determines if there is another value to read.
 func (d *Decoder) HasNext() bool {
-	if d.count <= 0 {
-		count := d.readBlock()
-		d.count = count
+	for d.count <= 0 && d.reader.Error == nil {
+		d.count = d.readBlock()
 	}
 
 	if d.reader.Error != nil {
@@ -219,20 +241,33 @@ func (d *Decoder) HasNext() bool {
 	return d.count > 0
 }
 
-// Decode reads the next Avro encoded value from its input and stores it in the value pointed to by v.
+// Decode reads the next value into v. The final record must exhaust its block.
+// On failure, v may be partly populated; subsequent reads retain the error.
 func (d *Decoder) Decode(v any) error {
+	if d.reader.Error != nil {
+		return d.reader.Error
+	}
+
 	if d.count <= 0 {
 		return errors.New("decoder: no data found, call HasNext first")
 	}
 
 	d.count--
 
-	return d.decoder.Decode(v)
+	if err := d.decoder.DecodeDatum(v); err != nil {
+		d.reader.Error = fmt.Errorf("decoder: read record: %w", err)
+	} else if d.count == 0 && (d.decoder.Buffered() != 0 || d.resetReader.Len() != 0) {
+		// Account for both read-ahead and bytes still in the block reader.
+		d.reader.Error = errors.New("decoder: unread bytes after final block record")
+	}
+
+	return d.reader.Error
 }
 
 // Error returns the last reader error.
 func (d *Decoder) Error() error {
-	if errors.Is(d.reader.Error, io.EOF) {
+	//nolint:errorlint // Wrapped record EOF is corruption, not clean stream EOF.
+	if d.reader.Error == io.EOF {
 		return nil
 	}
 
@@ -299,14 +334,16 @@ func (d *Decoder) readBlock() int64 {
 		return 0
 	}
 
-	if count > 0 {
-		decoded, err := d.codec.Decode(data)
-		if err != nil {
-			d.reader.Error = fmt.Errorf("decoder: decompress block: %w", err)
-			return 0
-		}
-		d.resetReader.Reset(decoded)
+	decoded, err := d.codec.Decode(data)
+	if err != nil {
+		d.reader.Error = fmt.Errorf("decoder: decompress block: %w", err)
+		return 0
 	}
+	if count == 0 && len(decoded) != 0 {
+		d.reader.Error = errors.New("decoder: unread bytes in empty block")
+		return 0
+	}
+	d.resetReader.Reset(decoded)
 
 	return count
 }
@@ -403,6 +440,10 @@ func WithZStandardEncoder(enc *zstd.Encoder) EncoderFunc {
 // WithMetadata sets the metadata on the encoder header.
 func WithMetadata(meta map[string][]byte) EncoderFunc {
 	return func(cfg *encoderConfig) {
+		if meta == nil {
+			cfg.Metadata = map[string][]byte{}
+			return
+		}
 		cfg.Metadata = meta
 	}
 }
@@ -483,10 +524,27 @@ func NewEncoderWithSchema(schema avro.Schema, w io.Writer, opts ...EncoderFunc) 
 	return newEncoder(schema, w, computeEncoderConfig(opts))
 }
 
-func newEncoder(schema avro.Schema, w io.Writer, cfg encoderConfig) (*Encoder, error) {
-	switch file := w.(type) {
-	case nil:
+func newEncoder(schema avro.Schema, w io.Writer, cfg encoderConfig) (result *Encoder, err error) {
+	if isNilValue(w) {
 		return nil, errors.New("writer cannot be nil")
+	}
+	if isNilValue(cfg.EncodingConfig) {
+		return nil, errors.New("encoding config cannot be nil")
+	}
+
+	// The constructor owns its codec until a complete encoder is returned.
+	var codec Codec
+	defer func() {
+		if result == nil {
+			if closer, ok := codec.(io.Closer); ok {
+				if closeErr := closer.Close(); closeErr != nil {
+					err = errors.Join(err, fmt.Errorf("ocf: close codec: %w", closeErr))
+				}
+			}
+		}
+	}()
+
+	switch file := w.(type) {
 	case *os.File:
 		info, err := file.Stat()
 		if err != nil {
@@ -494,11 +552,15 @@ func newEncoder(schema avro.Schema, w io.Writer, cfg encoderConfig) (*Encoder, e
 		}
 
 		if info.Size() > 0 {
+			if _, err = file.Seek(0, io.SeekStart); err != nil {
+				return nil, err
+			}
 			reader := avro.NewReader(file, 1024)
 			h, err := readHeader(reader, cfg.SchemaCache, cfg.CodecOptions)
 			if err != nil {
 				return nil, err
 			}
+			codec = h.Codec
 			if err = skipToEnd(reader, h.Sync); err != nil {
 				return nil, err
 			}
@@ -522,10 +584,19 @@ func newEncoder(schema avro.Schema, w io.Writer, cfg encoderConfig) (*Encoder, e
 			return e, nil
 		}
 	}
+	if isNilValue(schema) {
+		return nil, errors.New("schema cannot be nil")
+	}
+	if cfg.SchemaMarshaler == nil {
+		return nil, errors.New("schema marshaler cannot be nil")
+	}
 
 	schemaJSON, err := cfg.SchemaMarshaler(schema)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.CodecName == "" {
+		cfg.CodecName = Null
 	}
 
 	cfg.Metadata[schemaKey] = schemaJSON
@@ -539,7 +610,7 @@ func newEncoder(schema avro.Schema, w io.Writer, cfg encoderConfig) (*Encoder, e
 		_, _ = rand.Read(header.Sync[:])
 	}
 
-	codec, err := resolveCodec(cfg.CodecName, cfg.CodecOptions)
+	codec, err = resolveCodec(cfg.CodecName, cfg.CodecOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -577,7 +648,9 @@ func computeEncoderConfig(opts []EncoderFunc) encoderConfig {
 		SchemaMarshaler: DefaultSchemaMarshaler,
 	}
 	for _, opt := range opts {
-		opt(&cfg)
+		if opt != nil {
+			opt(&cfg)
+		}
 	}
 	return cfg
 }
@@ -610,7 +683,10 @@ func (e *Encoder) Write(p []byte) (n int, err error) {
 
 // Encode writes the Avro encoding of v to the stream.
 func (e *Encoder) Encode(v any) error {
+	start := e.buf.Len()
 	if err := e.encoder.Encode(v); err != nil {
+		e.buf.Truncate(start)
+		e.encoder.Reset(e.buf)
 		return err
 	}
 
@@ -627,7 +703,7 @@ func (e *Encoder) Encode(v any) error {
 // Flush flushes the underlying writer.
 func (e *Encoder) Flush() error {
 	if e.count == 0 {
-		return nil
+		return e.writer.Error
 	}
 
 	if err := e.writerBlock(); err != nil {
@@ -653,8 +729,14 @@ func (e *Encoder) Close() error {
 // settings are preserved from the original encoder.
 // This allows reusing the encoder for multiple files without reallocating buffers.
 func (e *Encoder) Reset(w io.Writer) error {
-	if err := e.Flush(); err != nil {
-		return err
+	if isNilValue(w) {
+		return errors.New("writer cannot be nil")
+	}
+
+	if e.count > 0 {
+		if err := e.Flush(); err != nil {
+			return err
+		}
 	}
 
 	// Generate new sync marker for the new file.

@@ -3,9 +3,39 @@ package soe_test
 import (
 	"testing"
 
+	"github.com/awaken/avro/v2"
 	"github.com/awaken/avro/v2/soe"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSchemaFunctionsRejectNil(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema avro.Schema
+	}{
+		{name: "nil", schema: nil},
+		{name: "typed nil", schema: (*avro.RecordSchema)(nil)},
+	}
+	functions := []struct {
+		name string
+		call func(avro.Schema) ([]byte, error)
+	}{
+		{name: "fingerprint", call: soe.ComputeFingerprint},
+		{name: "header", call: soe.BuildHeader},
+	}
+
+	for _, test := range tests {
+		for _, function := range functions {
+			t.Run(test.name+"/"+function.name, func(t *testing.T) {
+				var err error
+				require.NotPanics(t, func() {
+					_, err = function.call(test.schema)
+				})
+				require.ErrorContains(t, err, "schema cannot be nil")
+			})
+		}
+	}
+}
 
 func TestProtocolMagicIsImmutable(t *testing.T) {
 	original := append([]byte(nil), soe.Magic...)

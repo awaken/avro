@@ -257,6 +257,113 @@ func TestDecoder_RecordMap(t *testing.T) {
 	assert.Equal(t, map[string]any{"a": int64(27), "b": "foo", "c": "foo", "d": nil}, got)
 }
 
+func TestDecoder_RecordMapStopsAfterFieldError(t *testing.T) {
+	reader := avro.MustParse(`{
+		"type":"record","name":"test","fields":[
+			{"name":"value","type":"string"},
+			{"name":"fallback","type":"int","default":1}
+		]
+	}`)
+	writer := avro.MustParse(`{
+		"type":"record","name":"test","fields":[
+			{"name":"value","type":"string"}
+		]
+	}`)
+	resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+	require.NoError(t, err)
+
+	calls := 0
+	api := avro.Config{}.Freeze()
+	api.RegisterTypeConverters(avro.TypeConversionFuncs{
+		AvroType: avro.Int,
+		DecoderTypeConversion: func(in any, _ avro.Schema) (any, error) {
+			calls++
+			return in, nil
+		},
+	})
+	dec := api.NewDecoder(resolved, bytes.NewReader([]byte{0x02}))
+	var got map[string]any
+
+	err = dec.Decode(&got)
+
+	require.Error(t, err)
+	assert.Zero(t, calls)
+	assert.NotContains(t, got, "fallback")
+}
+
+func TestDecoder_RecordStructStopsAfterSkippedFieldError(t *testing.T) {
+	reader := avro.MustParse(`{
+		"type":"record","name":"test","fields":[
+			{"name":"value","type":"string"},
+			{"name":"fallback","type":"int","default":1}
+		]
+	}`)
+	writer := avro.MustParse(`{
+		"type":"record","name":"test","fields":[
+			{"name":"value","type":"string"}
+		]
+	}`)
+	resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+	require.NoError(t, err)
+
+	calls := 0
+	api := avro.Config{}.Freeze()
+	api.RegisterTypeConverters(avro.TypeConversionFuncs{
+		AvroType: avro.Int,
+		DecoderTypeConversion: func(in any, _ avro.Schema) (any, error) {
+			calls++
+			return in, nil
+		},
+	})
+	dec := api.NewDecoder(resolved, bytes.NewReader([]byte{0x02}))
+	var got struct {
+		Fallback any `avro:"fallback"`
+	}
+
+	err = dec.Decode(&got)
+
+	require.Error(t, err)
+	assert.Zero(t, calls)
+	assert.Nil(t, got.Fallback)
+}
+
+func TestDecoder_RecordStructStopsAfterFieldEOF(t *testing.T) {
+	reader := avro.MustParse(`{
+		"type":"record","name":"test","fields":[
+			{"name":"value","type":"string"},
+			{"name":"fallback","type":"int","default":1}
+		]
+	}`)
+	writer := avro.MustParse(`{
+		"type":"record","name":"test","fields":[
+			{"name":"value","type":"string"}
+		]
+	}`)
+	resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+	require.NoError(t, err)
+
+	calls := 0
+	api := avro.Config{}.Freeze()
+	api.RegisterTypeConverters(avro.TypeConversionFuncs{
+		AvroType: avro.Int,
+		DecoderTypeConversion: func(in any, _ avro.Schema) (any, error) {
+			calls++
+			return in, nil
+		},
+	})
+	dec := api.NewDecoder(resolved, bytes.NewReader([]byte{0x80}))
+	var got struct {
+		Value    string `avro:"value"`
+		Fallback any    `avro:"fallback"`
+	}
+
+	err = dec.Decode(&got)
+
+	require.Error(t, err)
+	assert.Zero(t, calls)
+	assert.Nil(t, got.Fallback)
+}
+
 func TestDecoder_RecordMapInvalidKey(t *testing.T) {
 	defer ConfigTeardown()
 

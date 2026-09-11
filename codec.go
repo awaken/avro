@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 	"reflect"
@@ -39,8 +40,12 @@ func (r *Reader) ReadVal(schema Schema, obj any) {
 		r.ReportError("ReadVal", "can not read into nil pointer")
 		return
 	}
+	if isNilSchema(schema) {
+		r.ReportError("ReadVal", "schema cannot be nil")
+		return
+	}
 
-	decoder := r.cfg.getDecoderFromCache(schema.CacheFingerprint(), reflect2.RTypeOf(obj))
+	decoder := r.cfg.getDecoderFromCache(schema, reflect2.RTypeOf(obj))
 	if decoder == nil {
 		typ := reflect2.TypeOf(obj)
 		if typ.Kind() != reflect.Ptr {
@@ -61,7 +66,14 @@ func (r *Reader) ReadVal(schema Schema, obj any) {
 
 // WriteVal writes the Avro encoding of obj.
 func (w *Writer) WriteVal(schema Schema, val any) {
-	encoder := w.cfg.getEncoderFromCache(schema.CacheFingerprint(), reflect2.RTypeOf(val))
+	if isNilSchema(schema) {
+		if w.Error == nil {
+			w.Error = errors.New("avro: WriteVal: schema cannot be nil")
+		}
+		return
+	}
+
+	encoder := w.cfg.getEncoderFromCache(schema, reflect2.RTypeOf(val))
 	if encoder == nil {
 		typ := reflect2.TypeOf(val)
 		encoder = w.cfg.EncoderOf(schema, typ)
@@ -69,16 +81,40 @@ func (w *Writer) WriteVal(schema Schema, val any) {
 	encoder.Encode(reflect2.PtrOf(val), w)
 }
 
+func isNilType(typ reflect2.Type) bool {
+	if typ == nil {
+		return true
+	}
+
+	value := reflect.ValueOf(typ)
+	return value.Kind() == reflect.Ptr && value.IsNil()
+}
+
+func supportsUnsafeType(typ reflect2.Type) bool {
+	unsafeType := reflect2.Type2(typ.Type1())
+	return reflect.TypeOf(typ) == reflect.TypeOf(unsafeType)
+}
+
 func (c *frozenConfig) DecoderOf(schema Schema, typ reflect2.Type) ValDecoder {
+	if isNilSchema(schema) {
+		return &errorDecoder{err: errors.New("avro: DecoderOf: schema cannot be nil")}
+	}
+	if isNilType(typ) || typ.Kind() != reflect.Ptr {
+		return &errorDecoder{err: errors.New("avro: DecoderOf: decoder type must be a pointer")}
+	}
+	if !supportsUnsafeType(typ) {
+		return &errorDecoder{err: errors.New("avro: DecoderOf: decoder type must support unsafe pointer operations")}
+	}
+	ptrType := typ.(*reflect2.UnsafePtrType)
+
 	rtype := typ.RType()
-	decoder := c.getDecoderFromCache(schema.CacheFingerprint(), rtype)
+	decoder := c.getDecoderFromCache(schema, rtype)
 	if decoder != nil {
 		return decoder
 	}
 
-	ptrType := typ.(*reflect2.UnsafePtrType)
 	decoder = decoderOfType(newDecoderContext(c), schema, ptrType.Elem())
-	c.addDecoderToCache(schema.CacheFingerprint(), rtype, decoder)
+	c.addDecoderToCache(schema, rtype, decoder)
 	return decoder
 }
 
@@ -161,7 +197,7 @@ func decoderOfType(d *decoderContext, schema Schema, typ reflect2.Type) ValDecod
 	case Union:
 		return createDecoderOfUnion(d, schema.(*UnionSchema), typ)
 	case Fixed:
-		return createDecoderOfFixed(schema.(*FixedSchema), typ)
+		return createDecoderOfFixed(d.cfg, schema.(*FixedSchema), typ)
 	default:
 		// It is impossible to get here with a valid schema
 		return &errorDecoder{err: fmt.Errorf("avro: schema type %s is unsupported", schema.Type())}
@@ -169,12 +205,18 @@ func decoderOfType(d *decoderContext, schema Schema, typ reflect2.Type) ValDecod
 }
 
 func (c *frozenConfig) EncoderOf(schema Schema, typ reflect2.Type) ValEncoder {
-	if typ == nil {
+	if isNilSchema(schema) {
+		return &errorEncoder{err: errors.New("avro: EncoderOf: schema cannot be nil")}
+	}
+	if isNilType(typ) {
 		typ = reflect2.TypeOf((*null)(nil))
+	}
+	if !supportsUnsafeType(typ) {
+		return &errorEncoder{err: errors.New("avro: EncoderOf: encoder type must support unsafe operations")}
 	}
 
 	rtype := typ.RType()
-	encoder := c.getEncoderFromCache(schema.CacheFingerprint(), rtype)
+	encoder := c.getEncoderFromCache(schema, rtype)
 	if encoder != nil {
 		return encoder
 	}
@@ -183,7 +225,7 @@ func (c *frozenConfig) EncoderOf(schema Schema, typ reflect2.Type) ValEncoder {
 	if typ.LikePtr() {
 		encoder = &onePtrEncoder{encoder}
 	}
-	c.addEncoderToCache(schema.CacheFingerprint(), rtype, encoder)
+	c.addEncoderToCache(schema, rtype, encoder)
 	return encoder
 }
 
@@ -231,7 +273,7 @@ func encoderOfType(e *encoderContext, schema Schema, typ reflect2.Type) ValEncod
 	case Union:
 		return createEncoderOfUnion(e, schema.(*UnionSchema), typ)
 	case Fixed:
-		return createEncoderOfFixed(schema.(*FixedSchema), typ)
+		return createEncoderOfFixed(e.cfg, schema.(*FixedSchema), typ)
 	default:
 		// It is impossible to get here with a valid schema
 		return &errorEncoder{err: fmt.Errorf("avro: schema type %s is unsupported", schema.Type())}

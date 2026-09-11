@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"encoding/binary"
 	"fmt"
 	"reflect"
 	"time"
@@ -8,6 +9,11 @@ import (
 
 // ReadNext reads the next Avro element as a generic interface.
 func (r *Reader) ReadNext(schema Schema) any {
+	if isNilSchema(schema) {
+		r.ReportError("ReadNext", "schema cannot be nil")
+		return nil
+	}
+
 	var ls LogicalSchema
 	lts, ok := schema.(LogicalTypeSchema)
 	if ok {
@@ -15,6 +21,8 @@ func (r *Reader) ReadNext(schema Schema) any {
 	}
 
 	switch schema.Type() {
+	case Null:
+		return nil
 	case Boolean:
 		return r.ReadBool()
 	case Int:
@@ -26,59 +34,106 @@ func (r *Reader) ReadNext(schema Schema) any {
 				return time.Unix(sec, 0).UTC()
 
 			case TimeMillis:
-				return time.Duration(r.ReadInt()) * time.Millisecond
+				value := r.ReadInt()
+				if !readTimeUnits(r, int64(value), time.Millisecond) {
+					return nil
+				}
+				return time.Duration(value) * time.Millisecond
 			}
 		}
 		return int(r.ReadInt())
 	case Long:
+		readLong := r.ReadLong
+		if encodedType := schema.(*PrimitiveSchema).encodedType; encodedType != "" {
+			if convert := createLongConverter(encodedType); convert != nil {
+				readLong = func() int64 { return convert(r) }
+			}
+		}
 		if ls != nil {
 			switch ls.Type() {
 			case TimeMicros:
-				return time.Duration(r.ReadLong()) * time.Microsecond
+				value := readLong()
+				if !readTimeUnits(r, value, time.Microsecond) {
+					return nil
+				}
+				return time.Duration(value) * time.Microsecond
 
-			case TimestampMillis:
-				i := r.ReadLong()
-				sec := i / 1e3
-				nsec := (i - sec*1e3) * 1e6
-				return time.Unix(sec, nsec).UTC()
+			case TimestampMillis, LocalTimestampMillis:
+				i := readLong()
+				if r.Error != nil {
+					return nil
+				}
+				return timestampFromUnits(i, time.Millisecond)
 
-			case TimestampMicros:
-				i := r.ReadLong()
-				sec := i / 1e6
-				nsec := (i - sec*1e6) * 1e3
-				return time.Unix(sec, nsec).UTC()
+			case TimestampMicros, LocalTimestampMicros:
+				i := readLong()
+				if r.Error != nil {
+					return nil
+				}
+				return timestampFromUnits(i, time.Microsecond)
 			}
 		}
-		return r.ReadLong()
+		return readLong()
 	case Float:
+		if encodedType := schema.(*PrimitiveSchema).encodedType; encodedType != "" {
+			if convert := createFloatConverter(encodedType); convert != nil {
+				return convert(r)
+			}
+		}
 		return r.ReadFloat()
 	case Double:
+		if encodedType := schema.(*PrimitiveSchema).encodedType; encodedType != "" {
+			if convert := createDoubleConverter(encodedType); convert != nil {
+				return convert(r)
+			}
+		}
 		return r.ReadDouble()
 	case String:
 		return r.ReadString()
 	case Bytes:
-		if ls != nil && ls.Type() == Decimal {
-			dec := ls.(*DecimalLogicalSchema)
-			return ratFromBytes(r.ReadBytes(), dec.Scale())
+		if dec, ok := validDecimalLogicalSchema(schema); ok {
+			value := r.readDecimal(r.ReadBytes(), dec.Precision(), dec.Scale())
+			if r.Error != nil {
+				return nil
+			}
+			return value
 		}
 		return r.ReadBytes()
 	case Record:
 		fields := schema.(*RecordSchema).Fields()
 		obj := make(map[string]any, len(fields))
 		for _, field := range fields {
+			switch field.action {
+			case FieldIgnore:
+				createSkipDecoder(field.Type()).Decode(nil, r)
+				if r.Error != nil {
+					return obj
+				}
+				continue
+			case FieldSetDefault:
+				obj[field.Name()] = r.readDefault(field)
+				if r.Error != nil {
+					return obj
+				}
+				continue
+			}
+
 			obj[field.Name()] = r.ReadNext(field.Type())
+			if r.Error != nil {
+				return obj
+			}
 		}
 		return obj
 	case Ref:
 		return r.ReadNext(schema.(*RefSchema).Schema())
 	case Enum:
-		symbols := schema.(*EnumSchema).Symbols()
 		idx := int(r.ReadInt())
-		if idx < 0 || idx >= len(symbols) {
+		symbol, ok := schema.(*EnumSchema).Symbol(idx)
+		if !ok {
 			r.ReportError("Read", "unknown enum symbol")
 			return nil
 		}
-		return symbols[idx]
+		return symbol
 	case Array:
 		arr := []any{}
 		r.ReadArrayCB(func(r *Reader) bool {
@@ -114,17 +169,54 @@ func (r *Reader) ReadNext(schema Schema) any {
 		return obj
 	case Fixed:
 		size := schema.(*FixedSchema).Size()
+		if err := r.cfg.checkFixedSize(size); err != nil {
+			r.ReportError("Read", err.Error())
+			return nil
+		}
 		obj := make([]byte, size)
 		r.Read(obj)
-		if ls != nil && ls.Type() == Decimal {
-			dec := ls.(*DecimalLogicalSchema)
-			return ratFromBytes(obj, dec.Scale())
+		if ls != nil {
+			switch ls.Type() {
+			case Decimal:
+				if dec, ok := validDecimalLogicalSchema(schema); ok {
+					value := r.readDecimal(obj, dec.Precision(), dec.Scale())
+					if r.Error != nil {
+						return nil
+					}
+					return value
+				}
+			case Duration:
+				if size == 12 {
+					return LogicalDuration{
+						Months:       binary.LittleEndian.Uint32(obj[0:4]),
+						Days:         binary.LittleEndian.Uint32(obj[4:8]),
+						Milliseconds: binary.LittleEndian.Uint32(obj[8:12]),
+					}
+				}
+			}
 		}
 		return byteSliceToArray(obj, size)
 	default:
 		r.ReportError("Read", fmt.Sprintf("unexpected schema type: %v", schema.Type()))
 		return nil
 	}
+}
+
+func (r *Reader) readDefault(field *Field) any {
+	b, err := encodeDefault(field)
+	if err != nil {
+		r.Error = fmt.Errorf("decode default: %w", err)
+		return nil
+	}
+
+	rr := r.cfg.borrowReader(b)
+	defer r.cfg.returnReader(rr)
+
+	obj := rr.ReadNext(field.Type())
+	if rr.Error != nil {
+		r.Error = fmt.Errorf("decode default: %w", rr.Error)
+	}
+	return obj
 }
 
 // ReadArrayCB reads an array with a callback per item.

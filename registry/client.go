@@ -8,8 +8,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -24,6 +27,12 @@ import (
 )
 
 const contentType = "application/vnd.schemaregistry.v1+json"
+
+// DefaultResponseLimit bounds response bodies, including trailing whitespace, to 4 MiB.
+const DefaultResponseLimit int64 = 4 << 20
+
+// ErrResponseLimit reports a response larger than the configured byte limit.
+var ErrResponseLimit = errors.New("registry response exceeds byte limit")
 
 // Registry represents a schema registry.
 type Registry interface {
@@ -81,7 +90,16 @@ type SchemaReference struct {
 }
 
 type idPayload struct {
-	ID int `json:"id"`
+	ID *int `json:"id"`
+}
+
+func required[T any](value *T, name string) (T, error) {
+	if value != nil {
+		return *value, nil
+	}
+
+	var zero T
+	return zero, fmt.Errorf("registry response missing %s", name)
 }
 
 type credentials struct {
@@ -91,8 +109,8 @@ type credentials struct {
 
 type schemaInfoPayload struct {
 	Schema   string         `json:"schema"`
-	ID       int            `json:"id"`
-	Version  int            `json:"version"`
+	ID       *int           `json:"id"`
+	Version  *int           `json:"version"`
 	Metadata schemaMetadata `json:"metadata"`
 }
 
@@ -103,9 +121,18 @@ type schemaMetadata struct {
 // Parse converts the string schema registry response into a
 // SchemaInfo object with an avro.Schema schema.
 func (s *schemaInfoPayload) Parse() (info SchemaInfo, err error) {
+	id, err := required(s.ID, "schema id")
+	if err != nil {
+		return SchemaInfo{}, err
+	}
+	version, err := required(s.Version, "schema version")
+	if err != nil {
+		return SchemaInfo{}, err
+	}
+
 	info = SchemaInfo{
-		ID:      s.ID,
-		Version: s.Version,
+		ID:      id,
+		Version: version,
 		Metadata: SchemaMetadata{
 			Properties: s.Metadata.Properties,
 		},
@@ -157,6 +184,14 @@ func WithHTTPClient(client *http.Client) ClientFunc {
 	}
 }
 
+// WithResponseLimit sets the maximum response-body bytes, after transport decoding.
+// limit must be positive and less than math.MaxInt64. Overflow consumes at most
+// one extra byte, then closes the body without draining it. Configure a request
+// deadline or HTTP client timeout to bound elapsed reading time.
+func WithResponseLimit(limit int64) ClientFunc {
+	return func(c *Client) { c.responseLimit = limit }
+}
+
 // WithBasicAuth sets the credentials to perform http basic auth.
 func WithBasicAuth(username, password string) ClientFunc {
 	return func(c *Client) {
@@ -166,8 +201,9 @@ func WithBasicAuth(username, password string) ClientFunc {
 
 // Client is an HTTP registry client.
 type Client struct {
-	client *http.Client
-	base   *url.URL
+	client        *http.Client
+	base          *url.URL
+	responseLimit int64
 
 	creds credentials
 
@@ -180,17 +216,26 @@ func NewClient(baseURL string, opts ...ClientFunc) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !strings.HasSuffix(u.Path, "/") {
+	if !strings.HasSuffix(u.EscapedPath(), "/") {
 		u.Path += "/"
+		if u.RawPath != "" {
+			u.RawPath += "/"
+		}
 	}
 
 	c := &Client{
-		client: defaultClient,
-		base:   u,
+		client:        defaultClient,
+		base:          u,
+		responseLimit: DefaultResponseLimit,
 	}
 
 	for _, opt := range opts {
-		opt(c)
+		if opt != nil {
+			opt(c)
+		}
+	}
+	if err := c.validate(); err != nil {
+		return nil, err
 	}
 
 	return c, nil
@@ -319,9 +364,13 @@ func (c *Client) CreateSchema(
 	if err := c.request(ctx, http.MethodPost, p, req, &resp); err != nil {
 		return 0, nil, err
 	}
+	id, err := required(resp.ID, "schema id")
+	if err != nil {
+		return 0, nil, err
+	}
 
-	sch, err := c.parseRegisteredSchema(ctx, resp.ID, schema, references)
-	return resp.ID, sch, err
+	sch, err := c.parseRegisteredSchema(ctx, id, schema, references)
+	return id, sch, err
 }
 
 // IsRegistered determines if the schema is registered.
@@ -340,9 +389,13 @@ func (c *Client) IsRegisteredWithRefs(
 	if err := c.request(ctx, http.MethodPost, path.Join("subjects", escapeSubject(subject)), req, &resp); err != nil {
 		return 0, nil, err
 	}
+	id, err := required(resp.ID, "schema id")
+	if err != nil {
+		return 0, nil, err
+	}
 
-	sch, err := c.parseRegisteredSchema(ctx, resp.ID, schema, references)
-	return resp.ID, sch, err
+	sch, err := c.parseRegisteredSchema(ctx, id, schema, references)
+	return id, sch, err
 }
 
 func (c *Client) parseRegisteredSchema(
@@ -363,7 +416,7 @@ func (c *Client) parseRegisteredSchema(
 }
 
 type isCompatibleResponse struct {
-	IsCompatible bool `json:"is_compatible"`
+	IsCompatible *bool `json:"is_compatible"`
 }
 
 // IsCompatible determines if the schema is compatible with all schemas in the subject.
@@ -385,7 +438,7 @@ func (c *Client) IsCompatibleWithRefs(
 	if err := c.request(ctx, http.MethodPost, reqPath, req, &resp); err != nil {
 		return false, err
 	}
-	return resp.IsCompatible, nil
+	return required(resp.IsCompatible, "compatibility result")
 }
 
 // Compatibility levels.
@@ -409,8 +462,8 @@ func validateCompatibilityLevel(lvl string) error {
 }
 
 type compatPayload struct {
-	Compatibility      string `json:"compatibility"`
-	CompatibilityLevel string `json:"compatibilityLevel,omitempty"`
+	Compatibility      string  `json:"compatibility"`
+	CompatibilityLevel *string `json:"compatibilityLevel,omitempty"`
 }
 
 // SetGlobalCompatibilityLevel sets the global compatibility level of the registry.
@@ -439,7 +492,7 @@ func (c *Client) GetGlobalCompatibilityLevel(ctx context.Context) (string, error
 	if err := c.request(ctx, http.MethodGet, "config", nil, &resp); err != nil {
 		return "", err
 	}
-	return resp.CompatibilityLevel, nil
+	return required(resp.CompatibilityLevel, "compatibility level")
 }
 
 // GetCompatibilityLevel gets the compatibility level of a subject.
@@ -448,10 +501,14 @@ func (c *Client) GetCompatibilityLevel(ctx context.Context, subject string) (str
 	if err := c.request(ctx, http.MethodGet, path.Join("config", escapeSubject(subject)), nil, &resp); err != nil {
 		return "", err
 	}
-	return resp.CompatibilityLevel, nil
+	return required(resp.CompatibilityLevel, "compatibility level")
 }
 
 func (c *Client) request(ctx context.Context, method, path string, in, out any) error {
+	if err := c.validate(); err != nil {
+		return err
+	}
+
 	var body io.Reader
 	if in != nil {
 		b, _ := jsoniter.Marshal(in)
@@ -471,19 +528,41 @@ func (c *Client) request(ctx context.Context, method, path string, in, out any) 
 	if err != nil {
 		return fmt.Errorf("could not perform request: %w", err)
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-	}()
-
-	if resp.StatusCode >= http.StatusBadRequest {
-		err := Error{StatusCode: resp.StatusCode}
-		_ = jsoniter.NewDecoder(resp.Body).Decode(&err)
-		return err
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, c.responseLimit+1))
+	if int64(len(data)) > c.responseLimit {
+		return ErrResponseLimit
+	}
+	if err != nil {
+		return fmt.Errorf("could not read registry response: %w", err)
 	}
 
-	if out != nil {
-		return jsoniter.NewDecoder(resp.Body).Decode(out)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		statusErr := Error{StatusCode: resp.StatusCode}
+		if len(bytes.TrimSpace(data)) > 0 {
+			if err := json.Unmarshal(data, &statusErr); err != nil {
+				return fmt.Errorf("%w: invalid registry error response: %v", statusErr, err)
+			}
+		}
+		return statusErr
+	}
+
+	if out == nil {
+		if len(bytes.TrimSpace(data)) == 0 {
+			return nil
+		}
+		var ignored json.RawMessage
+		out = &ignored
+	}
+	return json.Unmarshal(data, out)
+}
+
+func (c *Client) validate() error {
+	if c.client == nil {
+		return fmt.Errorf("http client cannot be nil")
+	}
+	if c.responseLimit <= 0 || c.responseLimit == math.MaxInt64 {
+		return fmt.Errorf("response byte limit must be positive and less than math.MaxInt64")
 	}
 	return nil
 }

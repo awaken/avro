@@ -28,11 +28,12 @@ func (r *Reader) SkipNBytes(n int) {
 	for read < n {
 		if r.head == r.tail {
 			if !r.loadMore() {
+				r.reportUnexpectedEOF()
 				return
 			}
 		}
 
-		if read+r.tail-r.head < n {
+		if r.tail-r.head < n-read {
 			read += r.tail - r.head
 			r.head = r.tail
 			continue
@@ -45,30 +46,29 @@ func (r *Reader) SkipNBytes(n int) {
 
 // SkipBool skips a Bool in the reader.
 func (r *Reader) SkipBool() {
-	_ = r.readByte()
+	_ = r.ReadBool()
 }
 
 // SkipInt skips an Int in the reader.
 func (r *Reader) SkipInt() {
-	var n int
-	for r.Error == nil && n < maxIntBufSize {
-		b := r.readByte()
-		if b&0x80 == 0 {
-			break
-		}
-		n++
-	}
+	r.skipVarint(maxIntBufSize, 0x0f, "SkipInt")
 }
 
 // SkipLong skips a Long in the reader.
 func (r *Reader) SkipLong() {
-	var n int
-	for r.Error == nil && n < maxLongBufSize {
+	r.skipVarint(maxLongBufSize, 0x01, "SkipLong")
+}
+
+func (r *Reader) skipVarint(maxSize int, maxLastByte byte, op string) {
+	for i := 0; r.Error == nil && i < maxSize; i++ {
 		b := r.readByte()
-		if b&0x80 == 0 {
-			break
+		if i == maxSize-1 && b > maxLastByte {
+			r.ReportError(op, "int overflow")
+			return
 		}
-		n++
+		if b&0x80 == 0 {
+			return
+		}
 	}
 }
 

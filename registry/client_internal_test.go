@@ -1,10 +1,12 @@
 package registry
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewClient_WithHTTPClient(t *testing.T) {
@@ -13,6 +15,18 @@ func TestNewClient_WithHTTPClient(t *testing.T) {
 	client, _ := NewClient("http://example.com", WithHTTPClient(httpClient))
 
 	assert.Equal(t, client.client, httpClient)
+}
+
+func TestClient_NilHTTPClientAfterConstruction(t *testing.T) {
+	client, err := NewClient("http://example.com")
+	require.NoError(t, err)
+	WithHTTPClient(nil)(client)
+
+	var requestErr error
+	require.NotPanics(t, func() {
+		_, requestErr = client.GetSubjects(context.Background())
+	})
+	require.ErrorContains(t, requestErr, "http client cannot be nil")
 }
 
 func TestNewClient_WithBasicAuth(t *testing.T) {

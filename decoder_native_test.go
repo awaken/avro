@@ -12,6 +12,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type customDecimalLogicalSchema struct{}
+
+func (customDecimalLogicalSchema) Type() avro.LogicalType {
+	return avro.Decimal
+}
+
+func (customDecimalLogicalSchema) String() string {
+	return `"logicalType":"decimal"`
+}
+
 func TestDecoder_NativeInvalidType(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -609,7 +619,7 @@ func TestDecoder_Time_LocalTimestampMillis(t *testing.T) {
 	err = dec.Decode(&got)
 
 	require.NoError(t, err)
-	assert.Equal(t, time.Date(2020, 1, 2, 3, 4, 5, 0, time.Local), got)
+	assert.Equal(t, time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC), got)
 }
 
 func TestDecoder_Time_LocalTimestampMillisZero(t *testing.T) {
@@ -624,7 +634,7 @@ func TestDecoder_Time_LocalTimestampMillisZero(t *testing.T) {
 	err = dec.Decode(&got)
 
 	require.NoError(t, err)
-	assert.Equal(t, time.Date(1, 1, 1, 0, 0, 0, 0, time.Local), got)
+	assert.Equal(t, time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC), got)
 }
 
 func TestDecoder_Time_LocalTimestampMillisOneMillis(t *testing.T) {
@@ -639,7 +649,7 @@ func TestDecoder_Time_LocalTimestampMillisOneMillis(t *testing.T) {
 	err = dec.Decode(&got)
 
 	require.NoError(t, err)
-	assert.Equal(t, time.Date(1970, 1, 1, 0, 0, 0, 1e6, time.Local), got)
+	assert.Equal(t, time.Date(1970, 1, 1, 0, 0, 0, 1e6, time.UTC), got)
 }
 
 func TestDecoder_Time_LocalTimestampMicros(t *testing.T) {
@@ -654,7 +664,7 @@ func TestDecoder_Time_LocalTimestampMicros(t *testing.T) {
 	err = dec.Decode(&got)
 
 	require.NoError(t, err)
-	assert.Equal(t, time.Date(2020, 1, 2, 3, 4, 5, 0, time.Local), got)
+	assert.Equal(t, time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC), got)
 }
 
 func TestDecoder_Time_LocalTimestampMicrosZero(t *testing.T) {
@@ -669,7 +679,7 @@ func TestDecoder_Time_LocalTimestampMicrosZero(t *testing.T) {
 	err = dec.Decode(&got)
 
 	require.NoError(t, err)
-	assert.Equal(t, time.Date(1, 1, 1, 0, 0, 0, 0, time.Local), got)
+	assert.Equal(t, time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC), got)
 }
 
 func TestDecoder_Time_LocalTimestampMillisOneMicros(t *testing.T) {
@@ -684,7 +694,7 @@ func TestDecoder_Time_LocalTimestampMillisOneMicros(t *testing.T) {
 	err = dec.Decode(&got)
 
 	require.NoError(t, err)
-	assert.Equal(t, time.Date(1970, 1, 1, 0, 0, 0, 1e3, time.Local), got)
+	assert.Equal(t, time.Date(1970, 1, 1, 0, 0, 0, 1e3, time.UTC), got)
 }
 
 func TestDecoder_TimeInvalidSchema(t *testing.T) {
@@ -704,7 +714,7 @@ func TestDecoder_TimeInvalidSchema(t *testing.T) {
 func TestDecoder_Duration_TimeMillis(t *testing.T) {
 	defer ConfigTeardown()
 
-	data := []byte{0xAA, 0xB4, 0xDE, 0x75}
+	data := []byte{0x9C, 0x85, 0xE3, 0x0B}
 	schema := `{"type":"int","logicalType":"time-millis"}`
 	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
 	require.NoError(t, err)
@@ -713,13 +723,13 @@ func TestDecoder_Duration_TimeMillis(t *testing.T) {
 	err = dec.Decode(&got)
 
 	require.NoError(t, err)
-	assert.Equal(t, 123456789*time.Millisecond, got)
+	assert.Equal(t, 12345678*time.Millisecond, got)
 }
 
 func TestDecoder_Duration_TimeMicros(t *testing.T) {
 	defer ConfigTeardown()
 
-	data := []byte{0x86, 0xEA, 0xC8, 0xE9, 0x97, 0x07}
+	data := []byte{0xD6, 0xE4, 0xE0, 0xFD, 0x5B}
 	schema := `{"type":"long","logicalType":"time-micros"}`
 	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
 	require.NoError(t, err)
@@ -728,13 +738,13 @@ func TestDecoder_Duration_TimeMicros(t *testing.T) {
 	err = dec.Decode(&got)
 
 	require.NoError(t, err)
-	assert.Equal(t, 123456789123*time.Microsecond, got)
+	assert.Equal(t, 12345678123*time.Microsecond, got)
 }
 
 func TestDecoder_Duration_InvalidLogicalType(t *testing.T) {
 	defer ConfigTeardown()
 
-	data := []byte{0x86, 0xEA, 0xC8, 0xE9, 0x97, 0x07}
+	data := []byte{0xD6, 0xE4, 0xE0, 0xFD, 0x5B}
 	schema := `{"type":"long","logicalType":"timestamp-micros"}`
 	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
 	require.NoError(t, err)
@@ -748,7 +758,7 @@ func TestDecoder_Duration_InvalidLogicalType(t *testing.T) {
 func TestDecoder_DurationInvalidSchema(t *testing.T) {
 	defer ConfigTeardown()
 
-	data := []byte{0x86, 0xEA, 0xC8, 0xE9, 0x97, 0x07}
+	data := []byte{0xD6, 0xE4, 0xE0, 0xFD, 0x5B}
 	schema := `{"type":"string"}`
 	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
 	require.NoError(t, err)
@@ -763,7 +773,7 @@ func TestDecoder_BytesRat_Positive(t *testing.T) {
 	defer ConfigTeardown()
 
 	data := []byte{0x6, 0x00, 0x87, 0x78}
-	schema := `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`
+	schema := `{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`
 	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
 	require.NoError(t, err)
 
@@ -778,7 +788,7 @@ func TestDecoder_BytesRat_Negative(t *testing.T) {
 	defer ConfigTeardown()
 
 	data := []byte{0x6, 0xFF, 0x78, 0x88}
-	schema := `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`
+	schema := `{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`
 	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
 	require.NoError(t, err)
 
@@ -793,7 +803,7 @@ func TestDecoder_BytesRat_Zero(t *testing.T) {
 	defer ConfigTeardown()
 
 	data := []byte{0x02, 0x00}
-	schema := `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`
+	schema := `{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`
 	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
 	require.NoError(t, err)
 
@@ -802,6 +812,21 @@ func TestDecoder_BytesRat_Zero(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, big.NewRat(0, 1), got)
+}
+
+func TestDecoder_BytesRatNonPtr(t *testing.T) {
+	defer ConfigTeardown()
+
+	data := []byte{0x6, 0x00, 0x87, 0x78}
+	schema := `{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`
+	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
+	require.NoError(t, err)
+
+	var got big.Rat
+	err = dec.Decode(&got)
+
+	require.NoError(t, err)
+	assert.Equal(t, *big.NewRat(1734, 5), got)
 }
 
 func TestDecoder_BytesRatInvalidSchema(t *testing.T) {
@@ -830,4 +855,33 @@ func TestDecoder_BytesRatInvalidLogicalSchema(t *testing.T) {
 	err = dec.Decode(&got)
 
 	assert.Error(t, err)
+}
+
+func TestDecoderBytesProgrammaticInvalidDecimal(t *testing.T) {
+	tests := []struct {
+		name    string
+		logical avro.LogicalSchema
+	}{
+		{name: "invalid parameters", logical: avro.NewDecimalLogicalSchema(0, 0)},
+		{name: "custom implementation", logical: customDecimalLogicalSchema{}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			schema := avro.NewPrimitiveSchema(avro.Bytes, test.logical)
+
+			var generic any
+			assert.NotPanics(t, func() {
+				err := avro.NewDecoderForSchema(schema, bytes.NewReader([]byte{0x02, 0x2a})).Decode(&generic)
+				require.NoError(t, err)
+			})
+			assert.Equal(t, []byte{0x2a}, generic)
+
+			var typed *big.Rat
+			assert.NotPanics(t, func() {
+				err := avro.NewDecoderForSchema(schema, bytes.NewReader([]byte{0x02, 0x2a})).Decode(&typed)
+				require.Error(t, err)
+			})
+		})
+	}
 }

@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+## v2.31.5 - 2026-09-11
+
+### Dependencies
+
+- Refresh all imported package and test dependencies, including
+  `klauspost/compress` v1.20.0, `x/tools` v0.50.0, `x/mod` v0.41.0,
+  `x/sync` v0.23.0, and `testify` v1.12.1.
+- Raise the minimum Go version to 1.26; test Go 1.26 and 1.27 in CI.
+
+### Fixed
+
+- Harden codec construction, union resolution, custom converters, defaults,
+  recursive schemas, and compatibility caches against invalid or stale state.
+- Reject integer overflow and invalid time-of-day values; correct calendar
+  dates, local timestamps, and exact decimal precision and scaling.
+- Enforce fixed-value and decimal resource limits before allocation.
+- Validate record aliases, logical schemas, defaults, and protocol messages;
+  produce deterministic protocol JSON and hashes.
+- Require complete SOE payload and OCF block consumption; handle zero-width
+  records, codec limits, and encoder/decoder lifecycle errors consistently.
+- Bound registry response bodies and require complete, valid JSON responses.
+- Correct generated types, imports, reset state, and schema validation.
+- Expand regression tests across codecs, schemas, generation, OCF, SOE,
+  registry clients, and command-line tools.
+
+### Compatibility
+
+- Previously accepted out-of-range integers, time values, inexact decimals,
+  ambiguous aliases, malformed protocols, and trailing framed data now fail.
+- Dates use calendar fields; local timestamps decode into a UTC civil-time
+  carrier. Corrected protocol serialization changes some protocol hashes.
+- Custom SOE APIs must implement or forward `ExactUnmarshaler`.
+- Registry responses default to 4 MiB; use `WithResponseLimit` for larger
+  schemas. Fixed values and decimal arithmetic use `Config.MaxByteSliceSize`.
+- See the README for migration details and error behavior.
+
 ## v2.31.3 - 2026-08-16
 
 ### Dependencies

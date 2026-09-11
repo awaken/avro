@@ -1,12 +1,18 @@
 package registry_test
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/awaken/avro/v2"
 	"github.com/awaken/avro/v2/registry"
@@ -17,6 +23,179 @@ import (
 const referencedParentSchema = `{"type":"record","name":"Parent","namespace":"com.acme","fields":[{"name":"child","type":"com.acme.Child"}]}`
 
 const resolvedParentSchema = `{"type":"record","name":"Parent","namespace":"com.acme","fields":[{"name":"child","type":{"type":"record","name":"Child","fields":[{"name":"value","type":"string"}]}}]}`
+
+type registryResponseTransport func(*http.Request) (*http.Response, error)
+
+func (f registryResponseTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type registryCountBody struct {
+	io.Reader
+	read   int64
+	closed int
+}
+
+func (b *registryCountBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	b.read += int64(n)
+	return n, err
+}
+
+func (b *registryCountBody) Close() error { b.closed++; return nil }
+
+func TestClientRejectsResponseTails(t *testing.T) {
+	for _, tail := range []string{` {"second":true}`, ` invalid`} {
+		t.Run(tail, func(t *testing.T) {
+			body := &registryCountBody{Reader: strings.NewReader(`["subject"]` + tail)}
+			client, err := registry.NewClient("https://registry.invalid", registry.WithHTTPClient(&http.Client{
+				Transport: registryResponseTransport(func(*http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+				}),
+			}))
+			require.NoError(t, err)
+			_, err = client.GetSubjects(context.Background())
+			require.Error(t, err, "accepted bytes after the response document")
+			require.Equal(t, 1, body.closed)
+		})
+	}
+}
+
+func TestClientBoundsResponseTails(t *testing.T) {
+	const limit int64 = 4 << 20
+	for _, status := range []int{http.StatusOK, http.StatusBadGateway} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			body := &registryCountBody{Reader: strings.NewReader(`[]` + strings.Repeat(" ", int(limit)+4096))}
+			client, err := registry.NewClient("https://registry.invalid", registry.WithHTTPClient(&http.Client{
+				Transport: registryResponseTransport(func(*http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: status, Body: body}, nil
+				}),
+			}))
+			require.NoError(t, err)
+			_, err = client.GetSubjects(context.Background())
+			assert.Error(t, err)
+			assert.LessOrEqual(t, body.read, limit+1, "response cleanup drained beyond the bound")
+			assert.Equal(t, 1, body.closed)
+		})
+	}
+}
+
+func TestClientResponseLimitOptions(t *testing.T) {
+	for _, limit := range []int64{-1, 0, math.MaxInt64} {
+		_, err := registry.NewClient("https://registry.invalid", registry.WithResponseLimit(limit))
+		require.Error(t, err)
+	}
+	for _, test := range []struct {
+		body     string
+		limit    int64
+		tooLarge bool
+	}{
+		{`[]`, 2, false}, {`[] `, 2, true}, {`[] `, 3, false},
+	} {
+		t.Run(fmt.Sprintf("%q/%d", test.body, test.limit), func(t *testing.T) {
+			body := &registryCountBody{Reader: strings.NewReader(test.body)}
+			client, err := registry.NewClient("https://registry.invalid", registry.WithResponseLimit(test.limit), registry.WithHTTPClient(&http.Client{
+				Transport: registryResponseTransport(func(*http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+				}),
+			}))
+			require.NoError(t, err)
+			_, err = client.GetSubjects(context.Background())
+			if test.tooLarge {
+				require.ErrorIs(t, err, registry.ErrResponseLimit)
+			} else {
+				require.NoError(t, err)
+			}
+			require.LessOrEqual(t, body.read, test.limit+1)
+			require.Equal(t, 1, body.closed)
+		})
+	}
+}
+
+func TestClientChecksUnusedResponse(t *testing.T) {
+	for _, payload := range []string{"", " \n", `{}`, `{} {}`} {
+		body := &registryCountBody{Reader: strings.NewReader(payload)}
+		client, err := registry.NewClient("https://registry.invalid", registry.WithHTTPClient(&http.Client{
+			Transport: registryResponseTransport(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+			}),
+		}))
+		require.NoError(t, err)
+		err = client.SetGlobalCompatibilityLevel(context.Background(), registry.BackwardCL)
+		if payload == `{} {}` {
+			require.Error(t, err)
+		} else {
+			require.NoError(t, err)
+		}
+		require.Equal(t, 1, body.closed)
+	}
+}
+
+func TestClientRejectsMalformedErrorDocument(t *testing.T) {
+	body := &registryCountBody{Reader: strings.NewReader(`{"error_code":4,"message":"partial"} {}`)}
+	client, err := registry.NewClient("https://registry.invalid", registry.WithHTTPClient(&http.Client{
+		Transport: registryResponseTransport(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusBadRequest, Body: body}, nil
+		}),
+	}))
+	require.NoError(t, err)
+	_, err = client.GetSubjects(context.Background())
+	require.ErrorContains(t, err, "invalid registry error response")
+	var status registry.Error
+	require.True(t, errors.As(err, &status))
+	require.Equal(t, http.StatusBadRequest, status.StatusCode)
+	require.Empty(t, status.Message, "part of an invalid document was trusted")
+	require.Equal(t, 1, body.closed)
+}
+
+func TestClientBoundsDecodedBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		if _, err := io.WriteString(gz, `[]`+strings.Repeat(" ", 128)); err != nil {
+			t.Error(err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer server.Close()
+	client, err := registry.NewClient(server.URL, registry.WithHTTPClient(server.Client()), registry.WithResponseLimit(64))
+	require.NoError(t, err)
+	_, err = client.GetSubjects(context.Background())
+	require.ErrorIs(t, err, registry.ErrResponseLimit)
+}
+
+type registryReaderFunc func([]byte) (int, error)
+
+func (f registryReaderFunc) Read(p []byte) (int, error) { return f(p) }
+
+func TestClientResponseReadErrors(t *testing.T) {
+	for _, timed := range []bool{false, true} {
+		failure := errors.New("response read failed")
+		body := &registryCountBody{}
+		client, err := registry.NewClient("https://registry.invalid", registry.WithHTTPClient(&http.Client{
+			Transport: registryResponseTransport(func(r *http.Request) (*http.Response, error) {
+				body.Reader = registryReaderFunc(func([]byte) (int, error) {
+					if timed {
+						<-r.Context().Done()
+						return 0, r.Context().Err()
+					}
+					return 0, failure
+				})
+				return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+			}),
+		}))
+		require.NoError(t, err)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+		_, err = client.GetSubjects(ctx)
+		cancel()
+		if timed {
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+		} else {
+			require.ErrorIs(t, err, failure)
+		}
+		require.Equal(t, 1, body.closed)
+	}
+}
 
 func TestNewClient(t *testing.T) {
 	client, err := registry.NewClient("http://example.com")
@@ -29,6 +208,51 @@ func TestNewClient_UrlError(t *testing.T) {
 	_, err := registry.NewClient("://")
 
 	assert.Error(t, err)
+}
+
+func TestNewClient_NilOption(t *testing.T) {
+	var client *registry.Client
+	var err error
+
+	require.NotPanics(t, func() {
+		client, err = registry.NewClient("http://example.com", nil)
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, client)
+}
+
+func TestNewClient_NilHTTPClient(t *testing.T) {
+	_, err := registry.NewClient("http://example.com", registry.WithHTTPClient(nil))
+
+	require.ErrorContains(t, err, "http client cannot be nil")
+}
+
+func TestClient_PreservesEscapedBasePath(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "inside segment", path: "/registry%2Ftenant", want: "/registry%2Ftenant/subjects"},
+		{name: "at segment end", path: "/registry%2F", want: "/registry%2F/subjects"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, test.want, r.URL.EscapedPath())
+				_, _ = w.Write([]byte(`[]`))
+			}))
+			t.Cleanup(s.Close)
+			client, err := registry.NewClient(s.URL + test.path)
+			require.NoError(t, err)
+
+			_, err = client.GetSubjects(context.Background())
+
+			require.NoError(t, err)
+		})
+	}
 }
 
 func TestSchemaInfo_IDBytes(t *testing.T) {
@@ -59,6 +283,114 @@ func TestClient_PopulatesError(t *testing.T) {
 	assert.Equal(t, 422, regError.StatusCode)
 	assert.Equal(t, 42202, regError.Code)
 	assert.Equal(t, "schema may not be empty", regError.Message)
+}
+
+func TestClient_RejectsIncompleteSuccessfulResponse(t *testing.T) {
+	tests := []struct {
+		name     string
+		response string
+		call     func(*registry.Client) error
+		want     string
+	}{
+		{
+			name: "create schema without id",
+			call: func(client *registry.Client) error {
+				_, _, err := client.CreateSchema(context.Background(), "test", "null")
+				return err
+			},
+			want: "schema id",
+		},
+		{
+			name: "registered schema without id",
+			call: func(client *registry.Client) error {
+				_, _, err := client.IsRegistered(context.Background(), "test", "null")
+				return err
+			},
+			want: "schema id",
+		},
+		{
+			name:     "schema info without id",
+			response: `{"version":1,"schema":"null"}`,
+			call: func(client *registry.Client) error {
+				_, err := client.GetSchemaInfo(context.Background(), "test", 1)
+				return err
+			},
+			want: "schema id",
+		},
+		{
+			name:     "schema info without version",
+			response: `{"id":1,"schema":"null"}`,
+			call: func(client *registry.Client) error {
+				_, err := client.GetSchemaInfo(context.Background(), "test", 1)
+				return err
+			},
+			want: "schema version",
+		},
+		{
+			name: "compatibility result missing",
+			call: func(client *registry.Client) error {
+				_, err := client.IsCompatible(context.Background(), "test", "null")
+				return err
+			},
+			want: "compatibility result",
+		},
+		{
+			name: "global compatibility level missing",
+			call: func(client *registry.Client) error {
+				_, err := client.GetGlobalCompatibilityLevel(context.Background())
+				return err
+			},
+			want: "compatibility level",
+		},
+		{
+			name: "subject compatibility level missing",
+			call: func(client *registry.Client) error {
+				_, err := client.GetCompatibilityLevel(context.Background(), "test")
+				return err
+			},
+			want: "compatibility level",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := test.response
+			if response == "" {
+				response = `{}`
+			}
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(response))
+			}))
+			t.Cleanup(s.Close)
+			client, err := registry.NewClient(s.URL)
+			require.NoError(t, err)
+
+			err = test.call(client)
+
+			require.ErrorContains(t, err, test.want)
+		})
+	}
+}
+
+func TestClient_RejectsRedirectResponse(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/target", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(s.Close)
+	httpClient := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	client, err := registry.NewClient(s.URL, registry.WithHTTPClient(httpClient))
+	require.NoError(t, err)
+
+	err = client.SetGlobalCompatibilityLevel(context.Background(), registry.BackwardCL)
+
+	require.Error(t, err)
+	regError, ok := err.(registry.Error)
+	require.True(t, ok)
+	require.Equal(t, http.StatusTemporaryRedirect, regError.StatusCode)
 }
 
 func TestNewClient_BasicAuth(t *testing.T) {
@@ -911,7 +1243,7 @@ func TestClient_IsCompatible(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, schema, "[\"null\",\"string\",\"int\"]")
 
-		_, _ = w.Write([]byte(`{"is_compatible":true}`))
+		_, _ = w.Write([]byte(`{"is_compatible":false}`))
 	}))
 	t.Cleanup(s.Close)
 	client, _ := registry.NewClient(s.URL)
@@ -923,7 +1255,7 @@ func TestClient_IsCompatible(t *testing.T) {
 	)
 
 	require.NoError(t, err)
-	assert.Equal(t, true, isCompatible)
+	assert.False(t, isCompatible)
 }
 
 func TestClient_IsCompatibleWithRefs(t *testing.T) {

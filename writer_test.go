@@ -64,6 +64,16 @@ func TestWriter_FlushNoWriter(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestWriter_FlushReturnsErrorWithoutWriter(t *testing.T) {
+	want := errors.New("test")
+	w := avro.NewWriter(nil, 10)
+	w.Error = want
+
+	err := w.Flush()
+
+	assert.ErrorIs(t, err, want)
+}
+
 func TestWriter_FlushReturnsWriterError(t *testing.T) {
 	var buf bytes.Buffer
 	w := avro.NewWriter(&buf, 10)

@@ -31,6 +31,39 @@ func ConfigTeardown() {
 	DefaultConfig = Config{}.Freeze()
 }
 
+func TestDecoder_DefaultEncodingIgnoresTypeConverters(t *testing.T) {
+	schema := MustParse(`{
+		"type": "record",
+		"name": "test",
+		"fields": [
+			{"name": "a", "type": "int"},
+			{"name": "b", "type": ["string", "long"], "default": "bar"}
+		]
+	}`).(*RecordSchema)
+	schema.fields[1].action = FieldSetDefault
+
+	converted := Config{}.Freeze()
+	converted.RegisterTypeConverters(TypeConversionFuncs{
+		AvroType: Union,
+		EncoderTypeConversion: func(any, Schema) (any, error) {
+			return "encoded", nil
+		},
+		DecoderTypeConversion: func(in any, _ Schema) (any, error) {
+			return "decoded:" + in.(string), nil
+		},
+	})
+	var warm map[string]any
+	err := converted.NewDecoder(schema, bytes.NewReader([]byte{0x02})).Decode(&warm)
+	require.NoError(t, err)
+	assert.Equal(t, "decoded:bar", warm["b"])
+
+	plain := Config{}.Freeze()
+	var got map[string]any
+	err = plain.NewDecoder(schema, bytes.NewReader([]byte{0x02})).Decode(&got)
+	require.NoError(t, err)
+	assert.Equal(t, "bar", got["b"])
+}
+
 func TestDecoder_InvalidDefault(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -55,6 +88,30 @@ func TestDecoder_InvalidDefault(t *testing.T) {
 	err := dec.Decode(&got)
 
 	require.Error(t, err)
+}
+
+func TestDecoder_DefaultTargetError(t *testing.T) {
+	defer ConfigTeardown()
+
+	data := []byte{0x6, 0x66, 0x6f, 0x6f}
+	schema := MustParse(`{
+		"type": "record",
+		"name": "test",
+		"fields" : [
+			{"name": "a", "type": "string"},
+			{"name": "b", "type": "int", "default": 1}
+		]
+	}`)
+	schema.(*RecordSchema).Fields()[1].action = FieldSetDefault
+
+	type target struct {
+		A string `avro:"a"`
+		B string `avro:"b"`
+	}
+	var got target
+	err := NewDecoderForSchema(schema, bytes.NewReader(data)).Decode(&got)
+
+	require.ErrorContains(t, err, "unsupported")
 }
 
 func TestDecoder_IgnoreField(t *testing.T) {
@@ -448,6 +505,65 @@ func TestDecoder_DefaultUnion(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, TestRecord{B: map[string]any{"string": "bar"}, A: "foo"}, got)
 	})
+
+	t.Run("named record default", func(t *testing.T) {
+		type TestRecord struct {
+			A string `avro:"a"`
+			B any    `avro:"b"`
+		}
+
+		schema := MustParse(`{
+			"type": "record",
+			"name": "test",
+			"fields" : [
+				{"name": "a", "type": "string"},
+				{
+					"name": "b",
+					"type": [
+						{"type": "record", "name": "child", "fields": [{"name": "value", "type": "int"}]},
+						"null"
+					],
+					"default": {"value": 7}
+				}
+			]
+		}`)
+
+		schema.(*RecordSchema).Fields()[1].action = FieldSetDefault
+
+		var got TestRecord
+		err := NewDecoderForSchema(schema, bytes.NewReader(data)).Decode(&got)
+
+		require.NoError(t, err)
+		assert.Equal(t, TestRecord{
+			A: "foo",
+			B: map[string]any{"child": map[string]any{"value": 7}},
+		}, got)
+	})
+
+	t.Run("later null default", func(t *testing.T) {
+		type TestRecord struct {
+			A string `avro:"a"`
+			B any    `avro:"b"`
+		}
+
+		schema := MustParse(`{
+			"type": "record",
+			"name": "test",
+			"fields" : [
+				{"name": "a", "type": "string"},
+				{"name": "b", "type": ["int", "string", "null"], "default": null}
+			]
+		}`)
+
+		schema.(*RecordSchema).Fields()[1].action = FieldSetDefault
+
+		var got TestRecord
+		assert.NotPanics(t, func() {
+			err := NewDecoderForSchema(schema, bytes.NewReader(data)).Decode(&got)
+			require.NoError(t, err)
+		})
+		assert.Equal(t, TestRecord{A: "foo"}, got)
+	})
 }
 
 func TestDecoder_DefaultArray(t *testing.T) {
@@ -731,7 +847,7 @@ func TestDecoder_DefaultFixed(t *testing.T) {
 						"name": "test.fixed",
 						"size": 6,
 						"logicalType":"decimal",
-						"precision":4,
+						"precision":5,
 						"scale":2
 					}, 
 					"default": "\u0000\u0000\u0000\u0000\u0087\u0078"

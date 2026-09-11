@@ -1,7 +1,9 @@
 package avro
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"reflect"
 	"strconv"
@@ -24,11 +26,11 @@ func createDecoderOfNative(schema *PrimitiveSchema, typ reflect2.Type) ValDecode
 	case reflect.Int:
 		switch schema.Type() {
 		case Int:
-			return &intCodec[int]{}
+			return &intCodec[int]{timeOfDay: getLogicalType(schema) == TimeMillis}
 		case Long:
 			if strconv.IntSize == 64 {
 				// allow decoding into int when it's 64-bit
-				return &longCodec[int]{}
+				return &longCodec[int]{timeOfDay: getLogicalType(schema) == TimeMicros}
 			}
 		}
 
@@ -36,40 +38,40 @@ func createDecoderOfNative(schema *PrimitiveSchema, typ reflect2.Type) ValDecode
 		if schema.Type() != Int {
 			break
 		}
-		return &intCodec[int8]{}
+		return &intCodec[int8]{timeOfDay: getLogicalType(schema) == TimeMillis}
 
 	case reflect.Uint8:
 		if schema.Type() != Int {
 			break
 		}
-		return &intCodec[uint8]{}
+		return &intCodec[uint8]{timeOfDay: getLogicalType(schema) == TimeMillis}
 
 	case reflect.Int16:
 		if schema.Type() != Int {
 			break
 		}
-		return &intCodec[int16]{}
+		return &intCodec[int16]{timeOfDay: getLogicalType(schema) == TimeMillis}
 
 	case reflect.Uint16:
 		if schema.Type() != Int {
 			break
 		}
-		return &intCodec[uint16]{}
+		return &intCodec[uint16]{timeOfDay: getLogicalType(schema) == TimeMillis}
 
 	case reflect.Int32:
 		if schema.Type() != Int {
 			break
 		}
-		return &intCodec[int32]{}
+		return &intCodec[int32]{timeOfDay: getLogicalType(schema) == TimeMillis}
 
 	case reflect.Uint32:
 		if schema.Type() != Long {
 			break
 		}
 		if resolved {
-			return &longConvCodec[uint32]{convert: createLongConverter(schema.encodedType)}
+			return &longConvCodec[uint32]{convert: createLongConverter(schema.encodedType), timeOfDay: getLogicalType(schema) == TimeMicros}
 		}
-		return &longCodec[uint32]{}
+		return &longCodec[uint32]{timeOfDay: getLogicalType(schema) == TimeMicros}
 
 	case reflect.Int64:
 		st := schema.Type()
@@ -90,9 +92,9 @@ func createDecoderOfNative(schema *PrimitiveSchema, typ reflect2.Type) ValDecode
 					typ.Type1().String(), schema.Type(), lt)}
 			}
 			if resolved {
-				return &longConvCodec[int64]{convert: createLongConverter(schema.encodedType)}
+				return &longConvCodec[int64]{convert: createLongConverter(schema.encodedType), timeOfDay: getLogicalType(schema) == TimeMicros}
 			}
-			return &longCodec[int64]{}
+			return &longCodec[int64]{timeOfDay: getLogicalType(schema) == TimeMicros}
 
 		default:
 			break
@@ -126,12 +128,13 @@ func createDecoderOfNative(schema *PrimitiveSchema, typ reflect2.Type) ValDecode
 		if typ.(reflect2.SliceType).Elem().Kind() != reflect.Uint8 || schema.Type() != Bytes {
 			break
 		}
-		return &bytesCodec{sliceType: typ.(*reflect2.UnsafeSliceType)}
+		decimal, _ := validDecimalLogicalSchema(schema)
+		return &bytesCodec{sliceType: typ.(*reflect2.UnsafeSliceType), decimal: decimal}
 
 	case reflect.Struct:
 		st := schema.Type()
-		ls := getLogicalSchema(schema)
 		lt := getLogicalType(schema)
+		dec, decimal := validDecimalLogicalSchema(schema)
 		isTime := typ.Type1().ConvertibleTo(timeType)
 		switch {
 		case isTime && st == Int && lt == Date:
@@ -154,8 +157,7 @@ func createDecoderOfNative(schema *PrimitiveSchema, typ reflect2.Type) ValDecode
 				local:   true,
 				convert: createLongConverter(schema.encodedType),
 			}
-		case typ.Type1().ConvertibleTo(ratType) && st == Bytes && lt == Decimal:
-			dec := ls.(*DecimalLogicalSchema)
+		case typ.Type1().ConvertibleTo(ratType) && st == Bytes && decimal:
 			return &bytesDecimalCodec{prec: dec.Precision(), scale: dec.Scale()}
 
 		default:
@@ -165,14 +167,10 @@ func createDecoderOfNative(schema *PrimitiveSchema, typ reflect2.Type) ValDecode
 		ptrType := typ.(*reflect2.UnsafePtrType)
 		elemType := ptrType.Elem()
 		typ1 := elemType.Type1()
-		ls := getLogicalSchema(schema)
-		if ls == nil {
+		dec, ok := validDecimalLogicalSchema(schema)
+		if !ok || !typ1.ConvertibleTo(ratType) {
 			break
 		}
-		if !typ1.ConvertibleTo(ratType) || schema.Type() != Bytes || ls.Type() != Decimal {
-			break
-		}
-		dec := ls.(*DecimalLogicalSchema)
 
 		return &bytesDecimalPtrCodec{prec: dec.Precision(), scale: dec.Scale()}
 	}
@@ -192,49 +190,49 @@ func createEncoderOfNative(schema *PrimitiveSchema, typ reflect2.Type) ValEncode
 	case reflect.Int:
 		switch schema.Type() {
 		case Int:
-			return &intCodec[int]{}
+			return &intCodec[int]{timeOfDay: getLogicalType(schema) == TimeMillis}
 		case Long:
-			return &longCodec[int]{}
+			return &longCodec[int]{timeOfDay: getLogicalType(schema) == TimeMicros}
 		}
 
 	case reflect.Int8:
 		if schema.Type() != Int {
 			break
 		}
-		return &intCodec[int8]{}
+		return &intCodec[int8]{timeOfDay: getLogicalType(schema) == TimeMillis}
 
 	case reflect.Uint8:
 		if schema.Type() != Int {
 			break
 		}
-		return &intCodec[uint8]{}
+		return &intCodec[uint8]{timeOfDay: getLogicalType(schema) == TimeMillis}
 
 	case reflect.Int16:
 		if schema.Type() != Int {
 			break
 		}
-		return &intCodec[int16]{}
+		return &intCodec[int16]{timeOfDay: getLogicalType(schema) == TimeMillis}
 
 	case reflect.Uint16:
 		if schema.Type() != Int {
 			break
 		}
-		return &intCodec[uint16]{}
+		return &intCodec[uint16]{timeOfDay: getLogicalType(schema) == TimeMillis}
 
 	case reflect.Int32:
 		switch schema.Type() {
 		case Long:
-			return &longCodec[int32]{}
+			return &longCodec[int32]{timeOfDay: getLogicalType(schema) == TimeMicros}
 
 		case Int:
-			return &intCodec[int32]{}
+			return &intCodec[int32]{timeOfDay: getLogicalType(schema) == TimeMillis}
 		}
 
 	case reflect.Uint32:
 		if schema.Type() != Long {
 			break
 		}
-		return &longCodec[uint32]{}
+		return &longCodec[uint32]{timeOfDay: getLogicalType(schema) == TimeMicros}
 
 	case reflect.Int64:
 		st := schema.Type()
@@ -252,7 +250,7 @@ func createEncoderOfNative(schema *PrimitiveSchema, typ reflect2.Type) ValEncode
 				return &errorEncoder{err: fmt.Errorf("avro: %s is unsupported for Avro %s and logicalType %s",
 					typ.Type1().String(), schema.Type(), lt)}
 			}
-			return &longCodec[int64]{}
+			return &longCodec[int64]{timeOfDay: getLogicalType(schema) == TimeMicros}
 
 		default:
 			break
@@ -282,11 +280,13 @@ func createEncoderOfNative(schema *PrimitiveSchema, typ reflect2.Type) ValEncode
 		if typ.(reflect2.SliceType).Elem().Kind() != reflect.Uint8 || schema.Type() != Bytes {
 			break
 		}
-		return &bytesCodec{sliceType: typ.(*reflect2.UnsafeSliceType)}
+		decimal, _ := validDecimalLogicalSchema(schema)
+		return &bytesCodec{sliceType: typ.(*reflect2.UnsafeSliceType), decimal: decimal}
 
 	case reflect.Struct:
 		st := schema.Type()
 		lt := getLogicalType(schema)
+		dec, decimal := validDecimalLogicalSchema(schema)
 		isTime := typ.Type1().ConvertibleTo(timeType)
 		switch {
 		case isTime && st == Int && lt == Date:
@@ -299,9 +299,7 @@ func createEncoderOfNative(schema *PrimitiveSchema, typ reflect2.Type) ValEncode
 			return &timestampMillisCodec{local: true}
 		case isTime && st == Long && lt == LocalTimestampMicros:
 			return &timestampMicrosCodec{local: true}
-		case typ.Type1().ConvertibleTo(ratType) && st != Bytes || lt == Decimal:
-			ls := getLogicalSchema(schema)
-			dec := ls.(*DecimalLogicalSchema)
+		case typ.Type1().ConvertibleTo(ratType) && st == Bytes && decimal:
 			return &bytesDecimalCodec{prec: dec.Precision(), scale: dec.Scale()}
 		default:
 			break
@@ -311,14 +309,10 @@ func createEncoderOfNative(schema *PrimitiveSchema, typ reflect2.Type) ValEncode
 		ptrType := typ.(*reflect2.UnsafePtrType)
 		elemType := ptrType.Elem()
 		typ1 := elemType.Type1()
-		ls := getLogicalSchema(schema)
-		if ls == nil {
+		dec, ok := validDecimalLogicalSchema(schema)
+		if !ok || !typ1.ConvertibleTo(ratType) {
 			break
 		}
-		if !typ1.ConvertibleTo(ratType) || schema.Type() != Bytes || ls.Type() != Decimal {
-			break
-		}
-		dec := ls.(*DecimalLogicalSchema)
 
 		return &bytesDecimalPtrCodec{prec: dec.Precision(), scale: dec.Scale()}
 	}
@@ -364,36 +358,91 @@ type smallInt interface {
 	~int | ~int8 | ~int16 | ~int32 | ~uint | ~uint8 | ~uint16
 }
 
-type intCodec[T smallInt] struct{}
-
-func (*intCodec[T]) Decode(ptr unsafe.Pointer, r *Reader) {
-	*((*T)(ptr)) = T(r.ReadInt())
+type intCodec[T smallInt] struct {
+	timeOfDay bool
 }
 
-func (*intCodec[T]) Encode(ptr unsafe.Pointer, w *Writer) {
-	w.WriteInt(int32(*((*T)(ptr))))
+func (c *intCodec[T]) Decode(ptr unsafe.Pointer, r *Reader) {
+	value := int64(r.ReadInt())
+	if c.timeOfDay && !readTimeUnits(r, value, time.Millisecond) {
+		return
+	}
+	setInteger[T](ptr, r, value)
+}
+
+func (c *intCodec[T]) Encode(ptr unsafe.Pointer, w *Writer) {
+	if w.Error != nil {
+		return
+	}
+	value := *((*T)(ptr))
+	encoded := int32(value)
+	if T(encoded) != value || encoded < 0 && value > 0 {
+		w.Error = fmt.Errorf("avro: %d is outside the Avro int range", value)
+		return
+	}
+	if c.timeOfDay && !validTimeUnits(int64(encoded), time.Millisecond) {
+		w.Error = errTimeOfDay
+		return
+	}
+	w.WriteInt(encoded)
 }
 
 type largeInt interface {
 	~int | ~int32 | ~uint32 | int64
 }
 
-type longCodec[T largeInt] struct{}
-
-func (c *longCodec[T]) Decode(ptr unsafe.Pointer, r *Reader) {
-	*((*T)(ptr)) = T(r.ReadLong())
+type longCodec[T largeInt] struct {
+	timeOfDay bool
 }
 
-func (*longCodec[T]) Encode(ptr unsafe.Pointer, w *Writer) {
-	w.WriteLong(int64(*((*T)(ptr))))
+func (c *longCodec[T]) Decode(ptr unsafe.Pointer, r *Reader) {
+	value := r.ReadLong()
+	if c.timeOfDay && !readTimeUnits(r, value, time.Microsecond) {
+		return
+	}
+	setInteger[T](ptr, r, value)
+}
+
+func (c *longCodec[T]) Encode(ptr unsafe.Pointer, w *Writer) {
+	if w.Error != nil {
+		return
+	}
+	value := int64(*((*T)(ptr)))
+	if c.timeOfDay && !validTimeUnits(value, time.Microsecond) {
+		w.Error = errTimeOfDay
+		return
+	}
+	w.WriteLong(value)
 }
 
 type longConvCodec[T largeInt] struct {
-	convert func(*Reader) int64
+	convert   func(*Reader) int64
+	timeOfDay bool
 }
 
 func (c *longConvCodec[T]) Decode(ptr unsafe.Pointer, r *Reader) {
-	*((*T)(ptr)) = T(c.convert(r))
+	value := c.convert(r)
+	if c.timeOfDay && !readTimeUnits(r, value, time.Microsecond) {
+		return
+	}
+	setInteger[T](ptr, r, value)
+}
+
+type codecInteger interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64 | ~uint | ~uint8 | ~uint16 | ~uint32
+}
+
+// setInteger checks narrowing and sign changes before publishing a decoded value.
+func setInteger[T codecInteger](ptr unsafe.Pointer, r *Reader, value int64) {
+	if r.Error != nil {
+		return
+	}
+	converted := T(value)
+	if int64(converted) != value || value < 0 && converted > 0 {
+		r.ReportError("decode integer", fmt.Sprintf("%d is outside the %T range", value, converted))
+		return
+	}
+	*((*T)(ptr)) = converted
 }
 
 type float32Codec struct{}
@@ -450,18 +499,36 @@ func (*stringCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 
 type bytesCodec struct {
 	sliceType *reflect2.UnsafeSliceType
+	decimal   *DecimalLogicalSchema
 }
 
 func (c *bytesCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 	b := r.ReadBytes()
+	if r.Error != nil {
+		return
+	}
+	if err := checkRawDecimal(b, c.decimal, r.cfg.getMaxByteSliceSize()); err != nil {
+		r.Error = err
+		return
+	}
 	c.sliceType.UnsafeSet(ptr, reflect2.PtrOf(b))
 }
 
 func (c *bytesCodec) Encode(ptr unsafe.Pointer, w *Writer) {
-	w.WriteBytes(*((*[]byte)(ptr)))
+	if w.Error != nil {
+		return
+	}
+	b := *((*[]byte)(ptr))
+	if err := checkRawDecimal(b, c.decimal, w.cfg.getMaxByteSliceSize()); err != nil {
+		w.Error = err
+		return
+	}
+	w.WriteBytes(b)
 }
 
 type dateCodec struct{}
+
+var errDateRange = errors.New("avro: date is outside the int32 day range")
 
 func (c *dateCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 	i := r.ReadInt()
@@ -470,8 +537,22 @@ func (c *dateCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 }
 
 func (c *dateCodec) Encode(ptr unsafe.Pointer, w *Writer) {
+	if w.Error != nil {
+		return
+	}
 	t := *((*time.Time)(ptr))
-	days := t.Unix() / int64(24*time.Hour/time.Second)
+	year, month, day := t.Date()
+	// All int32 day offsets fit within these years. Bound Unix arithmetic first.
+	if year < -6_000_000 || year > 6_000_000 {
+		w.Error = errDateRange
+		return
+	}
+	civil := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+	days := civil.Unix() / int64(24*time.Hour/time.Second)
+	if days < math.MinInt32 || days > math.MaxInt32 {
+		w.Error = errDateRange
+		return
+	}
 	w.WriteInt(int32(days))
 }
 
@@ -487,29 +568,22 @@ func (c *timestampMillisCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 	} else {
 		i = r.ReadLong()
 	}
-	sec := i / 1e3
-	nsec := (i - sec*1e3) * 1e6
-	t := time.Unix(sec, nsec)
-
-	if c.local {
-		// When doing unix time, Go will convert the time from UTC to Local,
-		// changing the time by the number of seconds in the zone offset.
-		// Remove those added seconds.
-		_, offset := t.Zone()
-		t = t.Add(time.Duration(-1*offset) * time.Second)
-		*((*time.Time)(ptr)) = t
+	if r.Error != nil {
 		return
 	}
-	*((*time.Time)(ptr)) = t.UTC()
+	*((*time.Time)(ptr)) = timestampFromUnits(i, time.Millisecond)
 }
 
 func (c *timestampMillisCodec) Encode(ptr unsafe.Pointer, w *Writer) {
-	t := *((*time.Time)(ptr))
-	if c.local {
-		t = t.Local()
-		t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
+	if w.Error != nil {
+		return
 	}
-	w.WriteLong(t.Unix()*1e3 + int64(t.Nanosecond()/1e6))
+	value, err := timestampValue(*((*time.Time)(ptr)), time.Millisecond, c.local)
+	if err != nil {
+		w.Error = err
+		return
+	}
+	w.WriteLong(value)
 }
 
 type timestampMicrosCodec struct {
@@ -524,40 +598,103 @@ func (c *timestampMicrosCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 	} else {
 		i = r.ReadLong()
 	}
-	sec := i / 1e6
-	nsec := (i - sec*1e6) * 1e3
-	t := time.Unix(sec, nsec)
-
-	if c.local {
-		// When doing unix time, Go will convert the time from UTC to Local,
-		// changing the time by the number of seconds in the zone offset.
-		// Remove those added seconds.
-		_, offset := t.Zone()
-		t = t.Add(time.Duration(-1*offset) * time.Second)
-		*((*time.Time)(ptr)) = t
+	if r.Error != nil {
 		return
 	}
-	*((*time.Time)(ptr)) = t.UTC()
+	*((*time.Time)(ptr)) = timestampFromUnits(i, time.Microsecond)
 }
 
 func (c *timestampMicrosCodec) Encode(ptr unsafe.Pointer, w *Writer) {
-	t := *((*time.Time)(ptr))
-	if c.local {
-		t = t.Local()
-		t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
+	if w.Error != nil {
+		return
 	}
-	w.WriteLong(t.Unix()*1e6 + int64(t.Nanosecond()/1e3))
+	value, err := timestampValue(*((*time.Time)(ptr)), time.Microsecond, c.local)
+	if err != nil {
+		w.Error = err
+		return
+	}
+	w.WriteLong(value)
+}
+
+var errTimestampRange = errors.New("avro: timestamp is outside the int64 unit range")
+
+// timestampFromUnits uses UTC as a zone-free carrier for local civil clocks.
+// This also preserves ambiguous or nonexistent clocks at DST transitions.
+func timestampFromUnits(value int64, unit time.Duration) time.Time {
+	perSecond := int64(time.Second / unit)
+	return time.Unix(value/perSecond, (value%perSecond)*int64(unit)).UTC()
+}
+
+func timestampValue(t time.Time, unit time.Duration, local bool) (int64, error) {
+	if !local {
+		t = t.UTC()
+	}
+	year, month, day := t.Date()
+	// Every int64 millisecond/microsecond value fits within these years.
+	if year < -300_000_000 || year > 300_000_000 {
+		return 0, errTimestampRange
+	}
+	if local {
+		t = time.Date(year, month, day, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
+	}
+	sec := t.Unix()
+	perSecond := int64(time.Second / unit)
+	fraction := int64(t.Nanosecond()) / int64(unit)
+	if sec >= 0 {
+		if sec > (math.MaxInt64-fraction)/perSecond {
+			return 0, errTimestampRange
+		}
+		return sec*perSecond + fraction, nil
+	}
+	// Form a negative value from its next second to retain the partial lower bound.
+	if sec+1 < math.MinInt64/perSecond {
+		return 0, errTimestampRange
+	}
+	whole := (sec + 1) * perSecond
+	remainder := perSecond - fraction
+	if whole < math.MinInt64+remainder {
+		return 0, errTimestampRange
+	}
+	return whole - remainder, nil
 }
 
 type timeMillisCodec struct{}
 
+var errTimeOfDay = errors.New("avro: time value must be within [0,24h)")
+
+func validTimeUnits(value int64, unit time.Duration) bool {
+	return value >= 0 && value < int64(24*time.Hour/unit)
+}
+
+// readTimeUnits validates raw units before duration multiplication can overflow.
+func readTimeUnits(r *Reader, value int64, unit time.Duration) bool {
+	if r.Error != nil {
+		return false
+	}
+	if !validTimeUnits(value, unit) {
+		r.Error = errTimeOfDay
+		return false
+	}
+	return true
+}
+
 func (c *timeMillisCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 	i := r.ReadInt()
+	if !readTimeUnits(r, int64(i), time.Millisecond) {
+		return
+	}
 	*((*time.Duration)(ptr)) = time.Duration(i) * time.Millisecond
 }
 
 func (c *timeMillisCodec) Encode(ptr unsafe.Pointer, w *Writer) {
+	if w.Error != nil {
+		return
+	}
 	d := *((*time.Duration)(ptr))
+	if d < 0 || d >= 24*time.Hour {
+		w.Error = errTimeOfDay
+		return
+	}
 	w.WriteInt(int32(d.Nanoseconds() / int64(time.Millisecond)))
 }
 
@@ -572,15 +709,23 @@ func (c *timeMicrosCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 	} else {
 		i = r.ReadLong()
 	}
+	if !readTimeUnits(r, i, time.Microsecond) {
+		return
+	}
 	*((*time.Duration)(ptr)) = time.Duration(i) * time.Microsecond
 }
 
 func (c *timeMicrosCodec) Encode(ptr unsafe.Pointer, w *Writer) {
+	if w.Error != nil {
+		return
+	}
 	d := *((*time.Duration)(ptr))
+	if d < 0 || d >= 24*time.Hour {
+		w.Error = errTimeOfDay
+		return
+	}
 	w.WriteLong(d.Nanoseconds() / int64(time.Microsecond))
 }
-
-var one = big.NewInt(1)
 
 type bytesDecimalCodec struct {
 	prec  int
@@ -588,54 +733,13 @@ type bytesDecimalCodec struct {
 }
 
 func (c *bytesDecimalCodec) Decode(ptr unsafe.Pointer, r *Reader) {
-	b := r.ReadBytes()
-	if i := (&big.Int{}).SetBytes(b); len(b) > 0 && b[0]&0x80 > 0 {
-		i.Sub(i, new(big.Int).Lsh(one, uint(len(b))*8))
+	if value := r.readDecimal(r.ReadBytes(), c.prec, c.scale); value != nil {
+		*((*big.Rat)(ptr)) = *value
 	}
-	*((**big.Rat)(ptr)) = ratFromBytes(b, c.scale)
-}
-
-func ratFromBytes(b []byte, scale int) *big.Rat {
-	num := (&big.Int{}).SetBytes(b)
-	if len(b) > 0 && b[0]&0x80 > 0 {
-		num.Sub(num, new(big.Int).Lsh(one, uint(len(b))*8))
-	}
-	denom := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
-	return new(big.Rat).SetFrac(num, denom)
 }
 
 func (c *bytesDecimalCodec) Encode(ptr unsafe.Pointer, w *Writer) {
-	r := (*big.Rat)(ptr)
-	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(c.scale)), nil)
-	i := (&big.Int{}).Mul(r.Num(), scale)
-	i = i.Div(i, r.Denom())
-
-	if numDigits, ok := checkDecimalPrecision(i, c.prec); !ok {
-		w.Error = fmt.Errorf(
-			"avro: cannot encode %v as Avro bytes.decimal with precision=%d, has %d significant digits",
-			r.FloatString(c.scale),
-			c.prec,
-			numDigits,
-		)
-		return
-	}
-
-	var b []byte
-	switch i.Sign() {
-	case 0:
-		b = []byte{0}
-
-	case 1:
-		b = i.Bytes()
-		if b[0]&0x80 > 0 {
-			b = append([]byte{0}, b...)
-		}
-
-	case -1:
-		length := uint(i.BitLen()/8+1) * 8
-		b = i.Add(i, (&big.Int{}).Lsh(one, length)).Bytes()
-	}
-	w.WriteBytes(b)
+	writeBytesDecimal(w, (*big.Rat)(ptr), c.prec, c.scale)
 }
 
 type bytesDecimalPtrCodec struct {
@@ -644,43 +748,11 @@ type bytesDecimalPtrCodec struct {
 }
 
 func (c *bytesDecimalPtrCodec) Decode(ptr unsafe.Pointer, r *Reader) {
-	b := r.ReadBytes()
-	if i := (&big.Int{}).SetBytes(b); len(b) > 0 && b[0]&0x80 > 0 {
-		i.Sub(i, new(big.Int).Lsh(one, uint(len(b))*8))
+	if value := r.readDecimal(r.ReadBytes(), c.prec, c.scale); value != nil {
+		*((**big.Rat)(ptr)) = value
 	}
-	*((**big.Rat)(ptr)) = ratFromBytes(b, c.scale)
 }
 
 func (c *bytesDecimalPtrCodec) Encode(ptr unsafe.Pointer, w *Writer) {
-	r := *((**big.Rat)(ptr))
-	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(c.scale)), nil)
-	i := (&big.Int{}).Mul(r.Num(), scale)
-	i = i.Div(i, r.Denom())
-
-	if numDigits, ok := checkDecimalPrecision(i, c.prec); !ok {
-		w.Error = fmt.Errorf(
-			"avro: cannot encode %v as Avro bytes.decimal with precision=%d, has %d significant digits",
-			r.FloatString(c.scale),
-			c.prec,
-			numDigits,
-		)
-		return
-	}
-
-	var b []byte
-	switch i.Sign() {
-	case 0:
-		b = []byte{0}
-
-	case 1:
-		b = i.Bytes()
-		if b[0]&0x80 > 0 {
-			b = append([]byte{0}, b...)
-		}
-
-	case -1:
-		length := uint(i.BitLen()/8+1) * 8
-		b = i.Add(i, (&big.Int{}).Lsh(one, length)).Bytes()
-	}
-	w.WriteBytes(b)
+	writeBytesDecimal(w, *((**big.Rat)(ptr)), c.prec, c.scale)
 }

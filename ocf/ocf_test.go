@@ -9,6 +9,8 @@ import (
 	"flag"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -585,6 +587,193 @@ func TestNewEncoder_InvalidCodec(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestNewEncoder_EmptyCodecUsesNullMetadata(t *testing.T) {
+	var data bytes.Buffer
+	encoder, err := ocf.NewEncoder(`"long"`, &data, ocf.WithCodec(""))
+	require.NoError(t, err)
+	require.NoError(t, encoder.Close())
+
+	decoder, err := ocf.NewDecoder(bytes.NewReader(data.Bytes()))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("null"), decoder.Metadata()["avro.codec"])
+}
+
+func TestNewEncoder_CompressionLevelRange(t *testing.T) {
+	for _, level := range []int{
+		flate.HuffmanOnly,
+		flate.DefaultCompression,
+		flate.NoCompression,
+		flate.BestSpeed,
+		flate.BestCompression,
+	} {
+		enc, err := ocf.NewEncoder(`"long"`, io.Discard, ocf.WithCompressionLevel(level))
+		require.NoError(t, err)
+		require.NoError(t, enc.Close())
+	}
+
+	for _, test := range []struct {
+		name  string
+		level int
+	}{
+		{name: "below minimum", level: flate.HuffmanOnly - 1},
+		{name: "above maximum", level: flate.BestCompression + 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ocf.NewEncoder(`"long"`, io.Discard, ocf.WithCompressionLevel(test.level))
+
+			assert.Error(t, err)
+		})
+	}
+}
+
+func TestNewEncoder_NilMetadata(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		opts []ocf.EncoderFunc
+		want []byte
+	}{
+		{name: "empty", opts: []ocf.EncoderFunc{ocf.WithMetadata(nil)}},
+		{
+			name: "followed by key",
+			opts: []ocf.EncoderFunc{
+				ocf.WithMetadata(nil),
+				ocf.WithMetadataKeyVal("key", []byte("value")),
+			},
+			want: []byte("value"),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var data bytes.Buffer
+			assert.NotPanics(t, func() {
+				enc, err := ocf.NewEncoder(`"long"`, &data, test.opts...)
+				require.NoError(t, err)
+				require.NoError(t, enc.Close())
+			})
+
+			dec, err := ocf.NewDecoder(bytes.NewReader(data.Bytes()))
+			require.NoError(t, err)
+			assert.Equal(t, test.want, dec.Metadata()["key"])
+		})
+	}
+}
+
+func TestConstructorsRejectNilDependencies(t *testing.T) {
+	var valid bytes.Buffer
+	enc, err := ocf.NewEncoder(`"long"`, &valid)
+	require.NoError(t, err)
+	require.NoError(t, enc.Close())
+
+	var typedNilSchema *avro.RecordSchema
+	for _, test := range []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "schema",
+			call: func() error {
+				_, err := ocf.NewEncoderWithSchema(nil, io.Discard)
+				return err
+			},
+		},
+		{
+			name: "typed nil schema",
+			call: func() error {
+				_, err := ocf.NewEncoderWithSchema(typedNilSchema, io.Discard)
+				return err
+			},
+		},
+		{
+			name: "schema marshaler",
+			call: func() error {
+				_, err := ocf.NewEncoder(`"long"`, io.Discard, ocf.WithSchemaMarshaler(nil))
+				return err
+			},
+		},
+		{
+			name: "encoding config",
+			call: func() error {
+				_, err := ocf.NewEncoder(`"long"`, io.Discard, ocf.WithEncodingConfig(nil))
+				return err
+			},
+		},
+		{
+			name: "decoding config",
+			call: func() error {
+				_, err := ocf.NewDecoder(bytes.NewReader(valid.Bytes()), ocf.WithDecoderConfig(nil))
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var err error
+			if assert.NotPanics(t, func() { err = test.call() }) {
+				assert.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestRejectsTypedNilIO(t *testing.T) {
+	var reader *bytes.Reader
+	var writer *bytes.Buffer
+
+	for _, test := range []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "decoder reader",
+			call: func() error {
+				_, err := ocf.NewDecoder(reader)
+				return err
+			},
+		},
+		{
+			name: "encoder writer",
+			call: func() error {
+				_, err := ocf.NewEncoder(`"long"`, writer)
+				return err
+			},
+		},
+		{
+			name: "reset writer",
+			call: func() error {
+				enc, err := ocf.NewEncoder(`"long"`, io.Discard)
+				if err != nil {
+					return err
+				}
+				return enc.Reset(writer)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var err error
+			if assert.NotPanics(t, func() { err = test.call() }) {
+				assert.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestConstructorsIgnoreNilOptions(t *testing.T) {
+	var encoderOption ocf.EncoderFunc
+	var data bytes.Buffer
+	var encoder *ocf.Encoder
+	var err error
+	if assert.NotPanics(t, func() {
+		encoder, err = ocf.NewEncoder(`"long"`, &data, encoderOption)
+	}) {
+		require.NoError(t, err)
+		require.NoError(t, encoder.Close())
+	}
+
+	var decoderOption ocf.DecoderFunc
+	assert.NotPanics(t, func() {
+		_, err = ocf.NewDecoder(bytes.NewReader(data.Bytes()), decoderOption)
+	})
+	assert.NoError(t, err)
+}
+
 func TestEncoder(t *testing.T) {
 	unionStr := "union value"
 	record := FullRecord{
@@ -992,6 +1181,42 @@ func TestEncoder_EncodeError(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestEncoder_EncodeRecoversAfterValueError(t *testing.T) {
+	const recordSchema = `{
+		"type":"record",
+		"name":"recoveryRecord",
+		"fields":[
+			{"name":"a","type":"long"},
+			{"name":"b","type":"long"}
+		]
+	}`
+
+	var data bytes.Buffer
+	encoder, err := ocf.NewEncoder(recordSchema, &data)
+	require.NoError(t, err)
+
+	require.NoError(t, encoder.Encode(map[string]any{"a": int64(0), "b": int64(1)}))
+	err = encoder.Encode(map[string]any{"a": int64(1), "b": "invalid"})
+	require.Error(t, err)
+	require.NoError(t, encoder.Encode(map[string]any{"a": int64(2), "b": int64(3)}))
+	require.NoError(t, encoder.Close())
+
+	decoder, err := ocf.NewDecoder(bytes.NewReader(data.Bytes()))
+	require.NoError(t, err)
+	var value struct {
+		A int64 `avro:"a"`
+		B int64 `avro:"b"`
+	}
+	for _, want := range [][2]int64{{0, 1}, {2, 3}} {
+		require.True(t, decoder.HasNext())
+		require.NoError(t, decoder.Decode(&value))
+		assert.Equal(t, want[0], value.A)
+		assert.Equal(t, want[1], value.B)
+	}
+	assert.False(t, decoder.HasNext())
+	assert.NoError(t, decoder.Error())
+}
+
 func TestEncoder_EncodeWritesBlocks(t *testing.T) {
 	buf := &bytes.Buffer{}
 	enc, _ := ocf.NewEncoder(`"long"`, buf, ocf.WithBlockLength(1))
@@ -1044,6 +1269,17 @@ func TestEncoder_CloseHandlesWriteBlockError(t *testing.T) {
 	err := enc.Close()
 
 	assert.Error(t, err)
+}
+
+func TestEncoder_CloseRetainsEarlierWriteError(t *testing.T) {
+	w := &errorBlockWriter{}
+	enc, err := ocf.NewEncoder(`"long"`, w, ocf.WithBlockLength(1))
+	require.NoError(t, err)
+	require.Error(t, enc.Encode(int64(1)))
+
+	err = enc.Close()
+
+	assert.ErrorContains(t, err, "test")
 }
 
 func TestEncodeDecodeMetadata(t *testing.T) {
@@ -1114,6 +1350,9 @@ func TestEncoder_WriteHeaderError(t *testing.T) {
 }
 
 func TestWithSchemaCache(t *testing.T) {
+	defaultFoo := avro.DefaultSchemaCache.Get("foo.bar.baz.Foo")
+	defaultFooMetadataEntry := avro.DefaultSchemaCache.Get("foo.bar.baz.FooMetadataEntry")
+
 	schema := `{
 		"type": "record",
 		"name": "Foo",
@@ -1181,8 +1420,8 @@ func TestWithSchemaCache(t *testing.T) {
 
 	assert.NotNil(t, encoderCache.Get("foo.bar.baz.Foo"))
 	assert.NotNil(t, encoderCache.Get("foo.bar.baz.FooMetadataEntry"))
-	assert.Nil(t, avro.DefaultSchemaCache.Get("foo.bar.baz.Foo"))
-	assert.Nil(t, avro.DefaultSchemaCache.Get("foo.bar.baz.FooMetadataEntry"))
+	assert.Equal(t, defaultFoo, avro.DefaultSchemaCache.Get("foo.bar.baz.Foo"))
+	assert.Equal(t, defaultFooMetadataEntry, avro.DefaultSchemaCache.Get("foo.bar.baz.FooMetadataEntry"))
 
 	decoderCache := &avro.SchemaCache{}
 	dec, err := ocf.NewDecoder(&buf, ocf.WithDecoderSchemaCache(decoderCache))
@@ -1195,8 +1434,8 @@ func TestWithSchemaCache(t *testing.T) {
 
 	assert.NotNil(t, decoderCache.Get("foo.bar.baz.Foo"))
 	assert.NotNil(t, decoderCache.Get("foo.bar.baz.FooMetadataEntry"))
-	assert.Nil(t, avro.DefaultSchemaCache.Get("foo.bar.baz.Foo"))
-	assert.Nil(t, avro.DefaultSchemaCache.Get("foo.bar.baz.FooMetadataEntry"))
+	assert.Equal(t, defaultFoo, avro.DefaultSchemaCache.Get("foo.bar.baz.Foo"))
+	assert.Equal(t, defaultFooMetadataEntry, avro.DefaultSchemaCache.Get("foo.bar.baz.FooMetadataEntry"))
 }
 
 func TestWithSchemaMarshaler(t *testing.T) {
@@ -1296,7 +1535,7 @@ func TestWithSchemaMarshaler(t *testing.T) {
 func copyToTemp(t *testing.T, src string) *os.File {
 	t.Helper()
 
-	file, err := os.CreateTemp(".", "temp-*.avro")
+	file, err := os.CreateTemp(t.TempDir(), "temp-*.avro")
 	require.NoError(t, err)
 
 	b, err := os.ReadFile(src)
@@ -1494,6 +1733,50 @@ func TestEncoder_ResetWithPendingData(t *testing.T) {
 	assert.Equal(t, int64(42), got)
 }
 
+func TestEncoder_ResetClearsEarlierWriterError(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		fail func(*testing.T) *ocf.Encoder
+	}{
+		{
+			name: "data block",
+			fail: func(t *testing.T) *ocf.Encoder {
+				encoder, err := ocf.NewEncoder(`"long"`, &errorBlockWriter{}, ocf.WithBlockLength(1))
+				require.NoError(t, err)
+				require.Error(t, encoder.Encode(int64(1)))
+				return encoder
+			},
+		},
+		{
+			name: "reset header",
+			fail: func(t *testing.T) *ocf.Encoder {
+				encoder, err := ocf.NewEncoder(`"long"`, io.Discard)
+				require.NoError(t, err)
+				require.Error(t, encoder.Reset(&errorHeaderWriter{}))
+				return encoder
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			encoder := test.fail(t)
+
+			var data bytes.Buffer
+			require.NoError(t, encoder.Reset(&data))
+			require.NoError(t, encoder.Encode(int64(7)))
+			require.NoError(t, encoder.Close())
+
+			decoder, err := ocf.NewDecoder(bytes.NewReader(data.Bytes()))
+			require.NoError(t, err)
+			require.True(t, decoder.HasNext())
+			var value int64
+			require.NoError(t, decoder.Decode(&value))
+			assert.Equal(t, int64(7), value)
+			assert.False(t, decoder.HasNext())
+			assert.NoError(t, decoder.Error())
+		})
+	}
+}
+
 // TestEncoder_ResetGeneratesNewSyncMarker tests that each reset creates a new sync marker.
 func TestEncoder_ResetGeneratesNewSyncMarker(t *testing.T) {
 	buf1 := &bytes.Buffer{}
@@ -1639,6 +1922,41 @@ func TestEncoder_AppendToExistingFile(t *testing.T) {
 	assert.Equal(t, record2, records[1])
 }
 
+func TestEncoder_AppendToFilePositionedAtEnd(t *testing.T) {
+	dir, err := os.MkdirTemp("../../../../tmp", "audit-avro-ocf-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	file, err := os.Create(filepath.Join(dir, "append.avro"))
+	require.NoError(t, err)
+
+	encoder, err := ocf.NewEncoder(`"long"`, file)
+	require.NoError(t, err)
+	require.NoError(t, encoder.Encode(int64(1)))
+	require.NoError(t, encoder.Close())
+	_, err = file.Seek(0, io.SeekEnd)
+	require.NoError(t, err)
+
+	encoder, err = ocf.NewEncoder(`"long"`, file)
+	require.NoError(t, err)
+	require.NoError(t, encoder.Encode(int64(2)))
+	require.NoError(t, encoder.Close())
+	_, err = file.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+
+	decoder, err := ocf.NewDecoder(file)
+	require.NoError(t, err)
+	for _, want := range []int64{1, 2} {
+		require.True(t, decoder.HasNext())
+		var got int64
+		require.NoError(t, decoder.Decode(&got))
+		assert.Equal(t, want, got)
+	}
+	assert.False(t, decoder.HasNext())
+	assert.NoError(t, decoder.Error())
+	require.NoError(t, file.Close())
+}
+
 // TestEncoder_ResetPreservesCodec tests that codec is preserved across reset.
 func TestEncoder_ResetPreservesCodec(t *testing.T) {
 	buf1 := &bytes.Buffer{}
@@ -1699,6 +2017,141 @@ func TestDecoder_DefaultResourceLimits(t *testing.T) {
 	})
 }
 
+func TestDecoder_SkipsEmptyBlocks(t *testing.T) {
+	original := buildSecurityOCF(t, ocf.Null)
+	headerEnd, sync := securityOCFHeaderEnd(t, original)
+
+	var data bytes.Buffer
+	data.Write(original[:headerEnd])
+	writeSecurityLong(&data, 0)
+	writeSecurityLong(&data, 0)
+	data.Write(sync)
+	data.Write(original[headerEnd:])
+
+	decoder, err := ocf.NewDecoder(bytes.NewReader(data.Bytes()))
+	require.NoError(t, err)
+	require.True(t, decoder.HasNext())
+
+	var value int64
+	require.NoError(t, decoder.Decode(&value))
+	assert.Equal(t, int64(7), value)
+	assert.False(t, decoder.HasNext())
+	assert.NoError(t, decoder.Error())
+}
+
+func TestDecoder_RejectsExcessBlockData(t *testing.T) {
+	for _, codec := range []ocf.CodecName{ocf.Null, ocf.Deflate, ocf.Snappy, ocf.ZStandard} {
+		for _, records := range []int{2, 1025} {
+			var data bytes.Buffer
+			encoder, err := ocf.NewEncoder(`"long"`, &data, ocf.WithCodec(codec), ocf.WithBlockLength(2048))
+			require.NoError(t, err)
+			for i := range records {
+				require.NoError(t, encoder.Encode(int64(i)))
+			}
+			require.NoError(t, encoder.Close())
+			for _, count := range []int64{0, 1} {
+				t.Run(string(codec)+"/"+strconv.Itoa(records)+"/"+strconv.FormatInt(count, 10), func(t *testing.T) {
+					decoder, err := ocf.NewDecoder(bytes.NewReader(replaceOCFCount(t, data.Bytes(), count)))
+					require.NoError(t, err)
+					t.Cleanup(func() { require.NoError(t, decoder.Close()) })
+					if count == 0 {
+						require.False(t, decoder.HasNext())
+					} else {
+						require.True(t, decoder.HasNext())
+						var value int64
+						require.Error(t, decoder.Decode(&value), "block count hid additional serialized records")
+					}
+					require.Error(t, decoder.Error())
+					require.False(t, decoder.HasNext(), "invalid block remained readable")
+				})
+			}
+		}
+	}
+}
+
+func replaceOCFCount(t *testing.T, data []byte, count int64) []byte {
+	t.Helper()
+	headerEnd, _ := securityOCFHeaderEnd(t, data)
+	_, size := binary.Uvarint(data[headerEnd:])
+	require.Greater(t, size, 0)
+	var result bytes.Buffer
+	result.Write(data[:headerEnd])
+	writeSecurityLong(&result, count)
+	result.Write(data[headerEnd+size:])
+	return result.Bytes()
+}
+
+func TestDecoder_ZeroWidthBlockRecords(t *testing.T) {
+	for _, codec := range []ocf.CodecName{ocf.Null, ocf.Deflate, ocf.Snappy, ocf.ZStandard} {
+		t.Run(string(codec), func(t *testing.T) {
+			var data bytes.Buffer
+			encoder, err := ocf.NewEncoder(`"null"`, &data, ocf.WithCodec(codec))
+			require.NoError(t, err)
+			for range 3 {
+				require.NoError(t, encoder.Encode(nil))
+			}
+			require.NoError(t, encoder.Close())
+
+			// A valid empty block may precede multiple zero-width record blocks.
+			empty := replaceOCFCount(t, data.Bytes(), 0)
+			headerEnd, _ := securityOCFHeaderEnd(t, data.Bytes())
+			empty = append(empty, data.Bytes()[headerEnd:]...)
+			empty = append(empty, data.Bytes()[headerEnd:]...)
+			decoder, err := ocf.NewDecoder(bytes.NewReader(empty))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, decoder.Close()) })
+			for range 6 {
+				require.True(t, decoder.HasNext())
+				var value any
+				require.NoError(t, decoder.Decode(&value), "the block count frames a zero-width datum")
+				require.Nil(t, value)
+			}
+			require.False(t, decoder.HasNext())
+			require.NoError(t, decoder.Error())
+		})
+	}
+}
+
+func TestDecoder_BlockBoundaries(t *testing.T) {
+	for _, codec := range []ocf.CodecName{ocf.Null, ocf.Deflate, ocf.Snappy, ocf.ZStandard} {
+		t.Run(string(codec), func(t *testing.T) {
+			var data bytes.Buffer
+			encoder, err := ocf.NewEncoder(`"long"`, &data, ocf.WithCodec(codec), ocf.WithBlockLength(3))
+			require.NoError(t, err)
+			for i := range 7 {
+				require.NoError(t, encoder.Encode(int64(i)))
+			}
+			require.NoError(t, encoder.Close())
+			decoder, err := ocf.NewDecoder(bytes.NewReader(data.Bytes()))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, decoder.Close()) })
+			for i := range 7 {
+				require.True(t, decoder.HasNext())
+				var value int64
+				require.NoError(t, decoder.Decode(&value))
+				require.Equal(t, int64(i), value)
+			}
+			for range 2 {
+				require.False(t, decoder.HasNext())
+				require.NoError(t, decoder.Error())
+			}
+		})
+	}
+}
+
+func TestDecoder_RecordErrorIsSticky(t *testing.T) {
+	data := replaceSecurityOCFPayload(t, buildSecurityOCF(t, ocf.Null), []byte{0x80})
+	decoder, err := ocf.NewDecoder(bytes.NewReader(data))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, decoder.Close()) })
+	require.True(t, decoder.HasNext())
+	var value int64
+	require.Error(t, decoder.Decode(&value))
+	require.Error(t, decoder.Error(), "record failure was hidden from the OCF error state")
+	require.False(t, decoder.HasNext())
+	require.Equal(t, decoder.Error(), decoder.Decode(&value))
+}
+
 func TestDecoder_RejectsDeflateDecompressionBomb(t *testing.T) {
 	original := buildSecurityOCF(t, ocf.Deflate)
 
@@ -1719,6 +2172,21 @@ func TestDecoder_RejectsDeflateDecompressionBomb(t *testing.T) {
 	assert.False(t, decoder.HasNext())
 	require.Error(t, decoder.Error())
 	assert.ErrorContains(t, decoder.Error(), "decompressed size exceeds")
+}
+
+func TestDecoder_AppliesDecompressedLimitToNullCodec(t *testing.T) {
+	original := buildSecurityOCF(t, ocf.Null)
+	hostile := replaceSecurityOCFPayload(t, original, []byte{0x80, 0x01})
+	decoder, err := ocf.NewDecoder(
+		bytes.NewReader(hostile),
+		ocf.WithMaxBlockBytes(-1),
+		ocf.WithMaxDecompressedBlockBytes(1),
+	)
+	require.NoError(t, err)
+
+	assert.False(t, decoder.HasNext())
+	require.Error(t, decoder.Error())
+	assert.ErrorContains(t, decoder.Error(), "decompressed size")
 }
 
 func TestDecoder_AppliesConfigToHeader(t *testing.T) {

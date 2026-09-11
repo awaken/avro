@@ -15,6 +15,60 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type nilAPI struct {
+	avro.API
+}
+
+func TestNewDecoder_NilOption(t *testing.T) {
+	client, err := registry.NewClient("http://example.com")
+	require.NoError(t, err)
+
+	var decoder *registry.Decoder
+	require.NotPanics(t, func() {
+		decoder = registry.NewDecoder(client, nil)
+	})
+	require.NotNil(t, decoder)
+}
+
+func TestDecoder_DecodeNilClient(t *testing.T) {
+	decoder := registry.NewDecoder(nil)
+
+	var err error
+	require.NotPanics(t, func() {
+		err = decoder.Decode(context.Background(), []byte{0, 0, 0, 0, 1}, new(any))
+	})
+	require.ErrorContains(t, err, "registry client cannot be nil")
+}
+
+func TestDecoder_DecodeNilAPI(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"schema":"null"}`))
+	}))
+	t.Cleanup(srv.Close)
+	client, err := registry.NewClient(srv.URL)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name string
+		api  avro.API
+	}{
+		{name: "nil", api: nil},
+		{name: "typed nil", api: (*nilAPI)(nil)},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			decoder := registry.NewDecoder(client, registry.WithAPI(test.api))
+
+			var decodeErr error
+			require.NotPanics(t, func() {
+				decodeErr = decoder.Decode(context.Background(), []byte{0, 0, 0, 0, 1}, new(any))
+			})
+			require.ErrorContains(t, decodeErr, "avro API cannot be nil")
+		})
+	}
+}
+
 func TestDecoder_Decode(t *testing.T) {
 	tests := []struct {
 		name    string

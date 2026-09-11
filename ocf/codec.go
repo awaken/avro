@@ -29,6 +29,8 @@ type codecOptions struct {
 	DeflateCompressionLevel int
 	ZStandardOptions        zstdOptions
 	MaxDecompressedBytes    int
+	// factory permits per-constructor ownership instrumentation without globals.
+	factory func(CodecName, codecOptions) (Codec, error)
 }
 
 type zstdOptions struct {
@@ -41,11 +43,19 @@ type zstdOptions struct {
 }
 
 func resolveCodec(name CodecName, codecOpts codecOptions) (Codec, error) {
+	if factory := codecOpts.factory; factory != nil {
+		codecOpts.factory = nil
+		return factory(name, codecOpts)
+	}
+
 	switch name {
 	case Null, "":
-		return &NullCodec{}, nil
+		return &NullCodec{maxDecompressed: codecOpts.MaxDecompressedBytes}, nil
 
 	case Deflate:
+		if level := codecOpts.DeflateCompressionLevel; level < flate.HuffmanOnly || level > flate.BestCompression {
+			return nil, fmt.Errorf("deflate: invalid compression level %d", level)
+		}
 		return &DeflateCodec{
 			compLvl:         codecOpts.DeflateCompressionLevel,
 			maxDecompressed: codecOpts.MaxDecompressedBytes,
@@ -55,7 +65,11 @@ func resolveCodec(name CodecName, codecOpts codecOptions) (Codec, error) {
 		return &SnappyCodec{maxDecompressed: codecOpts.MaxDecompressedBytes}, nil
 
 	case ZStandard:
-		return newZStandardCodec(codecOpts.ZStandardOptions, codecOpts.MaxDecompressedBytes)
+		codec, err := newZStandardCodec(codecOpts.ZStandardOptions, codecOpts.MaxDecompressedBytes)
+		if err != nil {
+			return nil, err
+		}
+		return codec, nil
 
 	default:
 		return nil, fmt.Errorf("unknown codec %s", name)
@@ -71,10 +85,15 @@ type Codec interface {
 }
 
 // NullCodec is a no op codec.
-type NullCodec struct{}
+type NullCodec struct {
+	maxDecompressed int
+}
 
 // Decode decodes the given bytes.
-func (*NullCodec) Decode(b []byte) ([]byte, error) {
+func (c *NullCodec) Decode(b []byte) ([]byte, error) {
+	if c.maxDecompressed > 0 && len(b) > c.maxDecompressed {
+		return nil, fmt.Errorf("null: decompressed size %d exceeds %d bytes", len(b), c.maxDecompressed)
+	}
 	return b, nil
 }
 

@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"fmt"
 	"io"
 	"sync"
 
@@ -48,8 +49,11 @@ type Config struct {
 	// call to Marshal() and Unmarshal()
 	DisableCaching bool
 
-	// MaxByteSliceSize is the maximum size of `bytes` or `string` types the Reader will create, defaulting to 1MiB.
-	// If this size is exceeded, the Reader returns an error. This can be disabled by setting a negative number.
+	// MaxByteSliceSize bounds decoded bytes/strings and encoded or decoded fixed values.
+	// It defaults to 1 MiB; a negative value disables this limit. Fixed values are
+	// checked before reflection, allocation or skipping, including logical types.
+	// Decimal conversion also bounds operands, scale powers and encoded bytes;
+	// intermediate arithmetic can use several times this amount of memory.
 	MaxByteSliceSize int
 
 	// MaxSliceAllocSize is the maximum number of elements the decoder will add to one slice.
@@ -63,7 +67,7 @@ type Config struct {
 	MaxMapAllocSize int
 }
 
-// Freeze makes the configuration immutable.
+// Freeze makes the configuration immutable. The returned API also implements ExactUnmarshaler.
 func (c Config) Freeze() API {
 	api := &frozenConfig{
 		config:         c,
@@ -130,6 +134,14 @@ type API interface {
 	NamesOf(typ reflect2.Type) ([]string, error)
 }
 
+// ExactUnmarshaler decodes one datum and rejects any unconsumed input bytes.
+// Config.Freeze implements it. API wrappers used for framed decoding must expose
+// this capability explicitly; ordinary Unmarshal may accept trailing bytes.
+// The destination must be a non-nil pointer and may be partly populated on error.
+type ExactUnmarshaler interface {
+	UnmarshalExact(schema Schema, data []byte, v any) error
+}
+
 type frozenConfig struct {
 	config Config
 
@@ -174,6 +186,15 @@ func (c *frozenConfig) returnWriter(writer *Writer) {
 }
 
 func (c *frozenConfig) Unmarshal(schema Schema, data []byte, v any) error {
+	return c.unmarshal(schema, data, v, false)
+}
+
+// UnmarshalExact decodes one datum into v and requires complete input consumption.
+func (c *frozenConfig) UnmarshalExact(schema Schema, data []byte, v any) error {
+	return c.unmarshal(schema, data, v, true)
+}
+
+func (c *frozenConfig) unmarshal(schema Schema, data []byte, v any, exact bool) error {
 	reader := c.borrowReader(data)
 	defer c.returnReader(reader)
 
@@ -182,9 +203,11 @@ func (c *frozenConfig) Unmarshal(schema Schema, data []byte, v any) error {
 
 	//nolint:errorlint // Only a direct EOF represents an empty zero-width value.
 	if err == io.EOF {
-		return nil
+		err = nil
 	}
-
+	if err == nil && exact && reader.head != reader.tail {
+		return fmt.Errorf("avro: %d trailing bytes after datum", reader.tail-reader.head)
+	}
 	return err
 }
 
@@ -195,7 +218,7 @@ func (c *frozenConfig) borrowReader(data []byte) *Reader {
 }
 
 func (c *frozenConfig) returnReader(reader *Reader) {
-	reader.Error = nil
+	reader.Reset(nil)
 	c.readerPool.Put(reader)
 }
 
@@ -237,21 +260,30 @@ func (c *frozenConfig) NamesOf(typ reflect2.Type) ([]string, error) {
 type cacheKey struct {
 	fingerprint [32]byte
 	rtype       uintptr
+	instance    Schema
 }
 
-func (c *frozenConfig) addDecoderToCache(fingerprint [32]byte, rtype uintptr, dec ValDecoder) {
+func (c *frozenConfig) newCacheKey(schema Schema, rtype uintptr) cacheKey {
+	key := cacheKey{fingerprint: schema.CacheFingerprint(), rtype: rtype}
+	if c.typeConverters.hasRegistered() {
+		key.instance = schema
+	}
+	return key
+}
+
+func (c *frozenConfig) addDecoderToCache(schema Schema, rtype uintptr, dec ValDecoder) {
 	if c.config.DisableCaching {
 		return
 	}
-	key := cacheKey{fingerprint: fingerprint, rtype: rtype}
+	key := c.newCacheKey(schema, rtype)
 	c.decoderCache.Store(key, dec)
 }
 
-func (c *frozenConfig) getDecoderFromCache(fingerprint [32]byte, rtype uintptr) ValDecoder {
+func (c *frozenConfig) getDecoderFromCache(schema Schema, rtype uintptr) ValDecoder {
 	if c.config.DisableCaching {
 		return nil
 	}
-	key := cacheKey{fingerprint: fingerprint, rtype: rtype}
+	key := c.newCacheKey(schema, rtype)
 	if dec, ok := c.decoderCache.Load(key); ok {
 		return dec.(ValDecoder)
 	}
@@ -259,19 +291,19 @@ func (c *frozenConfig) getDecoderFromCache(fingerprint [32]byte, rtype uintptr) 
 	return nil
 }
 
-func (c *frozenConfig) addEncoderToCache(fingerprint [32]byte, rtype uintptr, enc ValEncoder) {
+func (c *frozenConfig) addEncoderToCache(schema Schema, rtype uintptr, enc ValEncoder) {
 	if c.config.DisableCaching {
 		return
 	}
-	key := cacheKey{fingerprint: fingerprint, rtype: rtype}
+	key := c.newCacheKey(schema, rtype)
 	c.encoderCache.Store(key, enc)
 }
 
-func (c *frozenConfig) getEncoderFromCache(fingerprint [32]byte, rtype uintptr) ValEncoder {
+func (c *frozenConfig) getEncoderFromCache(schema Schema, rtype uintptr) ValEncoder {
 	if c.config.DisableCaching {
 		return nil
 	}
-	key := cacheKey{fingerprint: fingerprint, rtype: rtype}
+	key := c.newCacheKey(schema, rtype)
 	if enc, ok := c.encoderCache.Load(key); ok {
 		return enc.(ValEncoder)
 	}

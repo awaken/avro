@@ -399,12 +399,6 @@ func TestIsValidDefault(t *testing.T) {
 	}
 }
 
-func TestRecursionError_Error(t *testing.T) {
-	err := recursionError{}
-
-	assert.Equal(t, "", err.Error())
-}
-
 func TestValidateDefault_ErrorReportsOriginalValue(t *testing.T) {
 	union, err := NewUnionSchema([]Schema{NewNullSchema(), NewPrimitiveSchema(String, nil)})
 	require.NoError(t, err)
@@ -466,6 +460,46 @@ func TestNewRecordSchema_RejectsInvalidFields(t *testing.T) {
 
 	_, err = NewRecordSchema("R", "", []*Field{nil})
 	assert.Error(t, err)
+}
+
+func TestSchemaConstructorsRejectNilMembers(t *testing.T) {
+	var typedNil *PrimitiveSchema
+	for _, schema := range []Schema{nil, typedNil} {
+		field, err := NewField("value", schema)
+		assert.Nil(t, field)
+		assert.EqualError(t, err, "avro: field type cannot be nil")
+
+		var union *UnionSchema
+		assert.NotPanics(t, func() {
+			union, err = NewUnionSchema([]Schema{schema})
+		})
+		assert.Nil(t, union)
+		assert.EqualError(t, err, "avro: union type cannot contain nil")
+	}
+}
+
+func TestSchemaConstructorsTreatTypedNilLogicalAsAbsent(t *testing.T) {
+	var logical *PrimitiveLogicalSchema
+
+	t.Run("primitive", func(t *testing.T) {
+		var primitive *PrimitiveSchema
+		assert.NotPanics(t, func() {
+			primitive = NewPrimitiveSchema(Int, logical)
+		})
+		require.NotNil(t, primitive)
+		assert.Nil(t, primitive.Logical())
+	})
+
+	t.Run("fixed", func(t *testing.T) {
+		var fixed *FixedSchema
+		var err error
+		assert.NotPanics(t, func() {
+			fixed, err = NewFixedSchema("F", "", 1, logical)
+		})
+		require.NoError(t, err)
+		require.NotNil(t, fixed)
+		assert.Nil(t, fixed.Logical())
+	})
 }
 
 func TestSchema_CollectionsAndDefaultsAreSnapshots(t *testing.T) {

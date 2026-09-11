@@ -2,6 +2,8 @@ package avro_test
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"testing"
 
 	"github.com/awaken/avro/v2"
@@ -550,6 +552,80 @@ func TestEncoder_RecordMapWithUnionStringDefault(t *testing.T) {
 	assert.Equal(t, []byte{0x0, 0x8, 0x74, 0x65, 0x73, 0x74, 0x6, 0x66, 0x6f, 0x6f}, buf.Bytes())
 }
 
+func TestEncoder_RecordMapWithUnionRecordDefault(t *testing.T) {
+	schema := avro.MustParse(`{
+		"type":"record",
+		"name":"parent",
+		"fields":[{
+			"name":"child",
+			"type":[
+				{"type":"record","name":"child","fields":[{"name":"value","type":"int"}]},
+				"null"
+			],
+			"default":{"value":7}
+		}]
+	}`)
+
+	data, err := avro.Marshal(schema, map[string]any{})
+	require.NoError(t, err)
+	assert.Equal(t, []byte{0, 14}, data)
+}
+
+func TestEncoder_RecordMapWithLaterUnionDefault(t *testing.T) {
+	schema := avro.MustParse(`{
+		"type":"record",
+		"name":"parent",
+		"fields":[{
+			"name":"value",
+			"type":["int","string"],
+			"default":"test"
+		}]
+	}`)
+
+	data, err := avro.Marshal(schema, map[string]any{})
+	require.NoError(t, err)
+	assert.Equal(t, []byte{2, 8, 't', 'e', 's', 't'}, data)
+}
+
+func TestEncoder_RecordStructWithUnionRecordDefault(t *testing.T) {
+	schema := avro.MustParse(`{
+		"type":"record",
+		"name":"parent",
+		"fields":[{
+			"name":"child",
+			"type":[
+				{"type":"record","name":"child","fields":[{"name":"value","type":"int"}]},
+				"null"
+			],
+			"default":{"value":7}
+		}]
+	}`)
+
+	data, err := avro.Marshal(schema, struct{}{})
+	require.NoError(t, err)
+	assert.Equal(t, []byte{0, 14}, data)
+}
+
+func TestEncoder_RecordStructWithNullDefaultInMultiUnion(t *testing.T) {
+	schema := avro.MustParse(`{
+		"type":"record",
+		"name":"parent",
+		"fields":[{
+			"name":"value",
+			"type":["int","string","null"],
+			"default":null
+		}]
+	}`)
+	var data []byte
+	var err error
+
+	assert.NotPanics(t, func() {
+		data, err = avro.Marshal(schema, struct{}{})
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []byte{4}, data)
+}
+
 func TestEncoder_RecordMapInvalidKeyType(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -622,4 +698,75 @@ func TestEncoder_RefStruct(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, []byte{0x36, 0x06, 0x66, 0x6f, 0x6f, 0x36, 0x06, 0x66, 0x6f, 0x6f}, buf.Bytes())
+}
+
+type recordMarshalCounter struct {
+	calls *int
+	err   error
+}
+
+func (m recordMarshalCounter) MarshalText() ([]byte, error) {
+	*m.calls++
+	return nil, m.err
+}
+
+type recordMarshalCounters struct {
+	First  recordMarshalCounter `avro:"first"`
+	Second recordMarshalCounter `avro:"second"`
+}
+
+func TestEncoder_RecordStopsAfterFieldError(t *testing.T) {
+	schema := avro.MustParse(`{
+		"type":"record",
+		"name":"counters",
+		"fields":[
+			{"name":"first","type":"string"},
+			{"name":"second","type":"string"}
+		]
+	}`)
+
+	values := []struct {
+		name  string
+		value func(*int, error) any
+	}{
+		{
+			name: "struct",
+			value: func(calls *int, err error) any {
+				return recordMarshalCounters{
+					First:  recordMarshalCounter{calls: calls, err: err},
+					Second: recordMarshalCounter{calls: calls, err: err},
+				}
+			},
+		},
+		{
+			name: "map",
+			value: func(calls *int, err error) any {
+				return map[string]any{
+					"first":  recordMarshalCounter{calls: calls, err: err},
+					"second": recordMarshalCounter{calls: calls, err: err},
+				}
+			},
+		},
+	}
+	errors := []struct {
+		name string
+		err  error
+	}{
+		{name: "ordinary error", err: errors.New("test")},
+		{name: "EOF", err: io.EOF},
+	}
+
+	for _, value := range values {
+		for _, testErr := range errors {
+			t.Run(value.name+"/"+testErr.name, func(t *testing.T) {
+				calls := 0
+				enc := avro.Config{}.Freeze().NewEncoder(schema, bytes.NewBuffer(nil))
+
+				err := enc.Encode(value.value(&calls, testErr.err))
+
+				require.ErrorIs(t, err, testErr.err)
+				assert.Equal(t, 1, calls)
+			})
+		}
+	}
 }

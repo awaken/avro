@@ -63,3 +63,35 @@ func TestMarshal_Error(t *testing.T) {
 
 	assert.Error(t, err)
 }
+
+func TestEncoder_NilSchemaReturnsError(t *testing.T) {
+	var typedNil *avro.PrimitiveSchema
+	tests := []struct {
+		name   string
+		schema avro.Schema
+	}{
+		{name: "nil interface"},
+		{name: "typed nil", schema: typedNil},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name+"/stream", func(t *testing.T) {
+			enc := avro.NewEncoderForSchema(test.schema, bytes.NewBuffer(nil))
+			var err error
+
+			assert.NotPanics(t, func() {
+				err = enc.Encode(true)
+			})
+			assert.Error(t, err)
+		})
+
+		t.Run(test.name+"/marshal", func(t *testing.T) {
+			var err error
+
+			assert.NotPanics(t, func() {
+				_, err = avro.Marshal(test.schema, true)
+			})
+			assert.Error(t, err)
+		})
+	}
+}

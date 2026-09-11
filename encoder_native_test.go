@@ -626,10 +626,10 @@ func TestEncoder_Duration_TimeMillis(t *testing.T) {
 	enc, err := avro.NewEncoder(schema, buf)
 	require.NoError(t, err)
 
-	err = enc.Encode(123456789 * time.Millisecond)
+	err = enc.Encode(12345678 * time.Millisecond)
 
 	require.NoError(t, err)
-	assert.Equal(t, []byte{0xAA, 0xB4, 0xDE, 0x75}, buf.Bytes())
+	assert.Equal(t, []byte{0x9C, 0x85, 0xE3, 0x0B}, buf.Bytes())
 }
 
 func TestEncoder_Duration_TimeMicros(t *testing.T) {
@@ -640,10 +640,10 @@ func TestEncoder_Duration_TimeMicros(t *testing.T) {
 	enc, err := avro.NewEncoder(schema, buf)
 	require.NoError(t, err)
 
-	err = enc.Encode(123456789123 * time.Microsecond)
+	err = enc.Encode(12345678123 * time.Microsecond)
 
 	require.NoError(t, err)
-	assert.Equal(t, []byte{0x86, 0xEA, 0xC8, 0xE9, 0x97, 0x07}, buf.Bytes())
+	assert.Equal(t, []byte{0xD6, 0xE4, 0xE0, 0xFD, 0x5B}, buf.Bytes())
 }
 
 func TestEncoder_Duration_InvalidLogicalType(t *testing.T) {
@@ -654,7 +654,7 @@ func TestEncoder_Duration_InvalidLogicalType(t *testing.T) {
 	enc, err := avro.NewEncoder(schema, buf)
 	require.NoError(t, err)
 
-	err = enc.Encode(123456789123 * time.Microsecond)
+	err = enc.Encode(12345678123 * time.Microsecond)
 
 	assert.Error(t, err)
 }
@@ -714,6 +714,23 @@ func TestEncoder_BytesRat_Zero(t *testing.T) {
 	assert.Equal(t, []byte{0x02, 0x00}, buf.Bytes())
 }
 
+func TestEncoder_BytesRat_Nil(t *testing.T) {
+	defer ConfigTeardown()
+
+	schema := `{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`
+	buf := bytes.NewBuffer([]byte{})
+	enc, err := avro.NewEncoder(schema, buf)
+	require.NoError(t, err)
+
+	var rat *big.Rat
+	assert.NotPanics(t, func() {
+		err = enc.Encode(rat)
+	})
+
+	assert.ErrorContains(t, err, "cannot encode nil pointer")
+	assert.Empty(t, buf.Bytes())
+}
+
 func TestEncoder_BytesRat_TooManyDigits(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -724,7 +741,7 @@ func TestEncoder_BytesRat_TooManyDigits(t *testing.T) {
 
 	err = enc.Encode(big.NewRat(1734, 5))
 
-	assert.ErrorContains(t, err, "avro: cannot encode 346.80 as Avro bytes.decimal with precision=3, has 5 significant digits")
+	assert.ErrorContains(t, err, "avro: decimal exceeds precision=3, has 5 significant digits")
 	assert.Empty(t, buf.Bytes())
 }
 
@@ -780,7 +797,40 @@ func TestEncoder_BytesRatNonPtr_TooManyDigits(t *testing.T) {
 
 	err = enc.Encode(*big.NewRat(1734, 5))
 
-	assert.ErrorContains(t, err, "avro: cannot encode 346.80 as Avro bytes.decimal with precision=3, has 5 significant digits")
+	assert.ErrorContains(t, err, "avro: decimal exceeds precision=3, has 5 significant digits")
+	assert.Empty(t, buf.Bytes())
+}
+
+func TestEncoder_BytesRatNonPtrInvalidSchema(t *testing.T) {
+	defer ConfigTeardown()
+
+	schema := `{"type":"int"}`
+	buf := bytes.NewBuffer([]byte{})
+	enc, err := avro.NewEncoder(schema, buf)
+	require.NoError(t, err)
+
+	assert.NotPanics(t, func() {
+		err = enc.Encode(*big.NewRat(1734, 5))
+	})
+	assert.Error(t, err)
+	assert.Empty(t, buf.Bytes())
+}
+
+func TestEncoder_BytesDecimalRejectsUnrelatedStruct(t *testing.T) {
+	defer ConfigTeardown()
+
+	type wrappedRat struct {
+		big.Rat
+	}
+
+	schema := `{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`
+	buf := bytes.NewBuffer([]byte{})
+	enc, err := avro.NewEncoder(schema, buf)
+	require.NoError(t, err)
+
+	err = enc.Encode(wrappedRat{Rat: *big.NewRat(1734, 5)})
+
+	assert.Error(t, err)
 	assert.Empty(t, buf.Bytes())
 }
 
@@ -808,4 +858,29 @@ func TestEncoder_BytesRatInvalidLogicalSchema(t *testing.T) {
 	err = enc.Encode(big.NewRat(1734, 5))
 
 	assert.Error(t, err)
+}
+
+func TestEncoderBytesProgrammaticInvalidDecimal(t *testing.T) {
+	tests := []struct {
+		name    string
+		logical avro.LogicalSchema
+	}{
+		{name: "invalid parameters", logical: avro.NewDecimalLogicalSchema(0, 0)},
+		{name: "custom implementation", logical: customDecimalLogicalSchema{}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			schema := avro.NewPrimitiveSchema(avro.Bytes, test.logical)
+			var data bytes.Buffer
+			var err error
+
+			assert.NotPanics(t, func() {
+				err = avro.NewEncoderForSchema(schema, &data).Encode(big.NewRat(1, 1))
+			})
+
+			require.Error(t, err)
+			assert.Empty(t, data.Bytes())
+		})
+	}
 }

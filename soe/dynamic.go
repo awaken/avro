@@ -37,6 +37,7 @@ func NewDynamicDecoder(resolver SchemaResolver) *DynamicDecoder {
 
 // NewDynamicDecoderWithAPI returns a new DynamicDecoder for the given resolver
 // and API.
+// Decoding requires the API to implement avro.ExactUnmarshaler.
 func NewDynamicDecoderWithAPI(resolver SchemaResolver, api avro.API) *DynamicDecoder {
 	return &DynamicDecoder{
 		api:      api,
@@ -45,15 +46,23 @@ func NewDynamicDecoderWithAPI(resolver SchemaResolver, api avro.API) *DynamicDec
 }
 
 // Decode unmarshals a value from SOE-encoded Avro binary using the schema
-// specified in the SOE header. Fails if schema is not known to resolver.
+// specified in the SOE header. It rejects unknown schemas and trailing payload bytes.
 func (d *DynamicDecoder) Decode(ctx context.Context, data []byte, v any) error {
 	fingerprint, data, err := ParseHeader(data)
 	if err != nil {
 		return err
 	}
+	if isNilValue(d.resolver) {
+		return errors.New("resolver cannot be nil")
+	}
+
 	schema, err := d.resolver.GetSchema(ctx, fingerprint)
 	if err != nil {
 		return fmt.Errorf("resolver: %w", err)
 	}
-	return d.api.Unmarshal(schema, data, v)
+	if isNilValue(d.api) {
+		return errors.New("API cannot be nil")
+	}
+
+	return decodeExact(d.api, schema, data, v)
 }

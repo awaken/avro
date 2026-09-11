@@ -2,7 +2,9 @@ package avro
 
 import (
 	"errors"
+	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 var errNoTypeConverter = errors.New("no type converter")
@@ -29,7 +31,8 @@ type specificType struct {
 
 // TypeConverters holds the user-provided type conversion functions.
 type TypeConverters struct {
-	convs sync.Map // map[specificType]TypeConverter
+	convs      sync.Map // map[specificType]TypeConverter
+	registered atomic.Bool
 }
 
 // NewTypeConverters creates a new type converter.
@@ -40,10 +43,34 @@ func NewTypeConverters() *TypeConverters {
 // RegisterTypeConverters registers type converters for converting the data types during encoding and decoding.
 func (c *TypeConverters) RegisterTypeConverters(convs ...TypeConverter) {
 	for _, conv := range convs {
-		if typ := conv.Type(); len(typ) == 0 {
+		if isNilTypeConverter(conv) {
 			continue
 		}
-		c.convs.Store(specificType{typ: conv.Type(), lt: conv.LogicalType()}, conv)
+		typ := conv.Type()
+		if len(typ) == 0 {
+			continue
+		}
+		lt := conv.LogicalType()
+		c.registered.Store(true)
+		c.convs.Store(specificType{typ: typ, lt: lt}, conv)
+	}
+}
+
+func (c *TypeConverters) hasRegistered() bool {
+	return c.registered.Load()
+}
+
+func isNilTypeConverter(conv TypeConverter) bool {
+	if conv == nil {
+		return true
+	}
+
+	v := reflect.ValueOf(conv)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
 	}
 }
 
@@ -68,6 +95,10 @@ func (c *TypeConverters) DecodeTypeConvert(in any, schema Schema) (any, error) {
 }
 
 func (c *TypeConverters) getTypeConverter(schema Schema) (TypeConverter, bool) {
+	if isNilSchema(schema) {
+		return nil, false
+	}
+
 	typ := schema.Type()
 	lt := getLogicalType(schema)
 	conv, ok := c.convs.Load(specificType{typ: typ, lt: lt})

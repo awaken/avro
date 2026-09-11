@@ -26,6 +26,19 @@ func TestEncoder_UnionMap(t *testing.T) {
 	assert.Equal(t, []byte{0x02, 0x06, 0x66, 0x6F, 0x6F}, buf.Bytes())
 }
 
+func TestEncoder_UnionMapRejectsNonEmptyInterface(t *testing.T) {
+	buf := bytes.NewBuffer(nil)
+	enc, err := avro.NewEncoder(`["null", "string"]`, buf)
+	require.NoError(t, err)
+
+	value := map[string]unionMapInterface{"string": unionMapString("foo")}
+	assert.NotPanics(t, func() {
+		err = enc.Encode(value)
+	})
+	assert.Error(t, err)
+	assert.Empty(t, buf.Bytes())
+}
+
 func TestEncoder_UnionMapRecord(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -76,6 +89,20 @@ func TestEncoder_UnionMapNull(t *testing.T) {
 	assert.Equal(t, []byte{0x00}, buf.Bytes())
 }
 
+func TestEncoder_UnionMapNilValueReturnsError(t *testing.T) {
+	defer ConfigTeardown()
+
+	buf := bytes.NewBuffer([]byte{})
+	enc, err := avro.NewEncoder(`["null", "int"]`, buf)
+	require.NoError(t, err)
+
+	assert.NotPanics(t, func() {
+		err = enc.Encode(map[string]any{"int": nil})
+	})
+	assert.Error(t, err)
+	assert.Empty(t, buf.Bytes())
+}
+
 func TestEncoder_UnionMapMultipleEntries(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -115,12 +142,12 @@ func TestEncoder_UnionMapWithDuration(t *testing.T) {
 	require.NoError(t, err)
 
 	m := map[string]any{
-		"int.time-millis": 123456789 * time.Millisecond,
+		"int.time-millis": 12345678 * time.Millisecond,
 	}
 	err = enc.Encode(m)
 
 	require.NoError(t, err)
-	assert.Equal(t, []byte{0x02, 0xAA, 0xB4, 0xDE, 0x75}, buf.Bytes())
+	assert.Equal(t, []byte{0x02, 0x9C, 0x85, 0xE3, 0x0B}, buf.Bytes())
 }
 
 func TestEncoder_UnionMapWithDecimal(t *testing.T) {
@@ -353,6 +380,43 @@ func TestEncoder_UnionConverterToAnyInterface(t *testing.T) {
 	assert.Equal(t, []byte{0x02, 0x36, 0x06, 0x66, 0x6F, 0x6F}, buf.Bytes())
 }
 
+func TestEncoder_UnionConverterNilValueReturnsError(t *testing.T) {
+	defer ConfigTeardown()
+
+	buf := bytes.NewBuffer([]byte{})
+	enc, err := avro.NewEncoder(`["string", "int"]`, buf)
+	require.NoError(t, err)
+
+	assert.NotPanics(t, func() {
+		err = enc.Encode(&TestCountingUnionConverter{})
+	})
+	assert.Error(t, err)
+	assert.Empty(t, buf.Bytes())
+}
+
+type typedNilUnionConverter struct{}
+
+func (*typedNilUnionConverter) FromAny(any) error {
+	return nil
+}
+
+func (*typedNilUnionConverter) ToAny() (any, error) {
+	var value *int
+	return value, nil
+}
+
+func TestEncoder_UnionConverterTypedNilValueReturnsError(t *testing.T) {
+	buf := bytes.NewBuffer(nil)
+	enc, err := avro.NewEncoder(`["string", "int"]`, buf)
+	require.NoError(t, err)
+
+	assert.NotPanics(t, func() {
+		err = enc.Encode(&typedNilUnionConverter{})
+	})
+	assert.Error(t, err)
+	assert.Empty(t, buf.Bytes())
+}
+
 func TestEncoder_NullableUnionConverterToAnyInterface(t *testing.T) {
 	defer ConfigTeardown()
 
@@ -572,11 +636,11 @@ func TestEncoder_UnionInterfaceWithDuration(t *testing.T) {
 	enc, err := avro.NewEncoder(schema, buf)
 	require.NoError(t, err)
 
-	var val any = 123456789 * time.Millisecond
+	var val any = 12345678 * time.Millisecond
 	err = enc.Encode(val)
 
 	require.NoError(t, err)
-	assert.Equal(t, []byte{0x02, 0xAA, 0xB4, 0xDE, 0x75}, buf.Bytes())
+	assert.Equal(t, []byte{0x02, 0x9C, 0x85, 0xE3, 0x0B}, buf.Bytes())
 }
 
 func TestEncoder_UnionInterfaceWithDecimal(t *testing.T) {
@@ -739,8 +803,8 @@ func TestEncoder_UnionResolver(t *testing.T) {
 		{
 			name:   "Go time.Duration as Avro int.time-millis",
 			schema: `["null",{"type":"int","logicalType":"time-millis"}]`,
-			value:  123456789 * time.Millisecond,
-			want:   []byte{0x2, 0xAA, 0xB4, 0xDE, 0x75},
+			value:  12345678 * time.Millisecond,
+			want:   []byte{0x2, 0x9C, 0x85, 0xE3, 0x0B},
 		},
 		{
 			name:   "Go time.Time as Avro long.timestamp-millis",
@@ -757,8 +821,8 @@ func TestEncoder_UnionResolver(t *testing.T) {
 		{
 			name:   "Go time.Duration as Avro long.time-micros",
 			schema: `["null",{"type":"long","logicalType":"time-micros"}]`,
-			value:  123456789123 * time.Microsecond,
-			want:   []byte{0x2, 0x86, 0xEA, 0xC8, 0xE9, 0x97, 0x07},
+			value:  12345678123 * time.Microsecond,
+			want:   []byte{0x2, 0xD6, 0xE4, 0xE0, 0xFD, 0x5B},
 		},
 		{
 			name:   "Go big.Rat as Avro bytes.decimal",

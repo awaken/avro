@@ -2,6 +2,9 @@ package avro_test
 
 import (
 	"bytes"
+	"errors"
+	"io"
+	"math"
 	"testing"
 
 	"github.com/awaken/avro/v2"
@@ -25,7 +28,36 @@ func TestReader_SkipNBytesEOF(t *testing.T) {
 
 	r.SkipNBytes(3)
 
-	assert.Error(t, r.Error)
+	require.ErrorIs(t, r.Error, io.ErrUnexpectedEOF)
+}
+
+var errChunkReaderExhausted = errors.New("chunk reader exhausted")
+
+type chunkReader struct {
+	reads int
+	limit int
+}
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if r.reads == r.limit {
+		return 0, errChunkReaderExhausted
+	}
+	r.reads++
+	if r.reads == r.limit {
+		p[len(p)-1] = 0x36
+	}
+	return len(p), nil
+}
+
+func TestReaderSkipNBytesMaxInt32LeavesBufferedRemainder(t *testing.T) {
+	const bufSize = 1 << 20
+	r := avro.NewReader(&chunkReader{limit: math.MaxInt32/bufSize + 1}, bufSize)
+
+	r.SkipNBytes(math.MaxInt32)
+
+	require.NoError(t, r.Error)
+	assert.Equal(t, byte(0x36), r.Peek())
+	require.NoError(t, r.Error)
 }
 
 func TestReader_SkipBool(t *testing.T) {
@@ -38,59 +70,72 @@ func TestReader_SkipBool(t *testing.T) {
 	assert.Equal(t, int32(27), r.ReadInt())
 }
 
+func TestReaderSkipBoolRejectsInvalidValue(t *testing.T) {
+	r := avro.NewReader(bytes.NewReader([]byte{0x02}), 10)
+
+	r.SkipBool()
+
+	require.ErrorContains(t, r.Error, "invalid bool")
+}
+
 func TestReader_SkipInt(t *testing.T) {
-	tests := []struct {
-		name string
-		data []byte
-	}{
-		{
-			name: "Skipped",
-			data: []byte{0x38, 0x36},
-		},
-		{
-			name: "Overflow",
-			data: []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0x36},
-		},
-	}
+	data := []byte{0x38, 0x36}
+	r := avro.NewReader(bytes.NewReader(data), 10)
 
-	for _, test := range tests {
-		test := test
-		t.Run(test.name, func(t *testing.T) {
-			r := avro.NewReader(bytes.NewReader(test.data), 10)
+	r.SkipInt()
 
-			r.SkipInt()
-
-			require.NoError(t, r.Error)
-			assert.Equal(t, int32(27), r.ReadInt())
-		})
-	}
+	require.NoError(t, r.Error)
+	assert.Equal(t, int32(27), r.ReadInt())
 }
 
 func TestReader_SkipLong(t *testing.T) {
+	data := []byte{0x38, 0x36}
+	r := avro.NewReader(bytes.NewReader(data), 10)
+
+	r.SkipLong()
+
+	require.NoError(t, r.Error)
+	assert.Equal(t, int32(27), r.ReadInt())
+}
+
+func TestReaderSkipRejectsVarintOverflow(t *testing.T) {
 	tests := []struct {
 		name string
 		data []byte
+		skip func(*avro.Reader)
 	}{
 		{
-			name: "Skipped",
-			data: []byte{0x38, 0x36},
+			name: "int continuation",
+			data: []byte{0x80, 0x80, 0x80, 0x80, 0x80},
+			skip: (*avro.Reader).SkipInt,
 		},
 		{
-			name: "Overflow",
-			data: []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0x36},
+			name: "int final byte",
+			data: []byte{0xff, 0xff, 0xff, 0xff, 0x10},
+			skip: (*avro.Reader).SkipInt,
+		},
+		{
+			name: "long continuation",
+			data: []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80},
+			skip: (*avro.Reader).SkipLong,
+		},
+		{
+			name: "long final byte",
+			data: []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02},
+			skip: (*avro.Reader).SkipLong,
 		},
 	}
 
 	for _, test := range tests {
-		test := test
-		t.Run(test.name, func(t *testing.T) {
-			r := avro.NewReader(bytes.NewReader(test.data), 10)
+		for _, bufSize := range []int{1, 64} {
+			t.Run(test.name, func(t *testing.T) {
+				r := avro.NewReader(bytes.NewReader(test.data), bufSize)
 
-			r.SkipLong()
+				test.skip(r)
 
-			require.NoError(t, r.Error)
-			assert.Equal(t, int32(27), r.ReadInt())
-		})
+				require.ErrorContains(t, r.Error, "overflow")
+			})
+		}
 	}
 }
 

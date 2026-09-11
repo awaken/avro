@@ -1,6 +1,7 @@
 package soe_test
 
 import (
+	"bytes"
 	"io"
 	"testing"
 
@@ -9,6 +10,89 @@ import (
 	"github.com/awaken/avro/v2/soe/internal/testdata"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCodec_RejectsTrailingObject(t *testing.T) {
+	for _, test := range []struct {
+		schema string
+		value  any
+		target func() any
+	}{
+		{schema: `"int"`, value: 23, target: func() any { return new(int) }},
+		{schema: `"null"`, value: nil, target: func() any { return new(any) }},
+		{schema: `"bytes"`, value: bytes.Repeat([]byte{7}, 1025), target: func() any { return new([]byte) }},
+	} {
+		codec, err := soe.NewCodec(avro.MustParse(test.schema))
+		require.NoError(t, err)
+		frame, err := codec.Encode(test.value)
+		require.NoError(t, err)
+		for name, decode := range decoderFuncs(codec) {
+			t.Run(test.schema+"/"+name, func(t *testing.T) {
+				require.NoError(t, decode(frame, test.target()))
+				for _, tail := range [][]byte{{0}, {0x80}, {0, 0}} {
+					data := append(append([]byte(nil), frame...), tail...)
+					require.Error(t, decode(data, test.target()), "accepted trailing bytes %x", tail)
+				}
+				require.NoError(t, decode(frame, test.target()), "failed decode contaminated the next frame")
+			})
+		}
+	}
+}
+
+type nilAPI struct {
+	avro.API
+}
+
+type exactSOEWrapper struct {
+	avro.API
+	calls int
+}
+
+func (a *exactSOEWrapper) UnmarshalExact(schema avro.Schema, data []byte, v any) error {
+	a.calls++
+	return a.API.(avro.ExactUnmarshaler).UnmarshalExact(schema, data, v)
+}
+
+func TestCodec_CustomExactAPI(t *testing.T) {
+	schema := avro.MustParse(`"int"`)
+	legacy, err := soe.NewCodecWithAPI(schema, &nilAPI{API: avro.DefaultConfig})
+	require.NoError(t, err)
+	frame, err := legacy.Encode(12)
+	require.NoError(t, err, "custom encoding remains supported")
+	for _, decode := range decoderFuncs(legacy) {
+		require.ErrorIs(t, decode(frame, new(int)), soe.ErrExactAPI)
+	}
+
+	api := &exactSOEWrapper{API: avro.DefaultConfig}
+	codec, err := soe.NewCodecWithAPI(schema, api)
+	require.NoError(t, err)
+	for _, decode := range decoderFuncs(codec) {
+		var got int
+		require.NoError(t, decode(frame, &got))
+		require.Equal(t, 12, got)
+		require.Error(t, decode(append(append([]byte(nil), frame...), 0), &got))
+	}
+	require.Equal(t, 4, api.calls, "SOE must use the custom exact decoder")
+}
+
+func TestNewCodecWithAPIRejectsNil(t *testing.T) {
+	schema := avro.MustParse("null")
+	tests := []struct {
+		name string
+		api  avro.API
+	}{
+		{name: "nil", api: nil},
+		{name: "typed nil", api: (*nilAPI)(nil)},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			codec, err := soe.NewCodecWithAPI(schema, test.api)
+
+			require.ErrorContains(t, err, "API cannot be nil")
+			require.Nil(t, codec)
+		})
+	}
+}
 
 func newCodec(t *testing.T) *soe.Codec {
 	t.Helper()

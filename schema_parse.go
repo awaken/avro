@@ -34,6 +34,7 @@ func Parse(schema string) (Schema, error) {
 }
 
 // ParseWithCache parses a schema string using the given namespace and schema cache.
+// A nil cache parses without retaining named schemas.
 func ParseWithCache(schema, namespace string, cache *SchemaCache) (Schema, error) {
 	return ParseBytesWithCache([]byte(schema), namespace, cache)
 }
@@ -75,6 +76,7 @@ func ParseBytes(schema []byte) (Schema, error) {
 }
 
 // ParseBytesWithCache parses a schema byte slice using the given namespace and schema cache.
+// A nil cache parses without retaining named schemas.
 func ParseBytesWithCache(schema []byte, namespace string, cache *SchemaCache) (Schema, error) {
 	var json any
 	if err := schemaJSONAPI.Unmarshal(schema, &json); err != nil {
@@ -96,7 +98,9 @@ func ParseBytesWithCache(schema []byte, namespace string, cache *SchemaCache) (S
 		return nil, err
 	}
 
-	cache.AddAll(internalCache)
+	if cache != nil {
+		cache.AddAll(internalCache)
+	}
 
 	return derefSchema(cloneSchemaGraph(s)), nil
 }
@@ -298,19 +302,16 @@ func parseRecord(typ Type, namespace string, m map[string]any, seen seenCache, c
 		cache.Add(alias, ref)
 	}
 
-	fieldNames := make(map[string]struct{})
 	for i, f := range r.Fields {
 		field, err := parseField(rec.namespace, f, seen, cache)
 		if err != nil {
 			return nil, err
 		}
 
-		if _, exists := fieldNames[field.name]; exists {
-			return nil, fmt.Errorf("avro: duplicate field name %q", field.name)
-		}
-		fieldNames[field.name] = struct{}{}
-
 		fields[i] = field
+	}
+	if err = validateRecordFields(fields); err != nil {
+		return nil, err
 	}
 
 	return rec, nil
@@ -580,27 +581,7 @@ func parseDecimalLogicalType(size int, props map[string]any) LogicalSchema {
 }
 
 func newDecimalLogicalType(size, prec, scale int) LogicalSchema {
-	if prec <= 0 {
-		return nil
-	}
-
-	if size == 0 {
-		return nil
-	}
-
-	if size > 0 {
-		maxPrecision := math.Floor(math.Log10(2) * (8*float64(size) - 1))
-		if float64(prec) > maxPrecision {
-			return nil
-		}
-	}
-
-	if scale < 0 {
-		return nil
-	}
-
-	// Scale may not be bigger than precision
-	if scale > prec {
+	if !validDecimalLogicalType(size, prec, scale) {
 		return nil
 	}
 

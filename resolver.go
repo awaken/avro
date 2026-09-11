@@ -1,8 +1,10 @@
 package avro
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
+	"slices"
 	"sync"
 	"time"
 
@@ -40,6 +42,8 @@ func NewTypeResolver() *TypeResolver {
 	r.Register(string(Int)+"."+string(TimeMillis), time.Duration(0))
 	r.Register(string(Long)+"."+string(TimestampMillis), time.Time{})
 	r.Register(string(Long)+"."+string(TimestampMicros), time.Time{})
+	r.Register(string(Long)+"."+string(LocalTimestampMillis), time.Time{})
+	r.Register(string(Long)+"."+string(LocalTimestampMicros), time.Time{})
 	r.Register(string(Long)+"."+string(TimeMicros), time.Duration(0))
 	r.Register(string(Bytes)+"."+string(Decimal), big.NewRat(1, 1))
 	r.Register(string(String)+"."+string(UUID), "")
@@ -50,6 +54,9 @@ func NewTypeResolver() *TypeResolver {
 // Register registers names to their types for resolution.
 func (r *TypeResolver) Register(name string, obj any) {
 	typ := reflect2.TypeOf(obj)
+	if typ == nil {
+		return
+	}
 	rtype := typ.RType()
 
 	r.names.Store(name, typ)
@@ -62,12 +69,18 @@ func (r *TypeResolver) Register(name string, obj any) {
 		return
 	}
 	names := raw.([]string)
+	if slices.Contains(names, name) {
+		return
+	}
 	names = append(names, name)
 	r.types.Store(rtype, names)
 }
 
 // Name gets the name for a type, or an error.
 func (r *TypeResolver) Name(typ reflect2.Type) ([]string, error) {
+	if typ == nil {
+		return nil, errors.New("avro: unable to resolve nil type")
+	}
 	rtype := typ.RType()
 
 	r.typesMu.RLock()

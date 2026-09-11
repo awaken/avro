@@ -21,12 +21,17 @@ func NewCodec(schema avro.Schema) (*Codec, error) {
 }
 
 // NewCodecWithAPI creates a new Codec for a Schema and an API.
+// Decoding requires the API to implement avro.ExactUnmarshaler.
 func NewCodecWithAPI(schema avro.Schema, api avro.API) (*Codec, error) {
 	// Precompute SOE header
 	header, err := BuildHeader(schema)
 	if err != nil {
 		return nil, err
 	}
+	if isNilValue(api) {
+		return nil, fmt.Errorf("API cannot be nil")
+	}
+
 	return &Codec{
 		schema: schema,
 		api:    api,
@@ -47,7 +52,7 @@ func (c *Codec) Encode(v any) ([]byte, error) {
 }
 
 // Decode unmarshals a value from SOE-encoded Avro binary, and fails if
-// the schema fingerprint doesn't match the held schema.
+// the schema fingerprint doesn't match the held schema or payload bytes remain.
 func (c *Codec) Decode(data []byte, v any) error {
 	fingerprint, data, err := ParseHeader(data)
 	if err != nil {
@@ -57,17 +62,18 @@ func (c *Codec) Decode(data []byte, v any) error {
 	if !bytes.Equal(fingerprint, expected) {
 		return fmt.Errorf("bad fingerprint %x, expected %x", fingerprint, expected)
 	}
-	return c.api.Unmarshal(c.schema, data, v)
+	return decodeExact(c.api, c.schema, data, v)
 }
 
 // DecodeUnverified unmarshals a value from SOE-encoded Avro binary without
 // validating the schema fingerprint.
+// It still requires exactly one datum and complete payload consumption.
 func (c *Codec) DecodeUnverified(data []byte, v any) error {
 	_, data, err := ParseHeader(data)
 	if err != nil {
 		return err
 	}
-	return c.api.Unmarshal(c.schema, data, v)
+	return decodeExact(c.api, c.schema, data, v)
 }
 
 func (c *Codec) getFingerprint() []byte {

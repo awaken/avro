@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -127,6 +128,9 @@ type SchemaCache struct {
 
 // Add adds a schema to the cache with the given name.
 func (c *SchemaCache) Add(name string, schema Schema) {
+	if isNilSchema(schema) {
+		return
+	}
 	c.cache.Store(name, schema)
 }
 
@@ -504,6 +508,9 @@ func NewPrimitiveSchema(t Type, l LogicalSchema, opts ...SchemaOption) *Primitiv
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	if isNilLogicalSchema(l) {
+		l = nil
+	}
 	reservedProps := primitiveReserved
 	if l != nil {
 		if l.Type() == Decimal {
@@ -544,7 +551,12 @@ func (s *PrimitiveSchema) MarshalJSON() ([]byte, error) {
 	buf := new(bytes.Buffer)
 	buf.WriteString(`{"type":"` + string(s.typ) + `"`)
 	if s.logical != nil {
-		buf.WriteString(`,"logicalType":"` + string(s.logical.Type()) + `"`)
+		logicalTypeJSON, err := jsoniterAPI.Marshal(s.logical.Type())
+		if err != nil {
+			return nil, err
+		}
+		buf.WriteString(`,"logicalType":`)
+		buf.Write(logicalTypeJSON)
 		if d, ok := s.logical.(*DecimalLogicalSchema); ok {
 			buf.WriteString(`,"precision":` + strconv.Itoa(d.prec))
 			if d.scale > 0 {
@@ -586,25 +598,41 @@ type RecordSchema struct {
 	doc     string
 }
 
-// NewRecordSchema creates a new record schema instance.
+// NewRecordSchema creates a record with unique field names and aliases.
 func NewRecordSchema(name, namespace string, fields []*Field, opts ...SchemaOption) (*RecordSchema, error) {
 	rec, err := newRecordSchema(name, namespace, fields, opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	fieldNames := map[string]struct{}{}
-	for _, field := range fields {
-		if field == nil {
-			return nil, errors.New("avro: record fields cannot contain nil")
-		}
-		if _, ok := fieldNames[field.Name()]; ok {
-			return nil, fmt.Errorf("avro: duplicate field name %q", field.Name())
-		}
-		fieldNames[field.Name()] = struct{}{}
+	if err = validateRecordFields(fields); err != nil {
+		return nil, err
 	}
 	rec.fields = slices.Clone(fields)
 	return rec, nil
+}
+
+// Field names and aliases share one namespace; aliases may contain arbitrary text.
+func validateRecordFields(fields []*Field) error {
+	names := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		if field == nil {
+			return errors.New("avro: record fields cannot contain nil")
+		}
+		if _, ok := names[field.name]; ok {
+			return fmt.Errorf("avro: duplicate field name %q", field.name)
+		}
+		names[field.name] = struct{}{}
+	}
+	for _, field := range fields {
+		for _, alias := range field.aliases {
+			if _, ok := names[alias]; ok {
+				return fmt.Errorf("avro: duplicate field name or alias %q", alias)
+			}
+			names[alias] = struct{}{}
+		}
+	}
+	return nil
 }
 
 func newRecordSchema(name, namespace string, fields []*Field, opts ...SchemaOption) (*RecordSchema, error) {
@@ -689,8 +717,13 @@ func (s *RecordSchema) String() string {
 
 // MarshalJSON marshals the schema to json.
 func (s *RecordSchema) MarshalJSON() ([]byte, error) {
+	nameJSON, err := jsoniterAPI.Marshal(s.full)
+	if err != nil {
+		return nil, err
+	}
 	buf := new(bytes.Buffer)
-	buf.WriteString(`{"name":"` + s.full + `"`)
+	buf.WriteString(`{"name":`)
+	buf.Write(nameJSON)
 	if len(s.aliases) > 0 {
 		aliasesJSON, err := jsoniterAPI.Marshal(s.aliases)
 		if err != nil {
@@ -740,11 +773,14 @@ func (s *RecordSchema) CacheFingerprint() [32]byte {
 	return s.cacheFingerprinter.CacheFingerprint(s, func() []byte {
 		defs := make([]any, len(s.fields))
 		for i, field := range s.fields {
-			if !field.HasDefault() {
-				defs[i] = []any{false}
-				continue
+			metadata := []any{field.HasDefault()}
+			if field.HasDefault() {
+				metadata = append(metadata, field.Default())
 			}
-			defs[i] = []any{true, field.Default()}
+			if aliases := field.Aliases(); len(aliases) > 0 {
+				metadata = append(metadata, aliases)
+			}
+			defs[i] = metadata
 		}
 		b, _ := jsoniterAPI.Marshal(defs)
 		return b
@@ -761,6 +797,7 @@ type Field struct {
 	typ     Schema
 	hasDef  bool
 	def     any
+	jsonDef any
 	order   Order
 
 	// action mainly used when decoding data that lack the field for schema evolution purposes.
@@ -775,7 +812,7 @@ type noDef struct{}
 // NoDefault is used when no default exists for a field.
 var NoDefault = noDef{}
 
-// NewField creates a new field instance.
+// NewField creates a field. Aliases must be unique and differ from its name.
 func NewField(name string, typ Schema, opts ...SchemaOption) (*Field, error) {
 	cfg := schemaConfig{def: NoDefault}
 	for _, opt := range opts {
@@ -784,6 +821,9 @@ func NewField(name string, typ Schema, opts ...SchemaOption) (*Field, error) {
 
 	if err := validateName(name); err != nil {
 		return nil, err
+	}
+	if isNilSchema(typ) {
+		return nil, errors.New("avro: field type cannot be nil")
 	}
 
 	switch cfg.order {
@@ -802,6 +842,9 @@ func NewField(name string, typ Schema, opts ...SchemaOption) (*Field, error) {
 		typ:        typ,
 		order:      cfg.order,
 	}
+	if err := validateRecordFields([]*Field{f}); err != nil {
+		return nil, err
+	}
 
 	if cfg.def != NoDefault {
 		def, err := validateDefault(name, typ, cfg.def)
@@ -809,6 +852,7 @@ func NewField(name string, typ Schema, opts ...SchemaOption) (*Field, error) {
 			return nil, err
 		}
 		f.def = def
+		f.jsonDef = cloneDefault(cfg.def)
 		f.hasDef = true
 	}
 
@@ -882,8 +926,13 @@ func (f *Field) String() string {
 
 // MarshalJSON marshals the schema to json.
 func (f *Field) MarshalJSON() ([]byte, error) {
+	nameJSON, err := jsoniterAPI.Marshal(f.name)
+	if err != nil {
+		return nil, err
+	}
 	buf := new(bytes.Buffer)
-	buf.WriteString(`{"name":"` + f.name + `"`)
+	buf.WriteString(`{"name":`)
+	buf.Write(nameJSON)
 	if len(f.aliases) > 0 {
 		aliasesJSON, err := jsoniterAPI.Marshal(f.aliases)
 		if err != nil {
@@ -907,7 +956,7 @@ func (f *Field) MarshalJSON() ([]byte, error) {
 	buf.WriteString(`,"type":`)
 	buf.Write(typeJSON)
 	if f.hasDef {
-		defaultValueJSON, err := jsoniterAPI.Marshal(f.Default())
+		defaultValueJSON, err := jsoniterAPI.Marshal(f.jsonDef)
 		if err != nil {
 			return nil, err
 		}
@@ -1061,8 +1110,13 @@ func (s *EnumSchema) String() string {
 
 // MarshalJSON marshals the schema to json.
 func (s *EnumSchema) MarshalJSON() ([]byte, error) {
+	nameJSON, err := jsoniterAPI.Marshal(s.full)
+	if err != nil {
+		return nil, err
+	}
 	buf := new(bytes.Buffer)
-	buf.WriteString(`{"name":"` + s.full + `"`)
+	buf.WriteString(`{"name":`)
+	buf.Write(nameJSON)
 	if len(s.aliases) > 0 {
 		aliasesJSON, err := jsoniterAPI.Marshal(s.aliases)
 		if err != nil {
@@ -1087,7 +1141,12 @@ func (s *EnumSchema) MarshalJSON() ([]byte, error) {
 	buf.WriteString(`,"symbols":`)
 	buf.Write(symbolsJSON)
 	if s.def != "" {
-		buf.WriteString(`,"default":"` + s.def + `"`)
+		defaultJSON, err := jsoniterAPI.Marshal(s.def)
+		if err != nil {
+			return nil, err
+		}
+		buf.WriteString(`,"default":`)
+		buf.Write(defaultJSON)
 	}
 	if err := s.marshalPropertiesToJSON(buf); err != nil {
 		return nil, err
@@ -1277,6 +1336,9 @@ func NewUnionSchema(types []Schema, opts ...SchemaOption) (*UnionSchema, error) 
 
 	seen := map[string]bool{}
 	for _, schema := range types {
+		if isNilSchema(schema) {
+			return nil, errors.New("avro: union type cannot contain nil")
+		}
 		if schema.Type() == Union {
 			return nil, errors.New("avro: union type cannot be a union")
 		}
@@ -1295,6 +1357,34 @@ func NewUnionSchema(types []Schema, opts ...SchemaOption) (*UnionSchema, error) 
 	}, nil
 }
 
+func isNilSchema(schema Schema) bool {
+	if schema == nil {
+		return true
+	}
+
+	v := reflect.ValueOf(schema)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
+
+func isNilLogicalSchema(schema LogicalSchema) bool {
+	if schema == nil {
+		return true
+	}
+
+	v := reflect.ValueOf(schema)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
+
 // Type returns the type of the schema.
 func (s *UnionSchema) Type() Type {
 	return Union
@@ -1307,8 +1397,9 @@ func (s *UnionSchema) Types() Schemas {
 
 // Contains returns true if the union contains the given type.
 func (s *UnionSchema) Contains(typ Type) bool {
-	_, pos := s.types.Get(string(typ))
-	return pos != -1
+	return slices.ContainsFunc(s.types, func(schema Schema) bool {
+		return schema.Type() == typ
+	})
 }
 
 // Nullable returns true if the union is nullable, otherwise false.
@@ -1397,6 +1488,9 @@ func NewFixedSchema(
 	if size < 0 {
 		return nil, errors.New("avro: fixed size cannot be negative")
 	}
+	if isNilLogicalSchema(logical) {
+		logical = nil
+	}
 
 	reservedProps := fixedReserved
 	if logical != nil {
@@ -1438,8 +1532,13 @@ func (s *FixedSchema) String() string {
 
 // MarshalJSON marshals the schema to json.
 func (s *FixedSchema) MarshalJSON() ([]byte, error) {
+	nameJSON, err := jsoniterAPI.Marshal(s.full)
+	if err != nil {
+		return nil, err
+	}
 	buf := new(bytes.Buffer)
-	buf.WriteString(`{"name":"` + s.full + `"`)
+	buf.WriteString(`{"name":`)
+	buf.Write(nameJSON)
 	if len(s.aliases) > 0 {
 		aliasesJSON, err := jsoniterAPI.Marshal(s.aliases)
 		if err != nil {
@@ -1451,7 +1550,12 @@ func (s *FixedSchema) MarshalJSON() ([]byte, error) {
 	buf.WriteString(`,"type":"fixed"`)
 	buf.WriteString(`,"size":` + strconv.Itoa(s.size))
 	if s.logical != nil {
-		buf.WriteString(`,"logicalType":"` + string(s.logical.Type()) + `"`)
+		logicalTypeJSON, err := jsoniterAPI.Marshal(s.logical.Type())
+		if err != nil {
+			return nil, err
+		}
+		buf.WriteString(`,"logicalType":`)
+		buf.Write(logicalTypeJSON)
 		if d, ok := s.logical.(*DecimalLogicalSchema); ok {
 			buf.WriteString(`,"precision":` + strconv.Itoa(d.prec))
 			if d.scale > 0 {
@@ -1567,7 +1671,7 @@ func (s *RefSchema) String() string {
 
 // MarshalJSON marshals the schema to json.
 func (s *RefSchema) MarshalJSON() ([]byte, error) {
-	return []byte(`"` + s.actual.FullName() + `"`), nil
+	return jsoniterAPI.Marshal(s.actual.FullName())
 }
 
 // Fingerprint returns the SHA256 fingerprint of the schema.
@@ -1604,7 +1708,8 @@ func (s *PrimitiveLogicalSchema) Type() LogicalType {
 
 // String returns the canonical form of the logical schema.
 func (s *PrimitiveLogicalSchema) String() string {
-	return `"logicalType":"` + string(s.typ) + `"`
+	typ, _ := jsoniterAPI.Marshal(s.typ)
+	return `"logicalType":` + string(typ)
 }
 
 // DecimalLogicalSchema is a decimal logical type.
@@ -1647,6 +1752,51 @@ func (s *DecimalLogicalSchema) String() string {
 	return `"logicalType":"` + string(Decimal) + `","precision":` + precision + scale
 }
 
+func validDecimalLogicalType(size, prec, scale int) bool {
+	if prec <= 0 || size == 0 || scale < 0 || scale > prec {
+		return false
+	}
+
+	if size > 0 {
+		maxPrecision := math.Floor(math.Log10(2) * (8*float64(size) - 1))
+		if float64(prec) > maxPrecision {
+			return false
+		}
+	}
+
+	return true
+}
+
+func validDecimalLogicalSchema(schema Schema) (*DecimalLogicalSchema, bool) {
+	var (
+		logical LogicalSchema
+		size    int
+	)
+	switch schema := schema.(type) {
+	case *PrimitiveSchema:
+		if schema == nil || schema.Type() != Bytes {
+			return nil, false
+		}
+		logical = schema.Logical()
+		size = -1
+	case *FixedSchema:
+		if schema == nil {
+			return nil, false
+		}
+		logical = schema.Logical()
+		size = schema.Size()
+	default:
+		return nil, false
+	}
+
+	decimal, ok := logical.(*DecimalLogicalSchema)
+	if !ok || decimal == nil || !validDecimalLogicalType(size, decimal.Precision(), decimal.Scale()) {
+		return nil, false
+	}
+
+	return decimal, true
+}
+
 func invalidNameFirstChar(r rune) bool {
 	return (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') && r != '_'
 }
@@ -1678,11 +1828,53 @@ func validateNameStrict(name string) error {
 }
 
 func validateDefault(name string, schema Schema, def any) (any, error) {
+	if hasDefaultCycle(def, make(map[defaultContainer]struct{})) {
+		return nil, fmt.Errorf("avro: invalid cyclic default for field %s", name)
+	}
+
 	validated, ok := isValidDefault(schema, def)
 	if !ok {
 		return nil, fmt.Errorf("avro: invalid default for field %s. %+v not a %s", name, def, schema.Type())
 	}
 	return validated, nil
+}
+
+type defaultContainer struct {
+	typ reflect.Type
+	ptr uintptr
+}
+
+func hasDefaultCycle(def any, active map[defaultContainer]struct{}) bool {
+	var values []any
+	switch value := def.(type) {
+	case []any:
+		values = value
+	case map[string]any:
+		values = make([]any, 0, len(value))
+		for _, item := range value {
+			values = append(values, item)
+		}
+	default:
+		return false
+	}
+	if len(values) == 0 {
+		return false
+	}
+
+	v := reflect.ValueOf(def)
+	container := defaultContainer{typ: v.Type(), ptr: uintptr(v.UnsafePointer())}
+	if _, ok := active[container]; ok {
+		return true
+	}
+	active[container] = struct{}{}
+	defer delete(active, container)
+
+	for _, value := range values {
+		if hasDefaultCycle(value, active) {
+			return true
+		}
+	}
+	return false
 }
 
 func isValidDefault(schema Schema, def any) (any, bool) {
@@ -1778,16 +1970,19 @@ func isValidDefault(schema Schema, def any) (any, bool) {
 	case Float:
 		if number, ok := def.(stdjson.Number); ok {
 			f, err := number.Float64()
-			if err != nil || f < -math.MaxFloat32 || f > math.MaxFloat32 {
+			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < -math.MaxFloat32 || f > math.MaxFloat32 {
 				return def, false
 			}
 			return float32(f), true
 		}
-		if _, ok := def.(float32); ok {
-			return def, true
+		if f, ok := def.(float32); ok {
+			if f64 := float64(f); !math.IsNaN(f64) && !math.IsInf(f64, 0) {
+				return def, true
+			}
+			return def, false
 		}
 		if f, ok := def.(float64); ok {
-			if f < -math.MaxFloat32 || f > math.MaxFloat32 {
+			if math.IsNaN(f) || math.IsInf(f, 0) || f < -math.MaxFloat32 || f > math.MaxFloat32 {
 				return def, false
 			}
 			return float32(f), true
@@ -1795,13 +1990,16 @@ func isValidDefault(schema Schema, def any) (any, bool) {
 	case Double:
 		if number, ok := def.(stdjson.Number); ok {
 			f, err := number.Float64()
-			if err != nil {
+			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
 				return def, false
 			}
 			return f, true
 		}
-		if _, ok := def.(float64); ok {
-			return def, true
+		if f, ok := def.(float64); ok {
+			if !math.IsNaN(f) && !math.IsInf(f, 0) {
+				return def, true
+			}
+			return def, false
 		}
 	case Array:
 		arr, ok := def.([]any)
@@ -1855,12 +2053,15 @@ func isValidDefault(schema Schema, def any) (any, bool) {
 			validated[k] = cloneDefault(v)
 		}
 		for _, field := range schema.(*RecordSchema).Fields() {
+			if field == nil {
+				return nil, false
+			}
 			fieldDef, exists := m[field.Name()]
 			if !exists {
 				if !field.HasDefault() {
 					return nil, false
 				}
-				fieldDef = field.Default()
+				fieldDef = cloneDefault(field.jsonDef)
 			}
 
 			v, ok := isValidDefault(field.Type(), fieldDef)

@@ -14,8 +14,11 @@ type efaceDecoder struct {
 	dec    ValDecoder
 }
 
-func newEfaceDecoder(d *decoderContext, schema Schema) *efaceDecoder {
-	typ, _ := genericReceiver(schema)
+func newEfaceDecoder(d *decoderContext, schema Schema) ValDecoder {
+	typ, err := d.cfg.genericReceiver(schema)
+	if err != nil {
+		return &errorDecoder{err: err}
+	}
 	dec := decoderOfType(d, schema, typ)
 
 	return &efaceDecoder{
@@ -29,6 +32,10 @@ func (d *efaceDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 	pObj := (*any)(ptr)
 
 	defer func() {
+		if r.Error != nil {
+			return
+		}
+
 		obj, err := r.cfg.typeConverters.DecodeTypeConvert(*pObj, d.schema)
 		if err != nil && !errors.Is(err, errNoTypeConverter) {
 			r.Error = err

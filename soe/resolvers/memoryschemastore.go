@@ -10,6 +10,8 @@ import (
 	"github.com/awaken/avro/v2/soe"
 )
 
+const fingerprintSize = 8
+
 // MemorySchemaStore is a basic in-memory schema store and resolver
 // implementation.
 type MemorySchemaStore struct {
@@ -27,6 +29,9 @@ func (s *MemorySchemaStore) AddSchema(schema avro.Schema) error {
 	if err != nil {
 		return err
 	}
+	if len(fp) != fingerprintSize {
+		return fmt.Errorf("bad fingerprint length: %d", len(fp))
+	}
 
 	key := keyFromFingerprint(fp)
 	s.schemas.Store(key, schema)
@@ -35,7 +40,7 @@ func (s *MemorySchemaStore) AddSchema(schema avro.Schema) error {
 
 // GetSchema implements SchemaResolver.
 func (s *MemorySchemaStore) GetSchema(_ context.Context, fingerprint []byte) (avro.Schema, error) {
-	if len(fingerprint) != 8 {
+	if len(fingerprint) != fingerprintSize {
 		return nil, fmt.Errorf("%w: invalid fingerprint length %d", soe.ErrUnknownSchema, len(fingerprint))
 	}
 	key := keyFromFingerprint(fingerprint)

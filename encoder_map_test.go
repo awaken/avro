@@ -3,6 +3,7 @@ package avro_test
 import (
 	"bytes"
 	"errors"
+	"io"
 	"strconv"
 	"testing"
 
@@ -127,6 +128,8 @@ func TestEncoder_MapError(t *testing.T) {
 }
 
 func TestEncoder_MapWithMoreThanBlockLengthKeys(t *testing.T) {
+	defer ConfigTeardown()
+
 	avro.DefaultConfig = avro.Config{
 		TagKey:               "avro",
 		BlockLength:          1,
@@ -222,4 +225,78 @@ func TestEncoder_MapMarshallerError(t *testing.T) {
 	})
 
 	require.Error(t, err)
+}
+
+type mapMarshalCounter struct {
+	calls *int
+	err   error
+}
+
+func (m mapMarshalCounter) MarshalText() ([]byte, error) {
+	*m.calls++
+	return nil, m.err
+}
+
+func TestEncoder_MapStopsAfterValueError(t *testing.T) {
+	schema, err := avro.Parse(`{"type":"map", "values":"string"}`)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name  string
+		err   error
+		value func(*int, error) any
+	}{
+		{
+			name: "string keys ordinary error",
+			err:  errors.New("test"),
+			value: func(calls *int, err error) any {
+				return map[string]mapMarshalCounter{
+					"first":  {calls: calls, err: err},
+					"second": {calls: calls, err: err},
+				}
+			},
+		},
+		{
+			name: "string keys EOF",
+			err:  io.EOF,
+			value: func(calls *int, err error) any {
+				return map[string]mapMarshalCounter{
+					"first":  {calls: calls, err: err},
+					"second": {calls: calls, err: err},
+				}
+			},
+		},
+		{
+			name: "text marshaler keys ordinary error",
+			err:  errors.New("test"),
+			value: func(calls *int, err error) any {
+				return map[textMarshallerInt]mapMarshalCounter{
+					1: {calls: calls, err: err},
+					2: {calls: calls, err: err},
+				}
+			},
+		},
+		{
+			name: "text marshaler keys EOF",
+			err:  io.EOF,
+			value: func(calls *int, err error) any {
+				return map[textMarshallerInt]mapMarshalCounter{
+					1: {calls: calls, err: err},
+					2: {calls: calls, err: err},
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			enc := avro.Config{BlockLength: 2}.Freeze().NewEncoder(schema, bytes.NewBuffer(nil))
+
+			err := enc.Encode(test.value(&calls, test.err))
+
+			require.ErrorIs(t, err, test.err)
+			assert.Equal(t, 1, calls)
+		})
+	}
 }

@@ -48,9 +48,9 @@ func TestGenericDecode(t *testing.T) {
 		},
 		{
 			name:    "Int Time-Millis",
-			data:    []byte{0xAA, 0xB4, 0xDE, 0x75},
+			data:    []byte{0x9C, 0x85, 0xE3, 0x0B},
 			schema:  `{"type":"int","logicalType":"time-millis"}`,
-			want:    123456789 * time.Millisecond,
+			want:    12345678 * time.Millisecond,
 			wantErr: require.NoError,
 		},
 		{
@@ -62,9 +62,9 @@ func TestGenericDecode(t *testing.T) {
 		},
 		{
 			name:    "Long Time-Micros",
-			data:    []byte{0x86, 0xEA, 0xC8, 0xE9, 0x97, 0x07},
+			data:    []byte{0xD6, 0xE4, 0xE0, 0xFD, 0x5B},
 			schema:  `{"type":"long","logicalType":"time-micros"}`,
-			want:    123456789123 * time.Microsecond,
+			want:    12345678123 * time.Microsecond,
 			wantErr: require.NoError,
 		},
 		{
@@ -85,14 +85,14 @@ func TestGenericDecode(t *testing.T) {
 			name:    "Long Local-Timestamp-Millis",
 			data:    []byte{0x90, 0xB2, 0xAE, 0xC3, 0xEC, 0x5B},
 			schema:  `{"type":"long","logicalType":"local-timestamp-millis"}`,
-			want:    time.Date(2020, 1, 2, 3, 4, 5, 0, time.Local),
+			want:    time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
 			wantErr: require.NoError,
 		},
 		{
 			name:    "Long Local-Timestamp-Micros",
 			data:    []byte{0x80, 0xCD, 0xB7, 0xA2, 0xEE, 0xC7, 0xCD, 0x05},
 			schema:  `{"type":"long","logicalType":"local-timestamp-micros"}`,
-			want:    time.Date(2020, 1, 2, 3, 4, 5, 0, time.Local),
+			want:    time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
 			wantErr: require.NoError,
 		},
 		{
@@ -126,7 +126,7 @@ func TestGenericDecode(t *testing.T) {
 		{
 			name:    "Bytes Decimal",
 			data:    []byte{0x6, 0x00, 0x87, 0x78},
-			schema:  `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`,
+			schema:  `{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`,
 			want:    big.NewRat(1734, 5),
 			wantErr: require.NoError,
 		},
@@ -218,7 +218,7 @@ func TestGenericDecode(t *testing.T) {
 		{
 			name:    "Fixed Decimal",
 			data:    []byte{0x00, 0x00, 0x00, 0x00, 0x87, 0x78},
-			schema:  `{"type":"fixed", "name": "test", "size": 6,"logicalType":"decimal","precision":4,"scale":2}`,
+			schema:  `{"type":"fixed", "name": "test", "size": 6,"logicalType":"decimal","precision":5,"scale":2}`,
 			want:    big.NewRat(1734, 5),
 			wantErr: require.NoError,
 		},
@@ -232,7 +232,7 @@ func TestGenericDecode(t *testing.T) {
 			schema := MustParse(test.schema)
 			r := NewReader(bytes.NewReader(test.data), 10)
 
-			typ, err := genericReceiver(schema)
+			typ, err := DefaultConfig.(*frozenConfig).genericReceiver(schema)
 			require.NoError(t, err)
 			dec := decoderOfType(newDecoderContext(DefaultConfig.(*frozenConfig)), schema, typ)
 
@@ -247,7 +247,7 @@ func TestGenericDecode(t *testing.T) {
 func TestGenericReceiver_UnsupportedType(t *testing.T) {
 	schema := NewPrimitiveSchema(Type("test"), nil)
 
-	_, err := genericReceiver(schema)
+	_, err := DefaultConfig.(*frozenConfig).genericReceiver(schema)
 
 	assert.Error(t, err)
 }

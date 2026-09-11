@@ -4,8 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +34,82 @@ func TestParse_InvalidType(t *testing.T) {
 	}
 }
 
+func TestNewField_AliasCollisions(t *testing.T) {
+	for _, aliases := range [][]string{{"old", "old"}, {"value"}} {
+		_, err := avro.NewField("value", avro.NewPrimitiveSchema(avro.Int, nil), avro.WithAliases(aliases))
+		require.Error(t, err, "aliases %v", aliases)
+	}
+
+	field, err := avro.NewField("value", avro.NewPrimitiveSchema(avro.Int, nil), avro.WithAliases([]string{"old-name", ""}))
+	require.NoError(t, err)
+	require.Equal(t, []string{"old-name", ""}, field.Aliases())
+}
+
+func TestNewRecordSchema_AliasNamespace(t *testing.T) {
+	for _, aliases := range [][]string{{"second"}, {"shared"}} {
+		first, err := avro.NewField("first", avro.NewPrimitiveSchema(avro.Int, nil), avro.WithAliases(aliases))
+		require.NoError(t, err)
+		second, err := avro.NewField("second", avro.NewPrimitiveSchema(avro.Int, nil), avro.WithAliases([]string{"shared"}))
+		require.NoError(t, err)
+		for _, fields := range [][]*avro.Field{{first, second}, {second, first}} {
+			_, err = avro.NewRecordSchema("R", "", fields)
+			require.Error(t, err, "aliases %v", aliases)
+			_, err = avro.NewErrorRecordSchema("R", "", fields)
+			require.Error(t, err, "error record aliases %v", aliases)
+		}
+	}
+}
+
+func TestNewField_RejectsCyclicDefault(t *testing.T) {
+	const helper = "AVRO_CYCLIC_DEFAULT_HELPER"
+	if kind := os.Getenv(helper); kind != "" {
+		debug.SetMaxStack(256 << 10)
+
+		def := map[string]any{}
+		switch kind {
+		case "map":
+			def["extra"] = def
+		case "slice":
+			value := make([]any, 1)
+			value[0] = value
+			def["extra"] = value
+		default:
+			panic("unknown cyclic-default helper case")
+		}
+
+		record, err := avro.NewRecordSchema("R", "", nil)
+		if err != nil {
+			panic(err)
+		}
+		if _, err = avro.NewField("value", record, avro.WithDefault(def)); err == nil {
+			panic("cyclic default was accepted")
+		}
+		return
+	}
+
+	for _, kind := range []string{"map", "slice"} {
+		t.Run(kind, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestNewField_RejectsCyclicDefault$")
+			cmd.Env = append(os.Environ(), helper+"="+kind)
+			output, err := cmd.CombinedOutput()
+			require.NoError(t, err, string(output))
+		})
+	}
+
+	shared := map[string]any{"value": float64(1)}
+	def := map[string]any{"left": shared, "right": shared}
+	mapSchema := avro.NewMapSchema(avro.NewPrimitiveSchema(avro.Double, nil))
+	recordField, err := avro.NewField("left", mapSchema)
+	require.NoError(t, err)
+	recordField2, err := avro.NewField("right", mapSchema)
+	require.NoError(t, err)
+	record, err := avro.NewRecordSchema("Shared", "", []*avro.Field{recordField, recordField2})
+	require.NoError(t, err)
+
+	_, err = avro.NewField("value", record, avro.WithDefault(def))
+	require.NoError(t, err)
+}
+
 func TestParse_MalformedJSONPreservesSyntaxError(t *testing.T) {
 	for _, schema := range []string{
 		`{"type":"record"`,
@@ -50,6 +129,37 @@ func TestParse_BareNamedReference(t *testing.T) {
 	schema, err := avro.ParseWithCache("example.Referenced", "", cache)
 	require.NoError(t, err)
 	require.Equal(t, "example.Referenced", schema.(avro.NamedSchema).FullName())
+}
+
+func TestParseWithCache_NilCache(t *testing.T) {
+	const name = "NilCacheRecord"
+	require.Nil(t, avro.DefaultSchemaCache.Get(name))
+
+	schema, err := avro.ParseWithCache(`{"type":"record","name":"`+name+`","fields":[]}`, "", nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, name, schema.(avro.NamedSchema).FullName())
+	assert.Nil(t, avro.DefaultSchemaCache.Get(name))
+}
+
+func TestSchemaCache_AddIgnoresNil(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema avro.Schema
+	}{
+		{name: "nil"},
+		{name: "typed nil", schema: (*avro.PrimitiveSchema)(nil)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cache := &avro.SchemaCache{}
+			assert.NotPanics(t, func() {
+				cache.Add("test", tt.schema)
+			})
+			assert.Nil(t, cache.Get("test"))
+		})
+	}
 }
 
 func TestParse_AttributeNamesAreCaseSensitive(t *testing.T) {
@@ -546,6 +656,16 @@ func TestRecordSchema_ValidatesDefault(t *testing.T) {
 			wantErr: assert.NoError,
 		},
 		{
+			name:    "Record Missing Bytes Field With Default",
+			schema:  `{"type":"record","name":"test","fields":[{"name":"a","type":{"type":"record","name":"child","fields":[{"name":"b","type":"bytes","default":"\u00ff"}]},"default":{}}]}`,
+			wantErr: assert.NoError,
+		},
+		{
+			name:    "Record Missing Fixed Field With Default",
+			schema:  `{"type":"record","name":"test","fields":[{"name":"a","type":{"type":"record","name":"child","fields":[{"name":"b","type":{"type":"fixed","name":"fixed1","size":1},"default":"\u00ff"}]},"default":{}}]}`,
+			wantErr: assert.NoError,
+		},
+		{
 			name:    "Record With Nullable Field",
 			schema:  `{"type":"record", "name":"test", "namespace": "org.hamba.avro", "fields":[{"name": "a", "type": {"type":"record", "name": "test2", "fields":[{"name": "b", "type": "int"},{"name": "c", "type": ["null","int"]}]}, "default": {"b": 1, "c": null}}]}`,
 			wantErr: assert.NoError,
@@ -592,6 +712,48 @@ func TestRecordSchema_ValidatesDefault(t *testing.T) {
 			assert.Equal(t, schema, schema2)
 		})
 	}
+}
+
+func TestNewField_RejectsNonFiniteFloatDefaults(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema avro.Schema
+		value  any
+	}{
+		{name: "float32 NaN", schema: avro.NewPrimitiveSchema(avro.Float, nil), value: float32(math.NaN())},
+		{name: "float32 positive infinity", schema: avro.NewPrimitiveSchema(avro.Float, nil), value: float32(math.Inf(1))},
+		{name: "float64 NaN as float", schema: avro.NewPrimitiveSchema(avro.Float, nil), value: math.NaN()},
+		{name: "JSON number infinity as float", schema: avro.NewPrimitiveSchema(avro.Float, nil), value: json.Number("+Inf")},
+		{name: "float64 NaN as double", schema: avro.NewPrimitiveSchema(avro.Double, nil), value: math.NaN()},
+		{name: "float64 negative infinity", schema: avro.NewPrimitiveSchema(avro.Double, nil), value: math.Inf(-1)},
+		{name: "JSON number NaN as double", schema: avro.NewPrimitiveSchema(avro.Double, nil), value: json.Number("NaN")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := avro.NewField("value", tt.schema, avro.WithDefault(tt.value))
+			require.Error(t, err)
+		})
+	}
+
+	_, err := avro.NewField("value", avro.NewPrimitiveSchema(avro.Float, nil), avro.WithDefault(float32(math.MaxFloat32)))
+	require.NoError(t, err)
+	_, err = avro.NewField("value", avro.NewPrimitiveSchema(avro.Double, nil), avro.WithDefault(math.MaxFloat64))
+	require.NoError(t, err)
+}
+
+func TestParse_RejectsRecursiveRecordDefaultWithoutPanic(t *testing.T) {
+	const input = `{
+		"type":"record",
+		"name":"RecursiveDefault",
+		"fields":[{"name":"self","type":"RecursiveDefault","default":{}}]
+	}`
+
+	var err error
+	assert.NotPanics(t, func() {
+		_, err = avro.ParseWithCache(input, "", &avro.SchemaCache{})
+	})
+	assert.Error(t, err)
 }
 
 func TestRecordSchema_PreservesLargeLongDefault(t *testing.T) {
@@ -1127,6 +1289,17 @@ func TestUnionSchema_PreservesLogicalLookupKeys(t *testing.T) {
 	logical, position := schema.(*avro.UnionSchema).Types().Get("int.date")
 	require.Equal(t, 0, position)
 	require.Equal(t, avro.Date, logical.(avro.LogicalTypeSchema).Logical().Type())
+}
+
+func TestUnionSchema_ContainsNamedAndLogicalTypes(t *testing.T) {
+	schema := avro.MustParse(`[
+		{"type":"record","name":"R","fields":[]},
+		{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}
+	]`).(*avro.UnionSchema)
+
+	assert.True(t, schema.Contains(avro.Record))
+	assert.True(t, schema.Contains(avro.Bytes))
+	assert.False(t, schema.Contains(avro.Map))
 }
 
 func TestUnionSchema_Indices(t *testing.T) {

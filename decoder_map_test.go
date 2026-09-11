@@ -198,6 +198,19 @@ func TestDecoder_MapInvalidKeyType(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestDecoder_MapUnmarshallerInterfaceKey(t *testing.T) {
+	data := []byte{0x02, 0x02, 0x31, 0x08, 0x74, 0x65, 0x73, 0x74, 0x00}
+	dec, err := avro.NewDecoder(`{"type":"map","values":"string"}`, bytes.NewReader(data))
+	require.NoError(t, err)
+	var got map[interface{ UnmarshalText([]byte) error }]string
+
+	assert.NotPanics(t, func() {
+		err = dec.Decode(&got)
+	})
+
+	require.Error(t, err)
+}
+
 func TestDecoder_MapLimitIsCumulativeAcrossBlocks(t *testing.T) {
 	defer ConfigTeardown()
 	avro.DefaultConfig = avro.Config{MaxMapAllocSize: 3}.Freeze()

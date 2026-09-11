@@ -22,8 +22,10 @@ type UnionConverter interface {
 func createDecoderOfUnion(d *decoderContext, schema *UnionSchema, typ reflect2.Type) ValDecoder {
 	switch typ.Kind() {
 	case reflect.Map:
-		if typ.(reflect2.MapType).Key().Kind() != reflect.String ||
-			typ.(reflect2.MapType).Elem().Kind() != reflect.Interface {
+		mapType := typ.(reflect2.MapType)
+		if mapType.Key().Kind() != reflect.String ||
+			mapType.Elem().Kind() != reflect.Interface ||
+			mapType.Elem().Type1().NumMethod() != 0 {
 			break
 		}
 		return decoderOfMapUnion(d, schema, typ)
@@ -50,7 +52,10 @@ func createDecoderOfUnion(d *decoderContext, schema *UnionSchema, typ reflect2.T
 			return dec
 		}
 	case reflect.Struct:
-		return createDecoderOfUnion(d, schema, reflect2.PtrTo(typ))
+		ptrType := reflect2.PtrTo(typ)
+		if ptrType.Implements(reflect2.Type2(reflect.TypeFor[UnionConverter]())) {
+			return decoderOfUnionConverterCodec(d, schema, typ)
+		}
 	}
 
 	return &errorDecoder{err: fmt.Errorf("avro: %s is unsupported for Avro %s", typ.String(), schema.Type())}
@@ -59,8 +64,10 @@ func createDecoderOfUnion(d *decoderContext, schema *UnionSchema, typ reflect2.T
 func createEncoderOfUnion(e *encoderContext, schema *UnionSchema, typ reflect2.Type) ValEncoder {
 	switch typ.Kind() {
 	case reflect.Map:
-		if typ.(reflect2.MapType).Key().Kind() != reflect.String ||
-			typ.(reflect2.MapType).Elem().Kind() != reflect.Interface {
+		mapType := typ.(reflect2.MapType)
+		if mapType.Key().Kind() != reflect.String ||
+			mapType.Elem().Kind() != reflect.Interface ||
+			mapType.Elem().Type1().NumMethod() != 0 {
 			break
 		}
 		return encoderOfMapUnion(e, schema, typ)
@@ -117,13 +124,10 @@ func (d *mapUnionDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		return
 	}
 
-	// In a null case, just return
+	// A union map represents null as a nil map.
 	if resSchema.Type() == Null {
+		*((*unsafe.Pointer)(ptr)) = nil
 		return
-	}
-
-	if d.mapType.UnsafeIsNil(ptr) {
-		d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(1))
 	}
 
 	key := schemaTypeName(resSchema)
@@ -131,6 +135,15 @@ func (d *mapUnionDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 
 	elemPtr := d.elemType.UnsafeNew()
 	d.typeDecs[idx].Decode(elemPtr, r)
+	if r.Error != nil {
+		return
+	}
+
+	if d.mapType.UnsafeIsNil(ptr) {
+		d.mapType.UnsafeSet(ptr, d.mapType.UnsafeMakeMap(1))
+	} else {
+		reflect.ValueOf(d.mapType.UnsafeIndirect(ptr)).Clear()
+	}
 
 	d.mapType.UnsafeSetIndex(ptr, keyPtr, elemPtr)
 }
@@ -182,9 +195,23 @@ func (e *mapUnionEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 	}
 
 	val, err := w.cfg.typeConverters.EncodeTypeConvert(val, e.schema)
+	if errors.Is(err, errNoTypeConverter) {
+		val, err = w.cfg.typeConverters.EncodeTypeConvert(val, schema)
+	}
 	if err != nil && !errors.Is(err, errNoTypeConverter) {
 		w.Error = err
 		return
+	}
+	if val == nil {
+		switch schema.Type() {
+		case Null:
+			return
+		case Array:
+			val = []struct{}{}
+		default:
+			w.Error = fmt.Errorf("avro: cannot encode nil value for union type %s", name)
+			return
+		}
 	}
 
 	elemType := reflect2.TypeOf(val)
@@ -236,11 +263,19 @@ func (d *unionNullableDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 	}
 
 	if schema.Type() == Null {
-		*((*unsafe.Pointer)(ptr)) = nil
+		if d.isPtr {
+			*((*unsafe.Pointer)(ptr)) = nil
+		} else {
+			d.typ.(*reflect2.UnsafeSliceType).UnsafeSetNil(ptr)
+		}
 		return
 	}
 
 	defer func() {
+		if r.Error != nil {
+			return
+		}
+
 		if !d.isPtr {
 			obj := d.typ.UnsafeIndirect(ptr)
 			obj, err := r.cfg.typeConverters.DecodeTypeConvert(obj, d.schema)
@@ -254,6 +289,10 @@ func (d *unionNullableDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 				*(*unsafe.Pointer)(ptr) = nil
 				return
 			}
+			if !reflect.TypeOf(obj).AssignableTo(d.typ.Type1()) {
+				r.ReportError("decode union type converter", fmt.Sprintf("cannot assign %T to %s", obj, d.typ.String()))
+				return
+			}
 			d.typ.UnsafeSet(ptr, reflect2.PtrOf(obj))
 			return
 		}
@@ -264,6 +303,10 @@ func (d *unionNullableDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		}
 		if err != nil {
 			r.Error = err
+		}
+		if obj != nil && !reflect.TypeOf(obj).AssignableTo(d.typ.Type1()) {
+			r.ReportError("decode union type converter", fmt.Sprintf("cannot assign %T to %s", obj, d.typ.String()))
+			return
 		}
 		*((*unsafe.Pointer)(ptr)) = reflect2.PtrOf(obj)
 	}()
@@ -341,9 +384,17 @@ func (e *unionConverterToAnyCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 	}
 
 	typeOf := reflect2.TypeOf(val)
+	if typeOf == nil {
+		w.Error = errors.New("avro: expected ptr but received nil")
+		return
+	}
 	typeOfUnsafePtr, ok := typeOf.(*reflect2.UnsafePtrType)
 	if !ok {
 		w.Error = fmt.Errorf("avro: expected ptr but received %q", typeOf.String())
+		return
+	}
+	if reflect2.IsNil(val) {
+		w.Error = errors.New("avro: expected ptr but received nil")
 		return
 	}
 
@@ -409,14 +460,14 @@ func decoderOfResolvedUnion(d *decoderContext, schema Schema, _ reflect2.Type) (
 
 		typ, err := d.cfg.resolver.Type(name)
 		if err != nil {
-			if d.cfg.config.UnionResolutionError {
-				return nil, err
-			}
-
 			if d.cfg.config.PartialUnionTypeResolution {
 				decoders[i] = nil
 				types[i] = nil
 				continue
+			}
+
+			if d.cfg.config.UnionResolutionError {
+				return nil, err
 			}
 
 			decoders = []ValDecoder{}
@@ -458,6 +509,10 @@ func (d *unionResolvedDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 	}
 
 	defer func() {
+		if r.Error != nil {
+			return
+		}
+
 		obj, err := r.cfg.typeConverters.DecodeTypeConvert(*pObj, d.schema)
 		if err != nil && !errors.Is(err, errNoTypeConverter) {
 			r.Error = err
@@ -474,7 +529,7 @@ func (d *unionResolvedDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		// We cannot resolve this, set it to the map type
 		name := schemaTypeName(schema)
 		obj := map[string]any{}
-		vTyp, err := genericReceiver(schema)
+		vTyp, err := d.cfg.genericReceiver(schema)
 		if err != nil {
 			r.ReportError("Union", err.Error())
 			return
@@ -534,9 +589,17 @@ func (d *unionConverterFromAnyCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 	obj := new(any)
 	newPtr := reflect2.PtrOf(obj)
 	d.decoder.Decode(newPtr, r)
+	if r.Error != nil {
+		return
+	}
 
 	if *obj == nil {
 		if d.nullable {
+			if d.typ.Kind() == reflect.Ptr {
+				*((*unsafe.Pointer)(ptr)) = nil
+			} else {
+				d.typ.UnsafeSet(ptr, d.typ.UnsafeNew())
+			}
 			return
 		}
 
@@ -544,12 +607,15 @@ func (d *unionConverterFromAnyCodec) Decode(ptr unsafe.Pointer, r *Reader) {
 		return
 	}
 
+	var target any
 	if d.typ.Kind() == reflect.Ptr {
 		ptrType := d.typ.(*reflect2.UnsafePtrType).Elem()
 		elemPtr := ptrType.UnsafeNew()
 		*((*unsafe.Pointer)(ptr)) = elemPtr
+		target = d.typ.UnsafeIndirect(ptr)
+	} else {
+		target = d.typ.PackEFace(ptr)
 	}
-	target := d.typ.UnsafeIndirect(ptr)
 
 	unionConverter := target.(UnionConverter)
 	if err := unionConverter.FromAny(*obj); err != nil {
@@ -624,11 +690,14 @@ func (e *unionResolverEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 func getUnionSchema(schema *UnionSchema, r *Reader) (int, Schema) {
 	types := schema.Types()
 
-	idx := int(r.ReadInt())
-	if idx < 0 || idx > len(types)-1 {
+	idx := r.ReadLong()
+	if r.Error != nil {
+		return 0, nil
+	}
+	if idx < 0 || idx >= int64(len(types)) {
 		r.ReportError("decode union type", "unknown union type")
 		return 0, nil
 	}
 
-	return idx, types[idx]
+	return int(idx), types[idx]
 }

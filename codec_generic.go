@@ -22,7 +22,7 @@ func genericDecode(typ reflect2.Type, dec ValDecoder, r *Reader) any {
 	return obj
 }
 
-func genericReceiver(schema Schema) (reflect2.Type, error) {
+func (c *frozenConfig) genericReceiver(schema Schema) (reflect2.Type, error) {
 	if schema.Type() == Ref {
 		schema = schema.(*RefSchema).Schema()
 	}
@@ -90,7 +90,7 @@ func genericReceiver(schema Schema) (reflect2.Type, error) {
 		var v string
 		return reflect2.TypeOf(v), nil
 	case Bytes:
-		if ls != nil && ls.Type() == Decimal {
+		if _, ok := validDecimalLogicalSchema(schema); ok {
 			var v *big.Rat
 			return reflect2.TypeOf(v), nil
 		}
@@ -113,21 +113,33 @@ func genericReceiver(schema Schema) (reflect2.Type, error) {
 		return reflect2.TypeOf(v), nil
 	case Fixed:
 		fixed := schema.(*FixedSchema)
+		if err := c.checkFixedSize(fixed.Size()); err != nil {
+			return nil, err
+		}
 		ls := fixed.Logical()
 		if ls != nil {
 			switch ls.Type() {
 			case Duration:
-				var v LogicalDuration
-				return reflect2.TypeOf(v), nil
+				if fixed.Size() == 12 {
+					var v LogicalDuration
+					return reflect2.TypeOf(v), nil
+				}
 			case Decimal:
-				var v *big.Rat
-				return reflect2.TypeOf(v), nil
+				if _, ok := validDecimalLogicalSchema(fixed); ok {
+					var v *big.Rat
+					return reflect2.TypeOf(v), nil
+				}
 			}
 		}
-		v := byteSliceToArray(make([]byte, fixed.Size()), fixed.Size())
+		size := fixed.Size()
+		v := byteSliceToArray(make([]byte, size), size)
 		return reflect2.TypeOf(v), nil
 	default:
 		// This should not be possible.
 		return nil, errors.New("dynamic receiver not found for schema " + schemaName)
 	}
+}
+
+func isAllocatableFixedSize(size int) bool {
+	return size >= 0 && size < maxAllocSize
 }

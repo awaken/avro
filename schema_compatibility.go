@@ -1,21 +1,141 @@
 package avro
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"slices"
 	"sync"
 )
 
-type recursionError struct{}
-
-func (e recursionError) Error() string {
-	return ""
-}
-
 type compatKey struct {
 	reader [32]byte
 	writer [32]byte
+}
+
+type compatibilityFingerprintWriter struct {
+	data []byte
+	seen map[Schema]uint64
+}
+
+func compatibilityFingerprint(schema Schema) [32]byte {
+	w := compatibilityFingerprintWriter{seen: map[Schema]uint64{}}
+	w.writeSchema(schema)
+	return sha256.Sum256(w.data)
+}
+
+func (w *compatibilityFingerprintWriter) writeUint(value uint64) {
+	w.data = binary.AppendUvarint(w.data, value)
+}
+
+func (w *compatibilityFingerprintWriter) writeString(value string) {
+	w.writeUint(uint64(len(value)))
+	w.data = append(w.data, value...)
+}
+
+func (w *compatibilityFingerprintWriter) writeStrings(values []string) {
+	w.writeUint(uint64(len(values)))
+	for _, value := range values {
+		w.writeString(value)
+	}
+}
+
+func (w *compatibilityFingerprintWriter) writeDefinition(schema Schema) bool {
+	if id, ok := w.seen[schema]; ok {
+		w.writeString("reference")
+		w.writeUint(id)
+		return false
+	}
+
+	id := uint64(len(w.seen) + 1)
+	w.seen[schema] = id
+	w.writeString("definition")
+	w.writeUint(id)
+	return true
+}
+
+func (w *compatibilityFingerprintWriter) writeSchema(schema Schema) {
+	switch s := schema.(type) {
+	case *RefSchema:
+		w.writeSchema(s.Schema())
+	case *PrimitiveSchema:
+		w.writeString("primitive")
+		w.writeString(string(s.Type()))
+		w.writeDecimal(s)
+	case *NullSchema:
+		w.writeString("null")
+	case *RecordSchema:
+		if !w.writeDefinition(s) {
+			return
+		}
+		w.writeString("record")
+		w.writeString(s.FullName())
+		w.writeStrings(s.Aliases())
+		fields := s.Fields()
+		w.writeUint(uint64(len(fields)))
+		for _, field := range fields {
+			w.writeString(field.Name())
+			w.writeStrings(field.Aliases())
+			if field.HasDefault() {
+				w.writeUint(1)
+			} else {
+				w.writeUint(0)
+			}
+			w.writeSchema(field.Type())
+		}
+	case *EnumSchema:
+		if !w.writeDefinition(s) {
+			return
+		}
+		w.writeString("enum")
+		w.writeString(s.FullName())
+		w.writeStrings(s.Aliases())
+		w.writeStrings(s.Symbols())
+		if s.HasDefault() {
+			w.writeUint(1)
+		} else {
+			w.writeUint(0)
+		}
+	case *FixedSchema:
+		if !w.writeDefinition(s) {
+			return
+		}
+		w.writeString("fixed")
+		w.writeString(s.FullName())
+		w.writeStrings(s.Aliases())
+		w.writeUint(uint64(s.Size()))
+		w.writeDecimal(s)
+	case *ArraySchema:
+		w.writeString("array")
+		w.writeSchema(s.Items())
+	case *MapSchema:
+		w.writeString("map")
+		w.writeSchema(s.Values())
+	case *UnionSchema:
+		w.writeString("union")
+		types := s.Types()
+		w.writeUint(uint64(len(types)))
+		for _, typ := range types {
+			w.writeSchema(typ)
+		}
+	default:
+		w.writeString("schema")
+		fingerprint := schema.CacheFingerprint()
+		w.data = append(w.data, fingerprint[:]...)
+	}
+}
+
+func (w *compatibilityFingerprintWriter) writeDecimal(schema LogicalTypeSchema) {
+	decimal, ok := schema.Logical().(*DecimalLogicalSchema)
+	if !ok {
+		w.writeUint(0)
+		return
+	}
+
+	w.writeUint(1)
+	w.writeUint(uint64(decimal.Precision()))
+	w.writeUint(uint64(decimal.Scale()))
 }
 
 // SchemaCompatibility determines the compatibility of schemas.
@@ -28,28 +148,36 @@ func NewSchemaCompatibility() *SchemaCompatibility {
 	return &SchemaCompatibility{}
 }
 
-// Compatible determines the compatibility if the reader and writer schemas.
+// Compatible determines whether the reader can read the writer schema.
+// Each reader field must match at most one writer name, through its name or aliases.
+// Ambiguous matches are rejected, including an exact match plus an alias match.
 func (c *SchemaCompatibility) Compatible(reader, writer Schema) error {
-	return c.compatible(reader, writer)
+	if isNilSchema(reader) {
+		return errors.New("avro: reader schema is nil")
+	}
+	if isNilSchema(writer) {
+		return errors.New("avro: writer schema is nil")
+	}
+
+	return c.compatible(reader, writer, map[compatKey]struct{}{})
 }
 
-func (c *SchemaCompatibility) compatible(reader, writer Schema) error {
-	key := compatKey{reader: reader.Fingerprint(), writer: writer.Fingerprint()}
+func (c *SchemaCompatibility) compatible(reader, writer Schema, active map[compatKey]struct{}) error {
+	key := compatKey{reader: compatibilityFingerprint(reader), writer: compatibilityFingerprint(writer)}
 	if err, ok := c.cache.Load(key); ok {
-		if _, ok := err.(recursionError); ok {
-			// Break the recursion here.
-			return nil
-		}
-
 		if err == nil {
 			return nil
 		}
 
 		return err.(error)
 	}
+	if _, ok := active[key]; ok {
+		return nil
+	}
 
-	c.cache.Store(key, recursionError{})
-	err := c.match(reader, writer)
+	active[key] = struct{}{}
+	err := c.match(reader, writer, active)
+	delete(active, key)
 	if err != nil {
 		// We dont want to pay the cost of fmt.Errorf every time
 		err = errors.New(err.Error())
@@ -58,7 +186,7 @@ func (c *SchemaCompatibility) compatible(reader, writer Schema) error {
 	return err
 }
 
-func (c *SchemaCompatibility) match(reader, writer Schema) error {
+func (c *SchemaCompatibility) match(reader, writer Schema, active map[compatKey]struct{}) error {
 	// If the schema is a reference, get the actual schema
 	if reader.Type() == Ref {
 		reader = reader.(*RefSchema).Schema()
@@ -66,12 +194,15 @@ func (c *SchemaCompatibility) match(reader, writer Schema) error {
 	if writer.Type() == Ref {
 		writer = writer.(*RefSchema).Schema()
 	}
+	if err := checkDecimalCompatibility(reader, writer); err != nil {
+		return err
+	}
 
 	if reader.Type() != writer.Type() {
 		if writer.Type() == Union {
 			// Reader must be compatible with all types in writer
 			for _, schema := range writer.(*UnionSchema).Types() {
-				if err := c.compatible(reader, schema); err != nil {
+				if err := c.compatible(reader, schema, active); err != nil {
 					return err
 				}
 			}
@@ -83,7 +214,7 @@ func (c *SchemaCompatibility) match(reader, writer Schema) error {
 			// Writer must be compatible with at least one reader schema
 			var err error
 			for _, schema := range reader.(*UnionSchema).Types() {
-				err = c.compatible(schema, writer)
+				err = c.compatible(schema, writer, active)
 				if err == nil {
 					return nil
 				}
@@ -124,10 +255,10 @@ func (c *SchemaCompatibility) match(reader, writer Schema) error {
 
 	switch reader.Type() {
 	case Array:
-		return c.compatible(reader.(*ArraySchema).Items(), writer.(*ArraySchema).Items())
+		return c.compatible(reader.(*ArraySchema).Items(), writer.(*ArraySchema).Items(), active)
 
 	case Map:
-		return c.compatible(reader.(*MapSchema).Values(), writer.(*MapSchema).Values())
+		return c.compatible(reader.(*MapSchema).Values(), writer.(*MapSchema).Values(), active)
 
 	case Fixed:
 		r := reader.(*FixedSchema)
@@ -164,19 +295,39 @@ func (c *SchemaCompatibility) match(reader, writer Schema) error {
 			return err
 		}
 
-		if err := c.checkRecordFields(r, w); err != nil {
+		if err := c.checkRecordFields(r, w, active); err != nil {
 			return err
 		}
 
 	case Union:
 		for _, schema := range writer.(*UnionSchema).Types() {
-			if err := c.compatible(reader, schema); err != nil {
+			if err := c.compatible(reader, schema, active); err != nil {
 				return err
 			}
 		}
 	}
 
 	return nil
+}
+
+func checkDecimalCompatibility(reader, writer Schema) error {
+	r, rOK := decimalLogicalSchema(reader)
+	w, wOK := decimalLogicalSchema(writer)
+	if !rOK || !wOK {
+		return nil
+	}
+	if r.Precision() != w.Precision() || r.Scale() != w.Scale() {
+		return fmt.Errorf(
+			"reader decimal precision %d and scale %d do not match writer decimal precision %d and scale %d",
+			r.Precision(), r.Scale(), w.Precision(), w.Scale(),
+		)
+	}
+
+	return nil
+}
+
+func decimalLogicalSchema(schema Schema) (*DecimalLogicalSchema, bool) {
+	return validDecimalLogicalSchema(schema)
 }
 
 func (c *SchemaCompatibility) checkSchemaName(reader, writer NamedSchema) error {
@@ -220,12 +371,17 @@ func (c *SchemaCompatibility) identicalEnumSymbols(reader, writer *EnumSchema) b
 	return true
 }
 
-func (c *SchemaCompatibility) checkRecordFields(reader, writer *RecordSchema) error {
-	for _, field := range reader.Fields() {
-		f, ok := c.getField(writer.Fields(), field, func(gfo *getFieldOptions) {
-			gfo.fieldAlias = true
-		})
-		if !ok {
+func (c *SchemaCompatibility) checkRecordFields(
+	reader, writer *RecordSchema,
+	active map[compatKey]struct{},
+) error {
+	matched, err := matchRecordFields(reader, writer)
+	if err != nil {
+		return err
+	}
+	for _, field := range reader.fields {
+		f := matched[field]
+		if f == nil {
 			if field.HasDefault() {
 				continue
 			}
@@ -233,7 +389,7 @@ func (c *SchemaCompatibility) checkRecordFields(reader, writer *RecordSchema) er
 			return fmt.Errorf("reader field %s is missing in writer schema and has no default", field.Name())
 		}
 
-		if err := c.compatible(field.Type(), f.Type()); err != nil {
+		if err := c.compatible(field.Type(), f.Type(), active); err != nil {
 			return err
 		}
 	}
@@ -241,33 +397,35 @@ func (c *SchemaCompatibility) checkRecordFields(reader, writer *RecordSchema) er
 	return nil
 }
 
-type getFieldOptions struct {
-	fieldAlias bool
-	elemAlias  bool
-}
-
-func (c *SchemaCompatibility) getField(a []*Field, f *Field, optFns ...func(*getFieldOptions)) (*Field, bool) {
-	opt := getFieldOptions{}
-	for _, fn := range optFns {
-		fn(&opt)
+// Match before type recursion so compatibility and resolution use the same mapping.
+// Writer aliases do not rename wire fields; only reader aliases participate.
+func matchRecordFields(reader, writer *RecordSchema) (map[*Field]*Field, error) {
+	writers := make(map[string]*Field, len(writer.fields))
+	for _, field := range writer.fields {
+		writers[field.name] = field
 	}
-	for _, field := range a {
-		if field.Name() == f.Name() {
-			return field, true
-		}
-		if opt.fieldAlias {
-			if slices.Contains(f.Aliases(), field.Name()) {
-				return field, true
+	matched := make(map[*Field]*Field, len(reader.fields))
+	used := make(map[*Field]*Field, len(reader.fields))
+	for _, field := range reader.fields {
+		match := writers[field.name]
+		for _, alias := range field.aliases {
+			if candidate := writers[alias]; candidate != nil {
+				if match != nil {
+					return nil, fmt.Errorf("reader field %s matches multiple writer fields", field.name)
+				}
+				match = candidate
 			}
 		}
-		if opt.elemAlias {
-			if slices.Contains(field.Aliases(), f.Name()) {
-				return field, true
-			}
+		if match == nil {
+			continue
 		}
+		if other := used[match]; other != nil {
+			return nil, fmt.Errorf("writer field %s matches multiple reader fields", match.name)
+		}
+		matched[field] = match
+		used[match] = field
 	}
-
-	return nil, false
+	return matched, nil
 }
 
 // Resolve returns a composite schema that allows decoding data written by the writer schema,
@@ -275,7 +433,7 @@ func (c *SchemaCompatibility) getField(a []*Field, f *Field, optFns ...func(*get
 //
 // It fails if the writer and reader schemas are not compatible.
 func (c *SchemaCompatibility) Resolve(reader, writer Schema) (Schema, error) {
-	if err := c.compatible(reader, writer); err != nil {
+	if err := c.Compatible(reader, writer); err != nil {
 		return nil, err
 	}
 
@@ -297,7 +455,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 			for _, schema := range reader.(*UnionSchema).Types() {
 				// Compatibility is not guaranteed for every Union reader schema.
 				// Therefore, we need to check compatibility in every iteration.
-				if err := c.compatible(schema, writer); err != nil {
+				if err := c.Compatible(schema, writer); err != nil {
 					continue
 				}
 				sch, _, err := c.resolve(schema, writer)
@@ -325,6 +483,7 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 
 		if isPromotable(writer.Type(), reader.Type()) {
 			r := NewPrimitiveSchema(reader.Type(), reader.(*PrimitiveSchema).Logical(),
+				WithProps(reader.(*PrimitiveSchema).Props()),
 				withWriterFingerprint(writer.Fingerprint()),
 			)
 			r.encodedType = writer.Type()
@@ -345,7 +504,9 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 			if r.HasDefault() {
 				enum, _ := NewEnumSchema(r.Name(), r.Namespace(), r.Symbols(),
 					WithAliases(r.Aliases()),
+					WithDoc(r.Doc()),
 					WithDefault(r.Default()),
+					WithProps(r.Props()),
 					withWriterFingerprint(w.Fingerprint()),
 				)
 				enum.encodedSymbols = w.Symbols()
@@ -356,6 +517,8 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 		if !c.identicalEnumSymbols(r, w) {
 			opts := []SchemaOption{
 				WithAliases(r.Aliases()),
+				WithDoc(r.Doc()),
+				WithProps(r.Props()),
 				withWriterFingerprint(w.Fingerprint()),
 			}
 			if r.HasDefault() {
@@ -394,7 +557,10 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 		if err != nil {
 			return nil, false, err
 		}
-		return NewArraySchema(schema, withWriterFingerprintIfResolved(writer.Fingerprint(), resolved)), resolved, nil
+		return NewArraySchema(schema,
+			WithProps(reader.(*ArraySchema).Props()),
+			withWriterFingerprintIfResolved(writer.Fingerprint(), resolved),
+		), resolved, nil
 	}
 
 	if writer.Type() == Map {
@@ -402,7 +568,10 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 		if err != nil {
 			return nil, false, err
 		}
-		return NewMapSchema(schema, withWriterFingerprintIfResolved(writer.Fingerprint(), resolved)), resolved, nil
+		return NewMapSchema(schema,
+			WithProps(reader.(*MapSchema).Props()),
+			withWriterFingerprintIfResolved(writer.Fingerprint(), resolved),
+		), resolved, nil
 	}
 
 	if writer.Type() == Record {
@@ -415,19 +584,30 @@ func (c *SchemaCompatibility) resolve(reader, writer Schema) (schema Schema, res
 func (c *SchemaCompatibility) resolveRecord(reader, writer Schema) (Schema, bool, error) {
 	w := writer.(*RecordSchema)
 	r := reader.(*RecordSchema)
+	matched, err := matchRecordFields(r, w)
+	if err != nil {
+		return nil, false, err
+	}
+	readers := make(map[*Field]*Field, len(matched))
+	for reader, writer := range matched {
+		readers[writer] = reader
+	}
 
 	fields := make([]*Field, 0)
-	seen := make(map[string]struct{})
 
 	var resolved bool
-	for _, wf := range w.Fields() {
-		rf, ok := c.getField(r.Fields(), wf, func(gfo *getFieldOptions) {
-			gfo.elemAlias = true
-		})
-		if !ok {
+	for _, wf := range w.fields {
+		rf := readers[wf]
+		if rf == nil {
 			// The field was not found in the reader schema, it should be ignored.
-			f, _ := NewField(wf.Name(), wf.Type(), WithAliases(wf.aliases), WithOrder(wf.order))
+			// Its writer aliases are irrelevant and may conflict with reader names.
+			f, _ := NewField(wf.Name(), wf.Type(),
+				WithDoc(wf.Doc()),
+				WithOrder(wf.Order()),
+				WithProps(wf.Props()),
+			)
 			f.def = wf.def
+			f.jsonDef = cloneDefault(wf.jsonDef)
 			f.hasDef = wf.hasDef
 			f.action = FieldIgnore
 			fields = append(fields, f)
@@ -440,17 +620,21 @@ func (c *SchemaCompatibility) resolveRecord(reader, writer Schema) (Schema, bool
 		if err != nil {
 			return nil, false, err
 		}
-		f, _ := NewField(rf.Name(), ft, WithAliases(rf.aliases), WithOrder(rf.order))
+		f, _ := NewField(rf.Name(), ft,
+			WithAliases(rf.Aliases()),
+			WithDoc(rf.Doc()),
+			WithOrder(rf.Order()),
+			WithProps(rf.Props()),
+		)
 		f.def = rf.def
+		f.jsonDef = cloneDefault(rf.jsonDef)
 		f.hasDef = rf.hasDef
 		fields = append(fields, f)
 		resolved = resolv || resolved
-
-		seen[rf.Name()] = struct{}{}
 	}
 
-	for _, rf := range r.Fields() {
-		if _, ok := seen[rf.Name()]; ok {
+	for _, rf := range r.fields {
+		if matched[rf] != nil {
 			// This field has already been seen.
 			continue
 		}
@@ -458,8 +642,14 @@ func (c *SchemaCompatibility) resolveRecord(reader, writer Schema) (Schema, bool
 		// The schemas are already known to be compatible, so there must be a default on
 		// the field in the writer. Use the default.
 
-		f, _ := NewField(rf.Name(), rf.Type(), WithAliases(rf.aliases), WithOrder(rf.order))
+		f, _ := NewField(rf.Name(), rf.Type(),
+			WithAliases(rf.Aliases()),
+			WithDoc(rf.Doc()),
+			WithOrder(rf.Order()),
+			WithProps(rf.Props()),
+		)
 		f.def = rf.def
+		f.jsonDef = cloneDefault(rf.jsonDef)
 		f.hasDef = rf.hasDef
 		f.action = FieldSetDefault
 		fields = append(fields, f)
@@ -467,10 +657,18 @@ func (c *SchemaCompatibility) resolveRecord(reader, writer Schema) (Schema, bool
 		resolved = true
 	}
 
-	schema, err := NewRecordSchema(r.Name(), r.Namespace(), fields,
+	opts := []SchemaOption{
 		WithAliases(r.Aliases()),
+		WithDoc(r.Doc()),
+		WithProps(r.Props()),
 		withWriterFingerprintIfResolved(writer.Fingerprint(), resolved),
-	)
+	}
+	var schema *RecordSchema
+	if r.IsError() {
+		schema, err = NewErrorRecordSchema(r.Name(), r.Namespace(), fields, opts...)
+	} else {
+		schema, err = NewRecordSchema(r.Name(), r.Namespace(), fields, opts...)
+	}
 	return schema, resolved, err
 }
 

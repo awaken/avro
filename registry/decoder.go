@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"reflect"
 
 	"github.com/awaken/avro/v2"
 )
@@ -32,9 +33,25 @@ func NewDecoder(client *Client, opts ...DecoderFunc) *Decoder {
 		api:    avro.DefaultConfig,
 	}
 	for _, opt := range opts {
-		opt(d)
+		if opt != nil {
+			opt(d)
+		}
 	}
 	return d
+}
+
+func isNilAPI(api avro.API) bool {
+	if api == nil {
+		return true
+	}
+
+	value := reflect.ValueOf(api)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 // Decode decodes data into v.
@@ -51,10 +68,16 @@ func (d *Decoder) Decode(ctx context.Context, data []byte, v any) error {
 	if err != nil {
 		return fmt.Errorf("extracting schema id: %w", err)
 	}
+	if d.client == nil {
+		return errors.New("registry client cannot be nil")
+	}
 
 	schema, err := d.client.GetSchema(ctx, id)
 	if err != nil {
 		return fmt.Errorf("getting schema: %w", err)
+	}
+	if isNilAPI(d.api) {
+		return errors.New("avro API cannot be nil")
 	}
 
 	return d.api.Unmarshal(schema, data[5:], v)

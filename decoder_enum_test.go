@@ -142,6 +142,7 @@ func TestDecoder_EnumTextUnmarshalerEnumError(t *testing.T) {
 	err = dec.Decode(&got)
 
 	assert.Error(t, err)
+	assert.Nil(t, got)
 }
 
 func TestDecoder_EnumTextUnmarshalerError(t *testing.T) {
@@ -156,6 +157,21 @@ func TestDecoder_EnumTextUnmarshalerError(t *testing.T) {
 	err = dec.Decode(&got)
 
 	assert.Error(t, err)
+}
+
+func TestDecoder_EnumTextUnmarshalerInterface(t *testing.T) {
+	dec, err := avro.NewDecoder(
+		`{"type":"enum","name":"test","symbols":["x"]}`,
+		bytes.NewReader([]byte{0}),
+	)
+	require.NoError(t, err)
+	var got interface{ UnmarshalText([]byte) error }
+
+	assert.NotPanics(t, func() {
+		err = dec.Decode(&got)
+	})
+
+	require.Error(t, err)
 }
 
 type testEnumUnmarshalerObj struct {

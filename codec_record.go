@@ -130,6 +130,9 @@ func (d *structDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		// Skip case
 		if field.field == nil {
 			field.decoder.Decode(nil, r)
+			if r.Error != nil {
+				return
+			}
 			continue
 		}
 
@@ -152,11 +155,13 @@ func (d *structDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		}
 		field.decoder.Decode(fieldPtr, r)
 
-		if r.Error != nil && !errors.Is(r.Error, io.EOF) {
-			for _, f := range field.field {
-				r.Error = fmt.Errorf("%s: %w", f.Name(), r.Error)
-				return
+		if r.Error != nil {
+			if !errors.Is(r.Error, io.EOF) {
+				for _, f := range field.field {
+					r.Error = fmt.Errorf("%s: %w", f.Name(), r.Error)
+				}
 			}
+			return
 		}
 	}
 }
@@ -182,18 +187,11 @@ func encoderOfStruct(e *encoderContext, rec *RecordSchema, typ reflect2.Type) Va
 		}
 
 		def := field.Default()
-		if field.Default() == nil {
+		if field.Type().Type() == Union {
+			def = recordUnionDefault(field)
+		} else if def == nil {
 			if field.Type().Type() == Null {
 				// We write nothing in a Null case, just skip it
-				continue
-			}
-
-			if field.Type().Type() == Union && field.Type().(*UnionSchema).Nullable() {
-				defaultType := reflect2.TypeOf(&def)
-				fields = append(fields, &structFieldEncoder{
-					defaultPtr: reflect2.PtrOf(&def),
-					encoder:    encoderOfNullableUnion(e, field.Type(), defaultType),
-				})
 				continue
 			}
 		}
@@ -209,6 +207,21 @@ func encoderOfStruct(e *encoderContext, rec *RecordSchema, typ reflect2.Type) Va
 		})
 	}
 	return &structEncoder{typ: typ, fields: fields}
+}
+
+func recordUnionDefault(field *Field) map[string]any {
+	union := field.Type().(*UnionSchema)
+	defaultSchema := union.types[0]
+
+	// Select the first branch that accepted the original JSON default.
+	for _, schema := range union.types {
+		if _, ok := isValidDefault(schema, field.jsonDef); ok {
+			defaultSchema = schema
+			break
+		}
+	}
+
+	return map[string]any{schemaTypeName(defaultSchema): field.Default()}
 }
 
 type structFieldEncoder struct {
@@ -227,6 +240,9 @@ func (e *structEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 		// Default case
 		if field.field == nil {
 			field.encoder.Encode(field.defaultPtr, w)
+			if w.Error != nil {
+				return
+			}
 			continue
 		}
 
@@ -249,11 +265,14 @@ func (e *structEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 		}
 		field.encoder.Encode(fieldPtr, w)
 
-		if w.Error != nil && !errors.Is(w.Error, io.EOF) {
-			for _, f := range field.field {
-				w.Error = fmt.Errorf("%s: %w", f.Name(), w.Error)
-				return
+		if w.Error != nil {
+			if !errors.Is(w.Error, io.EOF) {
+				for _, f := range field.field {
+					w.Error = fmt.Errorf("%s: %w", f.Name(), w.Error)
+					return
+				}
 			}
+			return
 		}
 	}
 }
@@ -315,6 +334,9 @@ func (d *recordMapDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 	for _, field := range d.fields {
 		elemPtr := d.elemType.UnsafeNew()
 		field.decoder.Decode(elemPtr, r)
+		if r.Error != nil {
+			break
+		}
 		if field.skip {
 			continue
 		}
@@ -342,10 +364,7 @@ func encoderOfRecord(e *encoderContext, rec *RecordSchema, typ reflect2.Type) Va
 		if field.HasDefault() {
 			switch {
 			case field.Type().Type() == Union:
-				union := field.Type().(*UnionSchema)
-				fields[i].def = map[string]any{
-					string(union.Types()[0].Type()): field.Default(),
-				}
+				fields[i].def = recordUnionDefault(field)
 			case field.Default() == nil:
 				continue
 			}
@@ -396,13 +415,21 @@ func (e *recordMapEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 
 			defPtr := reflect2.PtrOf(field.def)
 			field.defEncoder.Encode(defPtr, w)
+			if w.Error != nil {
+				if !errors.Is(w.Error, io.EOF) {
+					w.Error = fmt.Errorf("%s: %w", field.name, w.Error)
+				}
+				return
+			}
 			continue
 		}
 
 		field.encoder.Encode(valPtr, w)
 
-		if w.Error != nil && !errors.Is(w.Error, io.EOF) {
-			w.Error = fmt.Errorf("%s: %w", field.name, w.Error)
+		if w.Error != nil {
+			if !errors.Is(w.Error, io.EOF) {
+				w.Error = fmt.Errorf("%s: %w", field.name, w.Error)
+			}
 			return
 		}
 	}
