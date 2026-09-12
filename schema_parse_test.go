@@ -1,6 +1,7 @@
 package avro_test
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/awaken/avro/v2"
@@ -27,4 +28,25 @@ func TestParse_RecordAliasNamespace(t *testing.T) {
 
 	_, err := avro.ParseWithCache(`{"type":"record","name":"R","fields":[{"name":"value","type":"int","aliases":["old-name",""]},{"name":"next","type":["null","R"]}]}`, "", nil)
 	require.NoError(t, err, "arbitrary alias text and recursive records remain valid")
+}
+
+func TestExactNumericProperties(t *testing.T) {
+	for _, number := range []string{"9007199254740993", "1e400", "1e-400", "0.10000000000000001"} {
+		schema, err := avro.Parse(`{"type":"long","n":` + number + `,"nested":{"values":[` + number + `]}}`)
+		require.NoError(t, err, number)
+		require.Equal(t, json.Number(number), schema.(*avro.PrimitiveSchema).Prop("n"))
+		require.Equal(t, json.Number(number), schema.(*avro.PrimitiveSchema).Prop("nested").(map[string]any)["values"].([]any)[0])
+		data, err := json.Marshal(schema)
+		require.NoError(t, err)
+		var raw map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(data, &raw))
+		require.Equal(t, number, string(raw["n"]))
+	}
+	for _, number := range []string{"2", "2.0", "2e0", "0.1", "-0", "9007199254740992"} {
+		schema, err := avro.Parse(`{"type":"long","n":` + number + `}`)
+		require.NoError(t, err)
+		value, err := json.Number(number).Float64()
+		require.NoError(t, err)
+		require.Equal(t, value, schema.(*avro.PrimitiveSchema).Prop("n"))
+	}
 }

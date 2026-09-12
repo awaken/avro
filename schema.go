@@ -697,6 +697,12 @@ func (s *RecordSchema) Fields() []*Field {
 	return slices.Clone(s.fields)
 }
 
+// canonicalString quotes a schema name or symbol without HTML escaping.
+func canonicalString(value string) string {
+	data, _ := schemaJSONAPI.Marshal(value)
+	return string(data)
+}
+
 // String returns the canonical form of the schema.
 func (s *RecordSchema) String() string {
 	typ := "record"
@@ -712,7 +718,7 @@ func (s *RecordSchema) String() string {
 		fields = fields[:len(fields)-1]
 	}
 
-	return `{"name":"` + s.FullName() + `","type":"` + typ + `","fields":[` + fields + `]}`
+	return `{"name":` + canonicalString(s.FullName()) + `,"type":"` + typ + `","fields":[` + fields + `]}`
 }
 
 // MarshalJSON marshals the schema to json.
@@ -921,7 +927,7 @@ func (f *Field) Order() Order {
 
 // String returns the canonical form of a field.
 func (f *Field) String() string {
-	return `{"name":"` + f.name + `","type":` + f.typ.String() + `}`
+	return `{"name":` + canonicalString(f.name) + `,"type":` + f.typ.String() + `}`
 }
 
 // MarshalJSON marshals the schema to json.
@@ -1099,13 +1105,13 @@ func (s *EnumSchema) HasDefault() bool {
 func (s *EnumSchema) String() string {
 	symbols := ""
 	for _, sym := range s.symbols {
-		symbols += `"` + sym + `",`
+		symbols += canonicalString(sym) + ","
 	}
 	if len(symbols) > 0 {
 		symbols = symbols[:len(symbols)-1]
 	}
 
-	return `{"name":"` + s.FullName() + `","type":"enum","symbols":[` + symbols + `]}`
+	return `{"name":` + canonicalString(s.FullName()) + `,"type":"enum","symbols":[` + symbols + `]}`
 }
 
 // MarshalJSON marshals the schema to json.
@@ -1184,8 +1190,17 @@ type ArraySchema struct {
 	items Schema
 }
 
-// NewArraySchema creates an array schema instance.
+// NewArraySchema creates a schema, or returns nil when items is nil.
 func NewArraySchema(items Schema, opts ...SchemaOption) *ArraySchema {
+	schema, _ := NewArraySchemaChecked(items, opts...)
+	return schema
+}
+
+// NewArraySchemaChecked creates a schema or returns an error for nil items.
+func NewArraySchemaChecked(items Schema, opts ...SchemaOption) (*ArraySchema, error) {
+	if isNilSchema(items) {
+		return nil, errors.New("avro: array items cannot be nil")
+	}
 	var cfg schemaConfig
 	for _, opt := range opts {
 		opt(&cfg)
@@ -1195,7 +1210,7 @@ func NewArraySchema(items Schema, opts ...SchemaOption) *ArraySchema {
 		properties:         newProperties(cfg.props, arrayReserved),
 		cacheFingerprinter: cacheFingerprinter{writerFingerprint: cfg.wfp},
 		items:              items,
-	}
+	}, nil
 }
 
 // Type returns the type of the schema.
@@ -1254,8 +1269,17 @@ type MapSchema struct {
 	values Schema
 }
 
-// NewMapSchema creates a map schema instance.
+// NewMapSchema creates a schema, or returns nil when values is nil.
 func NewMapSchema(values Schema, opts ...SchemaOption) *MapSchema {
+	schema, _ := NewMapSchemaChecked(values, opts...)
+	return schema
+}
+
+// NewMapSchemaChecked creates a schema or returns an error for nil values.
+func NewMapSchemaChecked(values Schema, opts ...SchemaOption) (*MapSchema, error) {
+	if isNilSchema(values) {
+		return nil, errors.New("avro: map values cannot be nil")
+	}
 	var cfg schemaConfig
 	for _, opt := range opts {
 		opt(&cfg)
@@ -1265,7 +1289,7 @@ func NewMapSchema(values Schema, opts ...SchemaOption) *MapSchema {
 		properties:         newProperties(cfg.props, mapReserved),
 		cacheFingerprinter: cacheFingerprinter{writerFingerprint: cfg.wfp},
 		values:             values,
-	}
+	}, nil
 }
 
 // Type returns the type of the schema.
@@ -1538,7 +1562,7 @@ func (s *FixedSchema) Logical() LogicalSchema {
 // String returns the canonical form of the schema.
 func (s *FixedSchema) String() string {
 	size := strconv.Itoa(s.size)
-	return `{"name":"` + s.FullName() + `","type":"fixed","size":` + size + `}`
+	return `{"name":` + canonicalString(s.FullName()) + `,"type":"fixed","size":` + size + `}`
 }
 
 // MarshalJSON marshals the schema to json.
@@ -1658,11 +1682,18 @@ type RefSchema struct {
 	actual NamedSchema
 }
 
-// NewRefSchema creates a ref schema instance.
+// NewRefSchema creates a reference, or returns nil when schema is nil.
 func NewRefSchema(schema NamedSchema) *RefSchema {
-	return &RefSchema{
-		actual: schema,
+	ref, _ := NewRefSchemaChecked(schema)
+	return ref
+}
+
+// NewRefSchemaChecked creates a reference or returns an error for a nil schema.
+func NewRefSchemaChecked(schema NamedSchema) (*RefSchema, error) {
+	if isNilSchema(schema) {
+		return nil, errors.New("avro: referenced schema cannot be nil")
 	}
+	return &RefSchema{actual: schema}, nil
 }
 
 // Type returns the type of the schema.
@@ -1677,7 +1708,7 @@ func (s *RefSchema) Schema() NamedSchema {
 
 // String returns the canonical form of the schema.
 func (s *RefSchema) String() string {
-	return `"` + s.actual.FullName() + `"`
+	return canonicalString(s.actual.FullName())
 }
 
 // MarshalJSON marshals the schema to json.
@@ -2174,6 +2205,14 @@ func LegacyParsingCanonicalForm(schema Schema) string {
 			fields = fields[:len(fields)-1]
 		}
 		return `{"name":"` + s.FullName() + `","type":"` + typ + `","fields":[` + fields + `]}`
+	case *EnumSchema:
+		symbols := make([]string, len(s.symbols))
+		for i, symbol := range s.symbols {
+			symbols[i] = `"` + symbol + `"`
+		}
+		return `{"name":"` + s.FullName() + `","type":"enum","symbols":[` + strings.Join(symbols, ",") + `]}`
+	case *RefSchema:
+		return `"` + s.actual.FullName() + `"`
 	case *ArraySchema:
 		return `{"type":"array","items":` + LegacyParsingCanonicalForm(s.items) + `}`
 	case *MapSchema:

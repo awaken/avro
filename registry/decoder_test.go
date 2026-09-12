@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/awaken/avro/v2"
@@ -180,4 +182,102 @@ func TestDecoder_DecodeResolvedReference(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, map[string]any{"child": map[string]any{"value": "ok"}}, got)
+}
+
+type headerDecoder interface {
+	DecodeHeaders(context.Context, []byte, []registry.Header, bool, any) error
+}
+
+func TestDecodeGUIDHeaders(t *testing.T) {
+	const guid = "00010203-0405-0607-0809-0a0b0c0d0e0f"
+	header := []byte{1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	var paths []string
+	client, err := registry.NewClient("https://registry.invalid/base/", registry.WithHTTPClient(&http.Client{
+		Transport: registryResponseTransport(func(r *http.Request) (*http.Response, error) {
+			paths = append(paths, r.URL.RequestURI())
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"schema":"long"}`))}, nil
+		}),
+	}))
+	require.NoError(t, err)
+	dec, ok := any(registry.NewDecoder(client)).(headerDecoder)
+	require.True(t, ok, "missing header-aware decoding capability")
+	var got int64
+	for _, key := range []bool{false, true} {
+		name := "__value_schema_id"
+		if key {
+			name = "__key_schema_id"
+		}
+		headers := []registry.Header{{Key: name, Value: []byte{0}}, {Key: name, Value: header}}
+		require.NoError(t, dec.DecodeHeaders(context.Background(), []byte{84}, headers, key, &got))
+		require.Equal(t, int64(42), got)
+	}
+	require.Equal(t, []string{"/base/schemas/guids/" + guid}, paths, "GUID lookup is cached")
+	require.NoError(t, dec.DecodeHeaders(context.Background(), []byte{0, 0, 0, 0, 7, 12}, nil, false, &got))
+	require.Equal(t, int64(6), got)
+	require.Equal(t, "/base/schemas/ids/7?format=resolved", paths[1])
+}
+
+func TestDecodeGUIDRejectsMalformedHeader(t *testing.T) {
+	dec, ok := any(registry.NewDecoder(nil)).(headerDecoder)
+	require.True(t, ok, "missing header-aware decoding capability")
+	for _, header := range [][]byte{nil, {}, {1}, make([]byte, 17), append([]byte{1}, make([]byte, 17)...)} {
+		var got int64 = 99
+		// A present invalid header cannot fall back to otherwise valid legacy bytes.
+		err := dec.DecodeHeaders(context.Background(), []byte{0, 0, 0, 0, 7, 12}, []registry.Header{{Key: "__value_schema_id", Value: header}}, false, &got)
+		require.ErrorContains(t, err, "header")
+		require.Equal(t, int64(99), got)
+	}
+}
+
+func TestGUIDHeaderPrecedence(t *testing.T) {
+	header := append([]byte{1}, make([]byte, 16)...)
+	calls := 0
+	client, err := registry.NewClient("https://registry.invalid", registry.WithHTTPClient(&http.Client{
+		Transport: registryResponseTransport(func(r *http.Request) (*http.Response, error) {
+			calls++
+			if strings.Contains(r.URL.Path, "/guids/") {
+				return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(`{"error_code":40403,"message":"missing"}`))}, nil
+			}
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"schema":"long"}`))}, nil
+		}),
+	}))
+	require.NoError(t, err)
+	dec := registry.NewDecoder(client)
+	var got int64
+	legacy := []byte{0, 0, 0, 0, 1, 14}
+	headers := []registry.Header{{Key: registry.KeySchemaIDHeader, Value: header}}
+	require.NoError(t, dec.DecodeHeaders(context.Background(), legacy, headers, false, &got))
+	require.Equal(t, int64(7), got)
+	require.Error(t, dec.DecodeHeaders(context.Background(), legacy, headers, true, &got))
+	require.Equal(t, 2, calls, "failed GUID lookup must not try a numeric schema")
+	require.Error(t, registry.NewDecoder(nil).DecodeHeaders(context.Background(), nil, headers, true, &got))
+	require.Error(t, registry.NewDecoder(client, registry.WithAPI(nil)).DecodeHeaders(context.Background(), nil, headers, true, &got))
+	require.Equal(t, 2, calls, "invalid API must not request a schema")
+}
+
+func TestConfluentRawBytes(t *testing.T) {
+	client, err := registry.NewClient("https://registry.invalid", registry.WithHTTPClient(&http.Client{
+		Transport: registryResponseTransport(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"schema":"bytes"}`))}, nil
+		}),
+	}))
+	require.NoError(t, err)
+	headers := []registry.Header{{Key: registry.ValueSchemaIDHeader, Value: append([]byte{1}, make([]byte, 16)...)}}
+	for i, data := range [][]byte{{}, {0xff, 0x03}} {
+		for _, header := range []bool{false, true} {
+			t.Run(strconv.Itoa(i)+"/header="+strconv.FormatBool(header), func(t *testing.T) {
+				var got []byte
+				dec := registry.NewDecoder(client)
+				if header {
+					require.NoError(t, dec.DecodeHeaders(context.Background(), data, headers, false, &got))
+				} else {
+					require.NoError(t, dec.Decode(context.Background(), append([]byte{0, 0, 0, 0, 1}, data...), &got))
+				}
+				require.Equal(t, data, got)
+			})
+		}
+	}
+	limited := registry.NewDecoder(client, registry.WithAPI(avro.Config{MaxByteSliceSize: 1}.Freeze()))
+	var got []byte
+	require.Error(t, limited.DecodeHeaders(context.Background(), []byte{1, 2}, headers, false, &got))
 }

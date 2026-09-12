@@ -36,6 +36,15 @@ type ValEncoder interface {
 
 // ReadVal parses Avro value and stores the result in the value pointed to by obj.
 func (r *Reader) ReadVal(schema Schema, obj any) {
+	if r.Error != nil {
+		return
+	}
+	if r.owner != nil && r.valDepth == 0 {
+		r.cfg = r.owner.snapshot()
+	}
+	r.valDepth++
+	defer func() { r.valDepth-- }()
+
 	if obj == nil {
 		r.ReportError("ReadVal", "can not read into nil pointer")
 		return
@@ -66,6 +75,15 @@ func (r *Reader) ReadVal(schema Schema, obj any) {
 
 // WriteVal writes the Avro encoding of obj.
 func (w *Writer) WriteVal(schema Schema, val any) {
+	if w.Error != nil {
+		return
+	}
+	if w.owner != nil && w.valDepth == 0 {
+		w.cfg = w.owner.snapshot()
+	}
+	w.valDepth++
+	defer func() { w.valDepth-- }()
+
 	if isNilSchema(schema) {
 		if w.Error == nil {
 			w.Error = errors.New("avro: WriteVal: schema cannot be nil")
@@ -96,6 +114,7 @@ func supportsUnsafeType(typ reflect2.Type) bool {
 }
 
 func (c *frozenConfig) DecoderOf(schema Schema, typ reflect2.Type) ValDecoder {
+	c = c.snapshot()
 	if isNilSchema(schema) {
 		return &errorDecoder{err: errors.New("avro: DecoderOf: schema cannot be nil")}
 	}
@@ -141,7 +160,7 @@ type decoderContext struct {
 
 func newDecoderContext(cfg *frozenConfig) *decoderContext {
 	return &decoderContext{
-		cfg:      cfg,
+		cfg:      cfg.snapshot(),
 		decoders: make(map[cacheKey]ValDecoder),
 	}
 }
@@ -153,7 +172,7 @@ type encoderContext struct {
 
 func newEncoderContext(cfg *frozenConfig) *encoderContext {
 	return &encoderContext{
-		cfg:      cfg,
+		cfg:      cfg.snapshot(),
 		encoders: make(map[cacheKey]ValEncoder),
 	}
 }
@@ -205,6 +224,7 @@ func decoderOfType(d *decoderContext, schema Schema, typ reflect2.Type) ValDecod
 }
 
 func (c *frozenConfig) EncoderOf(schema Schema, typ reflect2.Type) ValEncoder {
+	c = c.snapshot()
 	if isNilSchema(schema) {
 		return &errorEncoder{err: errors.New("avro: EncoderOf: schema cannot be nil")}
 	}

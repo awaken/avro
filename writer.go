@@ -2,40 +2,53 @@ package avro
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"math"
+	"unicode/utf8"
 )
 
 // WriterFunc is a function used to customize the Writer.
 type WriterFunc func(w *Writer)
 
-// WithWriterConfig specifies the configuration to use with a writer.
+// WithWriterConfig selects a frozen API or ConfigProvider. Unsupported or nil APIs
+// set Error; Reset preserves that configuration error.
 func WithWriterConfig(cfg API) WriterFunc {
 	return func(w *Writer) {
-		w.cfg = cfg.(*frozenConfig)
+		w.owner, w.configErr = readerConfig(cfg)
+		if w.owner != nil {
+			w.cfg = w.owner.snapshot()
+		}
+		w.Error = w.configErr
+		if w.cfg == nil {
+			w.cfg = &frozenConfig{}
+		}
 	}
 }
 
 // Writer is an Avro specific io.Writer.
 type Writer struct {
-	cfg   *frozenConfig
-	out   io.Writer
-	buf   []byte
-	Error error
+	cfg       *frozenConfig
+	configErr error
+	owner     *frozenConfig
+	valDepth  int
+	out       io.Writer
+	buf       []byte
+	Error     error
 }
 
-// NewWriter creates a new Writer.
+// NewWriter creates a new Writer. Check Error for unsupported configurations.
 func NewWriter(out io.Writer, bufSize int, opts ...WriterFunc) *Writer {
 	if bufSize < 0 {
 		bufSize = 0
 	}
 	writer := &Writer{
-		cfg:   DefaultConfig.(*frozenConfig),
 		out:   out,
 		buf:   make([]byte, 0, bufSize),
 		Error: nil,
 	}
 
+	WithWriterConfig(DefaultConfig)(writer)
 	for _, opt := range opts {
 		opt(writer)
 	}
@@ -45,9 +58,12 @@ func NewWriter(out io.Writer, bufSize int, opts ...WriterFunc) *Writer {
 
 // Reset resets the Writer with a new io.Writer attached.
 func (w *Writer) Reset(out io.Writer) {
+	if w.cfg == nil && w.configErr == nil {
+		WithWriterConfig(DefaultConfig)(w)
+	}
 	w.out = out
 	w.buf = w.buf[:0]
-	w.Error = nil
+	w.Error = w.configErr
 }
 
 // Buffered returns the number of buffered bytes.
@@ -146,8 +162,15 @@ func (w *Writer) WriteBytes(b []byte) {
 	w.buf = append(w.buf, b...)
 }
 
-// WriteString reads a String to the Writer.
+// WriteString writes a UTF-8 string; invalid input sets Error before writing bytes.
 func (w *Writer) WriteString(s string) {
+	if w.Error != nil {
+		return
+	}
+	if !utf8.ValidString(s) {
+		w.Error = errors.New("avro: WriteString: invalid UTF-8")
+		return
+	}
 	w.WriteLong(int64(len(s)))
 	w.buf = append(w.buf, s...)
 }

@@ -519,3 +519,44 @@ type errorWriter struct{}
 func (errorWriter) Write(p []byte) (n int, err error) {
 	return 0, errors.New("test error")
 }
+
+func TestWriterRejectsInvalidUTF8(t *testing.T) {
+	for _, value := range []string{string([]byte{0xff}), string([]byte{0xc0, 0xaf}), string([]byte{0xed, 0xa0, 0x80})} {
+		writer := avro.NewWriter(nil, 0)
+		writer.WriteString(value)
+		require.Error(t, writer.Error)
+		require.Empty(t, writer.Buffer(), "rejection must precede the length prefix")
+	}
+}
+
+type wrappedWriterAPI struct{ avro.API }
+
+func TestWriterUnsupportedAPI(t *testing.T) {
+	cfg := wrappedWriterAPI{avro.Config{}.Freeze()}
+	var value *avro.Writer
+	require.NotPanics(t, func() { value = avro.NewWriter(nil, 16, avro.WithWriterConfig(cfg)) })
+	require.Error(t, value.Error)
+	value.Reset(nil)
+	require.Error(t, value.Error, "Reset must preserve an unsupported configuration error")
+}
+
+type providedWriterAPI struct{ avro.API }
+
+func (p providedWriterAPI) AvroConfig() avro.API { return p.API }
+
+func TestWriterConfigProvider(t *testing.T) {
+	cfg := providedWriterAPI{avro.Config{MaxByteSliceSize: 1}.Freeze()}
+	value := avro.NewWriter(nil, 16, avro.WithWriterConfig(cfg))
+	require.NoError(t, value.Error)
+	value.WriteVal(avro.MustParse(`{"type":"fixed","name":"F","size":2}`), [2]byte{})
+	require.Error(t, value.Error)
+	for _, cfg := range []avro.API{nil, (*wrappedWriterAPI)(nil), wrappedWriterAPI{avro.Config{}.Freeze()}} {
+		value := avro.NewWriter(nil, 16, avro.WithWriterConfig(cfg))
+		first := value.Error
+		require.Error(t, first)
+		require.NotPanics(t, func() { value.WriteVal(avro.MustParse(`"long"`), int64(1)) })
+		require.Same(t, first, value.Error)
+		value.Reset(nil)
+		require.Same(t, first, value.Error)
+	}
+}

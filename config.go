@@ -1,9 +1,12 @@
 package avro
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"sync"
+	"sync/atomic"
 
 	"github.com/modern-go/reflect2"
 )
@@ -67,13 +70,18 @@ type Config struct {
 	MaxMapAllocSize int
 }
 
-// Freeze makes the configuration immutable. The returned API also implements ExactUnmarshaler.
+// Freeze fixes the codec settings and creates a registration API. The returned API
+// also implements ExactUnmarshaler. Registrations affect subsequent API calls;
+// each datum uses one registration snapshot, including on existing streams.
 func (c Config) Freeze() API {
-	api := &frozenConfig{
-		config:         c,
-		resolver:       NewTypeResolver(),
-		typeConverters: NewTypeConverters(),
-	}
+	api := &frozenConfig{config: c}
+	api.current.Store(newFrozenConfig(c, NewTypeResolver(), NewTypeConverters()))
+	return api
+}
+
+// Each generation owns its caches and pools; an older build cannot publish into a newer cache.
+func newFrozenConfig(c Config, resolver *TypeResolver, converters *TypeConverters) *frozenConfig {
+	api := &frozenConfig{config: c, resolver: resolver, typeConverters: converters}
 
 	api.readerPool = &sync.Pool{
 		New: func() any {
@@ -100,7 +108,7 @@ func (c Config) Freeze() API {
 	return api
 }
 
-// API represents a frozen Config.
+// API represents fixed codec settings with updatable type registrations.
 type API interface {
 	// Marshal returns the Avro encoding of v.
 	Marshal(schema Schema, v any) ([]byte, error)
@@ -121,10 +129,10 @@ type API interface {
 	// EncoderOf returns the value encoder for a given schema and type.
 	EncoderOf(schema Schema, typ reflect2.Type) ValEncoder
 
-	// Register registers names to their types for resolution. All primitive types are pre-registered.
+	// Register registers names for subsequent API calls. Primitive types are pre-registered.
 	Register(name string, obj any)
 
-	// RegisterTypeConverters registers type conversion functions.
+	// RegisterTypeConverters registers conversions for subsequent API calls.
 	RegisterTypeConverters(conv ...TypeConverter)
 
 	// TypeOf returns the schema type for a given name.
@@ -142,8 +150,42 @@ type ExactUnmarshaler interface {
 	UnmarshalExact(schema Schema, data []byte, v any) error
 }
 
+// ConfigProvider lets an API wrapper expose its underlying frozen configuration
+// to NewReader and NewWriter. AvroConfig must return the wrapped API, not itself.
+// Primitive I/O uses those settings; wrapper method overrides are not invoked.
+type ConfigProvider interface {
+	AvroConfig() API
+}
+
+// readerConfig resolves wrappers explicitly; unsupported APIs fail without losing their limits.
+func readerConfig(api API) (*frozenConfig, error) {
+	for range 64 {
+		if api == nil {
+			break
+		}
+		v := reflect.ValueOf(api)
+		switch v.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			if v.IsNil() {
+				return nil, errors.New("avro: configuration cannot be nil")
+			}
+		}
+		if cfg, ok := api.(*frozenConfig); ok {
+			return cfg, nil
+		}
+		provider, ok := api.(ConfigProvider)
+		if !ok {
+			break
+		}
+		api = provider.AvroConfig()
+	}
+	return nil, errors.New("avro: configuration must come from Config.Freeze or ConfigProvider")
+}
+
 type frozenConfig struct {
-	config Config
+	config  Config
+	current atomic.Pointer[frozenConfig]
+	regMu   sync.Mutex
 
 	decoderCache sync.Map // map[cacheKey]ValDecoder
 	encoderCache sync.Map // map[cacheKey]ValEncoder
@@ -156,7 +198,15 @@ type frozenConfig struct {
 	typeConverters *TypeConverters
 }
 
+func (c *frozenConfig) snapshot() *frozenConfig {
+	if current := c.current.Load(); current != nil {
+		return current
+	}
+	return c
+}
+
 func (c *frozenConfig) Marshal(schema Schema, v any) ([]byte, error) {
+	c = c.snapshot()
 	writer := c.borrowWriter()
 	defer c.returnWriter(writer)
 
@@ -195,6 +245,7 @@ func (c *frozenConfig) UnmarshalExact(schema Schema, data []byte, v any) error {
 }
 
 func (c *frozenConfig) unmarshal(schema Schema, data []byte, v any, exact bool) error {
+	c = c.snapshot()
 	reader := c.borrowReader(data)
 	defer c.returnReader(reader)
 
@@ -242,18 +293,42 @@ func (c *frozenConfig) NewDecoder(schema Schema, r io.Reader) *Decoder {
 }
 
 func (c *frozenConfig) Register(name string, obj any) {
-	c.resolver.Register(name, obj)
+	c.regMu.Lock()
+	defer c.regMu.Unlock()
+
+	old := c.snapshot()
+	resolver := old.resolver.clone()
+	resolver.Register(name, obj)
+	c.current.Store(newFrozenConfig(c.config, resolver, old.typeConverters))
 }
 
 func (c *frozenConfig) RegisterTypeConverters(convs ...TypeConverter) {
-	c.typeConverters.RegisterTypeConverters(convs...)
+	// Converter metadata is user code. Invoke it before taking the registration lock.
+	added := NewTypeConverters()
+	added.RegisterTypeConverters(convs...)
+	if !added.hasRegistered() {
+		return
+	}
+	c.regMu.Lock()
+	defer c.regMu.Unlock()
+
+	old := c.snapshot()
+	converters := old.typeConverters.clone()
+	added.convs.Range(func(key, value any) bool {
+		converters.convs.Store(key, value)
+		return true
+	})
+	converters.registered.Store(true)
+	c.current.Store(newFrozenConfig(c.config, old.resolver, converters))
 }
 
 func (c *frozenConfig) TypeOf(name string) (reflect2.Type, error) {
+	c = c.snapshot()
 	return c.resolver.Type(name)
 }
 
 func (c *frozenConfig) NamesOf(typ reflect2.Type) ([]string, error) {
+	c = c.snapshot()
 	return c.resolver.Name(typ)
 }
 

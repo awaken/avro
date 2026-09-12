@@ -443,7 +443,7 @@ func parseArray(namespace string, m map[string]any, seen seenCache, cache *Schem
 		return nil, err
 	}
 
-	return NewArraySchema(schema, WithProps(a.Props)), nil
+	return NewArraySchemaChecked(schema, WithProps(a.Props))
 }
 
 type mapSchema struct {
@@ -472,7 +472,7 @@ func parseMap(namespace string, m map[string]any, seen seenCache, cache *SchemaC
 		return nil, err
 	}
 
-	return NewMapSchema(schema, WithProps(ms.Props)), nil
+	return NewMapSchemaChecked(schema, WithProps(ms.Props))
 }
 
 func parseUnion(namespace string, v []any, seen seenCache, cache *SchemaCache) (Schema, error) {
@@ -719,7 +719,16 @@ func normalizeProperties(props map[string]any) error {
 func normalizePropertyNumbers(value any) (any, error) {
 	switch value := value.(type) {
 	case stdjson.Number:
-		return value.Float64()
+		f, err := value.Float64()
+		if err != nil {
+			return value, nil
+		}
+		a, ae, aok := propertyNumberParts(string(value))
+		b, be, bok := propertyNumberParts(strconv.FormatFloat(f, 'g', -1, 64))
+		if aok && bok && a == b && ae == be {
+			return f, nil
+		}
+		return value, nil
 	case []any:
 		for i, item := range value {
 			normalized, err := normalizePropertyNumbers(item)
@@ -734,4 +743,41 @@ func normalizePropertyNumbers(value any) (any, error) {
 		}
 	}
 	return value, nil
+}
+
+// propertyNumberParts compares decimal values without constructing exponent-sized powers.
+func propertyNumberParts(text string) (string, int64, bool) {
+	negative := strings.HasPrefix(text, "-")
+	text = strings.TrimPrefix(text, "-")
+	var exponent int64
+	if i := strings.IndexAny(text, "eE"); i >= 0 {
+		var err error
+		exponent, err = strconv.ParseInt(text[i+1:], 10, 64)
+		if err != nil {
+			return "", 0, false
+		}
+		text = text[:i]
+	}
+	if i := strings.IndexByte(text, '.'); i >= 0 {
+		places := int64(len(text) - i - 1)
+		if exponent < math.MinInt64+places {
+			return "", 0, false
+		}
+		exponent -= places
+		text = text[:i] + text[i+1:]
+	}
+	text = strings.TrimLeft(text, "0")
+	if text == "" {
+		return "", 0, true
+	}
+	digits := strings.TrimRight(text, "0")
+	zeros := int64(len(text) - len(digits))
+	if exponent > math.MaxInt64-zeros {
+		return "", 0, false
+	}
+	exponent += zeros
+	if negative {
+		digits = "-" + digits
+	}
+	return digits, exponent, true
 }

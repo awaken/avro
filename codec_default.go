@@ -7,7 +7,7 @@ import (
 	"github.com/modern-go/reflect2"
 )
 
-var defaultEncodingConfig = Config{}.Freeze().(*frozenConfig)
+var defaultEncodingConfig = Config{}.Freeze().(*frozenConfig).snapshot()
 
 func createDefaultDecoder(d *decoderContext, field *Field, typ reflect2.Type) ValDecoder {
 	b, err := encodeDefault(field)

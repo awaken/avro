@@ -1337,3 +1337,95 @@ func TestError_ErrorEmptyMessage(t *testing.T) {
 
 	assert.Equal(t, "registry error: 404", str)
 }
+
+type guidRegistry interface {
+	GetSchemaByGUID(context.Context, string) (avro.Schema, error)
+}
+
+func TestGetSchemaByGUID(t *testing.T) {
+	calls := 0
+	client, err := registry.NewClient("https://registry.invalid", registry.WithHTTPClient(&http.Client{
+		Transport: registryResponseTransport(func(r *http.Request) (*http.Response, error) {
+			calls++
+			require.Equal(t, "/schemas/guids/a1b2c3d4-e5f6-7890-abcd-ef1234567890", r.URL.Path)
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"schema":"long"}`))}, nil
+		}),
+	}))
+	require.NoError(t, err)
+	api, ok := any(client).(guidRegistry)
+	require.True(t, ok, "missing GUID registry lookup")
+	for _, guid := range []string{"a1b2c3d4-e5f6-7890-abcd-ef1234567890", "A1B2C3D4-E5F6-7890-ABCD-EF1234567890"} {
+		schema, err := api.GetSchemaByGUID(context.Background(), guid)
+		require.NoError(t, err)
+		require.Equal(t, avro.Long, schema.Type())
+	}
+	require.Equal(t, 1, calls)
+	for _, guid := range []string{"", "1234", "a1b2c3d4_e5f6-7890-abcd-ef1234567890", "z1b2c3d4-e5f6-7890-abcd-ef1234567890"} {
+		_, err := api.GetSchemaByGUID(context.Background(), guid)
+		require.Error(t, err)
+	}
+	require.Equal(t, 1, calls, "invalid GUIDs perform no requests")
+}
+
+func TestGUIDReferences(t *testing.T) {
+	const guid = "00010203-0405-0607-0809-0a0b0c0d0e0f"
+	var paths []string
+	client, err := registry.NewClient("https://registry.invalid", registry.WithHTTPClient(&http.Client{
+		Transport: registryResponseTransport(func(r *http.Request) (*http.Response, error) {
+			paths = append(paths, r.URL.RequestURI())
+			value := map[string]any{"schema": referencedParentSchema, "references": []registry.SchemaReference{{Name: "com.acme.Child", Subject: "child/v1", Version: 2}}}
+			if r.URL.Path != "/schemas/guids/"+guid {
+				require.Equal(t, "/subjects/child%2Fv1/versions/2?format=resolved", r.URL.RequestURI())
+				value = map[string]any{"schema": `{"type":"record","name":"Child","namespace":"com.acme","fields":[{"name":"value","type":"string"}]}`}
+			}
+			data, err := json.Marshal(value)
+			require.NoError(t, err)
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(data)))}, nil
+		}),
+	}))
+	require.NoError(t, err)
+	schema, err := client.GetSchemaByGUID(context.Background(), guid)
+	require.NoError(t, err)
+	data, err := avro.Marshal(schema, map[string]any{"child": map[string]any{"value": "ok"}})
+	require.NoError(t, err)
+	require.Equal(t, []byte{4, 'o', 'k'}, data)
+	require.Len(t, paths, 2)
+}
+
+func TestGUIDLookupErrorsAreNotCached(t *testing.T) {
+	const guid = "00010203-0405-0607-0809-0a0b0c0d0e0f"
+	for _, test := range []struct {
+		name, body string
+		status     int
+		limit      int64
+	}{
+		{"old registry", `{"error_code":40403,"message":"schema not found"}`, 404, 512},
+		{"unsupported schema", `{"schemaType":"PROTOBUF","schema":"long"}`, 200, 512},
+		{"invalid schema", `{"schema":"MissingGUIDType"}`, 200, 512},
+		{"missing schema", `{}`, 200, 512},
+		{"trailing response", `{"schema":"long"} {}`, 200, 512},
+		{"bounded response", `{"schema":"long"}` + strings.Repeat(" ", 512), 200, 512},
+		{"invalid reference", `{"schema":"long","references":[{"name":"X","subject":"s","version":0}]}`, 200, 512},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			client, err := registry.NewClient("https://registry.invalid", registry.WithResponseLimit(test.limit), registry.WithHTTPClient(&http.Client{
+				Transport: registryResponseTransport(func(r *http.Request) (*http.Response, error) {
+					calls++
+					if calls == 1 {
+						return &http.Response{StatusCode: test.status, Body: io.NopCloser(strings.NewReader(test.body))}, nil
+					}
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"schema":"long"}`))}, nil
+				}),
+			}))
+			require.NoError(t, err)
+			schema, err := client.GetSchemaByGUID(context.Background(), guid)
+			require.Error(t, err)
+			require.Nil(t, schema)
+			schema, err = client.GetSchemaByGUID(context.Background(), guid)
+			require.NoError(t, err)
+			require.Equal(t, avro.Long, schema.Type())
+			require.Equal(t, 2, calls)
+		})
+	}
+}

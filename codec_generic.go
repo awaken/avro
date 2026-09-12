@@ -23,6 +23,7 @@ func genericDecode(typ reflect2.Type, dec ValDecoder, r *Reader) any {
 }
 
 func (c *frozenConfig) genericReceiver(schema Schema) (reflect2.Type, error) {
+	c = c.snapshot()
 	if schema.Type() == Ref {
 		schema = schema.(*RefSchema).Schema()
 	}

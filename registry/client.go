@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -207,7 +208,8 @@ type Client struct {
 
 	creds credentials
 
-	cache sync.Map // map[int]avro.Schema
+	cache     sync.Map // map[int]avro.Schema
+	guidCache sync.Map // map[string]avro.Schema; separate from registry-local numeric IDs
 }
 
 // NewClient creates a schema registry Client with the given base url.
@@ -279,6 +281,72 @@ func (c *Client) GetSchema(ctx context.Context, id int) (avro.Schema, error) {
 
 	c.cache.Store(id, schema)
 
+	return schema, nil
+}
+
+// GUIDRegistry is the optional GUID lookup capability implemented by Client.
+// Registry remains compatible with implementations that support numeric IDs only.
+type GUIDRegistry interface {
+	GetSchemaByGUID(ctx context.Context, guid string) (avro.Schema, error)
+}
+
+// GetSchemaByGUID returns and caches the schema identified by a 36-character UUID.
+// Hexadecimal letters are case-insensitive. Invalid GUIDs perform no request.
+// References use immutable subject versions and resolved Avro responses, with at
+// most 1024 direct references. Only successful lookups are cached. Registries
+// without /schemas/guids/{guid} return their HTTP error; numeric IDs are not inferred.
+func (c *Client) GetSchemaByGUID(ctx context.Context, guid string) (avro.Schema, error) {
+	if len(guid) != 36 || guid[8] != '-' || guid[13] != '-' || guid[18] != '-' || guid[23] != '-' {
+		return nil, errors.New("invalid schema GUID: expected hexadecimal UUID")
+	}
+	raw, err := hex.DecodeString(strings.ReplaceAll(guid, "-", ""))
+	if err != nil || len(raw) != 16 {
+		return nil, errors.New("invalid schema GUID: expected 16 hexadecimal bytes")
+	}
+	guid = strings.ToLower(guid)
+	if schema, ok := c.guidCache.Load(guid); ok {
+		return schema.(avro.Schema), nil
+	}
+	var resp struct {
+		schemaPayload
+		SchemaType string `json:"schemaType" yaml:"schemaType" xml:"schemaType"`
+	}
+	if err := c.request(ctx, http.MethodGet, "schemas/guids/"+guid, nil, &resp); err != nil {
+		return nil, fmt.Errorf("getting GUID schema %s: %w", guid, err)
+	}
+	if resp.SchemaType != "" && resp.SchemaType != "AVRO" {
+		return nil, fmt.Errorf("GUID schema type %q is not AVRO", resp.SchemaType)
+	}
+	const maxReferences = 1024
+	if len(resp.References) > maxReferences {
+		return nil, fmt.Errorf("GUID schema exceeds %d references", maxReferences)
+	}
+	// Keep each lookup's names isolated from unrelated registry schemas.
+	cache := &avro.SchemaCache{}
+	for _, ref := range resp.References {
+		if ref.Name == "" || ref.Subject == "" || ref.Version <= 0 || cache.Get(ref.Name) != nil {
+			return nil, errors.New("invalid or duplicate GUID schema reference")
+		}
+		var resolved schemaPayload
+		p := path.Join("subjects", escapeSubject(ref.Subject), "versions", strconv.Itoa(ref.Version))
+		if err := c.request(ctx, http.MethodGet, resolvedSchemaPath(p), nil, &resolved); err != nil {
+			return nil, fmt.Errorf("getting GUID reference %s: %w", ref.Name, err)
+		}
+		child, err := avro.ParseWithCache(resolved.Schema, "", nil)
+		if err != nil {
+			return nil, fmt.Errorf("parsing GUID reference %s: %w", ref.Name, err)
+		}
+		named, ok := child.(avro.NamedSchema)
+		if !ok || named.FullName() != ref.Name {
+			return nil, fmt.Errorf("GUID reference %s does not match its named schema", ref.Name)
+		}
+		cache.Add(ref.Name, child)
+	}
+	schema, err := avro.ParseWithCache(resp.Schema, "", cache)
+	if err != nil {
+		return nil, fmt.Errorf("parsing GUID schema %s: %w", guid, err)
+	}
+	c.guidCache.Store(guid, schema)
 	return schema, nil
 }
 

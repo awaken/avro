@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -49,7 +50,7 @@ func TestConfig_Freeze(t *testing.T) {
 }
 
 func TestConfig_ReturnReaderReleasesInput(t *testing.T) {
-	cfg := Config{}.Freeze().(*frozenConfig)
+	cfg := Config{}.Freeze().(*frozenConfig).snapshot()
 	reader := cfg.borrowReader(make([]byte, 1<<20))
 	reader.head = 1
 	reader.pendingErr = errors.New("pending")
@@ -503,4 +504,155 @@ func TestTypeResolver_ConcurrentRegister(t *testing.T) {
 	names, err := resolver.Name(reflect2.TypeOf(value{}))
 	require.NoError(t, err)
 	assert.ElementsMatch(t, want, names)
+}
+
+func TestRegistrationRefreshesCodecs(t *testing.T) {
+	type item struct {
+		Value int64 `avro:"value" json:"value" yaml:"value" xml:"value"`
+	}
+	schema := MustParse(`["null",{"type":"record","name":"Late","fields":[{"name":"value","type":"long"}]}]`)
+	api := Config{}.Freeze()
+	data, err := api.Marshal(schema, map[string]any{"Late": map[string]any{"value": int64(2)}})
+	require.NoError(t, err)
+	var before any
+	require.NoError(t, api.Unmarshal(schema, data, &before))
+	require.IsType(t, map[string]any{}, before)
+	api.Register("Late", item{})
+	var after any
+	require.NoError(t, api.Unmarshal(schema, data, &after))
+	require.Equal(t, item{2}, after)
+}
+
+func TestConvertersRefreshCodecs(t *testing.T) {
+	api := Config{}.Freeze()
+	schema := MustParse(`"string"`)
+	data, err := api.Marshal(schema, "initial")
+	require.NoError(t, err)
+	var got any
+	require.NoError(t, api.Unmarshal(schema, data, &got))
+	api.RegisterTypeConverters(TypeConversionFuncs{
+		AvroType:              String,
+		DecoderTypeConversion: func(in any, schema Schema) (any, error) { return "converted", nil },
+	})
+	require.NoError(t, api.Unmarshal(schema, data, &got))
+	require.Equal(t, "converted", got)
+}
+
+func TestRegistrationRefreshesStreams(t *testing.T) {
+	type item struct {
+		Value int64 `avro:"value" json:"value" yaml:"value" xml:"value"`
+	}
+	schema := MustParse(`["null",{"type":"record","name":"StreamItem","fields":[{"name":"value","type":"long"}]}]`)
+	api := Config{}.Freeze()
+	data, err := api.Marshal(schema, map[string]any{"StreamItem": map[string]any{"value": int64(2)}})
+	require.NoError(t, err)
+	dec := api.NewDecoder(schema, bytes.NewReader(append(append([]byte(nil), data...), data...)))
+	var got any
+	require.NoError(t, dec.Decode(&got))
+	require.IsType(t, map[string]any{}, got)
+	old := api.(*frozenConfig).snapshot()
+	api.Register("StreamItem", item{})
+	// Complete an older cache build after registration; it cannot replace the new codec.
+	old.DecoderOf(schema, reflect2.TypeOf(&got))
+	require.NoError(t, dec.Decode(&got))
+	require.Equal(t, item{2}, got)
+	require.NoError(t, api.Unmarshal(schema, data, &got))
+	require.Equal(t, item{2}, got)
+}
+
+type reentrantConverter struct {
+	TypeConversionFuncs
+	metadata func()
+}
+
+func (c reentrantConverter) Type() Type {
+	c.metadata()
+	return c.TypeConversionFuncs.Type()
+}
+
+func TestConverterMetadataCanRegister(t *testing.T) {
+	api := Config{}.Freeze()
+	done := make(chan struct{})
+	go func() {
+		api.RegisterTypeConverters(reentrantConverter{
+			TypeConversionFuncs: TypeConversionFuncs{AvroType: String},
+			metadata:            func() { api.Register("FromConverter", int64(0)) },
+		})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("converter metadata blocked registration")
+	}
+	_, err := api.TypeOf("FromConverter")
+	require.NoError(t, err)
+}
+
+func TestConcurrentRegistrations(t *testing.T) {
+	api := Config{}.Freeze()
+	schema := MustParse(`"long"`)
+	errs := make(chan error, 16)
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			api.Register(fmt.Sprintf("Concurrent%d", i), int64(0))
+			data, err := api.Marshal(schema, int64(i))
+			if err != nil {
+				errs <- err
+				return
+			}
+			var got int64
+			if err = api.Unmarshal(schema, data, &got); err != nil {
+				errs <- err
+				return
+			}
+			if got != int64(i) {
+				errs <- fmt.Errorf("decoded %d, want %d", got, i)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	for i := range 16 {
+		_, err := api.TypeOf(fmt.Sprintf("Concurrent%d", i))
+		require.NoError(t, err)
+	}
+}
+
+func TestRegistrationRefreshesCacheModes(t *testing.T) {
+	type item struct {
+		Value int64 `avro:"value" json:"value" yaml:"value" xml:"value"`
+	}
+	type replacement struct {
+		Value int64 `avro:"value" json:"value" yaml:"value" xml:"value"`
+	}
+	schema := MustParse(`["null",{"type":"record","name":"LateMode","fields":[{"name":"value","type":"long"}]}]`)
+	for _, disabled := range []bool{false, true} {
+		for _, partial := range []bool{false, true} {
+			for _, strict := range []bool{false, true} {
+				t.Run(fmt.Sprintf("disabled=%v/partial=%v/strict=%v", disabled, partial, strict), func(t *testing.T) {
+					api := Config{DisableCaching: disabled, PartialUnionTypeResolution: partial, UnionResolutionError: strict}.Freeze()
+					_, err := api.Marshal(schema, item{4})
+					require.Error(t, err)
+					var got any
+					_ = api.Unmarshal(schema, []byte{2, 8}, &got)
+					api.Register("LateMode", item{})
+					data, err := api.Marshal(schema, item{4})
+					require.NoError(t, err)
+					require.Equal(t, []byte{2, 8}, data)
+					require.NoError(t, api.Unmarshal(schema, data, &got))
+					require.Equal(t, item{4}, got)
+					api.Register("LateMode", replacement{})
+					require.NoError(t, api.Unmarshal(schema, data, &got))
+					require.Equal(t, replacement{4}, got)
+				})
+			}
+		}
+	}
 }

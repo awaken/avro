@@ -2898,3 +2898,72 @@ func avroTestTempDir(t *testing.T) string {
 	})
 	return tempDir
 }
+
+func TestCanonicalHistoricalNames(t *testing.T) {
+	old := avro.SkipNameValidation
+	avro.SkipNameValidation = true
+	t.Cleanup(func() { avro.SkipNameValidation = old })
+	for _, tc := range []struct{ raw, want string }{
+		{`{"type":"record","name":"R\"x","fields":[{"name":"f\\x","type":"long"}]}`, `{"name":"R\"x","type":"record","fields":[{"name":"f\\x","type":"long"}]}`},
+		{`{"type":"enum","name":"E\"x","symbols":["a\"b","c\nd"]}`, `{"name":"E\"x","type":"enum","symbols":["a\"b","c\nd"]}`},
+		{`{"type":"fixed","name":"F\"x","size":2}`, `{"name":"F\"x","type":"fixed","size":2}`},
+		{`{"type":"record","name":"R\"x","fields":[{"name":"next","type":["null","R\"x"]}]}`, `{"name":"R\"x","type":"record","fields":[{"name":"next","type":["null","R\"x"]}]}`},
+	} {
+		schema, err := avro.ParseWithCache(tc.raw, "", &avro.SchemaCache{})
+		require.NoError(t, err)
+		require.Equal(t, tc.want, schema.String())
+		require.True(t, json.Valid([]byte(schema.String())))
+		require.Equal(t, sha256.Sum256([]byte(tc.want)), schema.Fingerprint())
+		again, err := avro.ParseWithCache(tc.want, "", &avro.SchemaCache{})
+		require.NoError(t, err)
+		for _, algorithm := range []avro.FingerprintType{avro.SHA256, avro.MD5, avro.CRC64Avro} {
+			got, err := schema.FingerprintUsing(algorithm)
+			require.NoError(t, err)
+			want, err := again.FingerprintUsing(algorithm)
+			require.NoError(t, err)
+			require.Equal(t, want, got)
+		}
+		require.NotEqual(t, schema.Fingerprint(), avro.LegacyFingerprint(schema))
+	}
+}
+
+func TestSchemaConstructorsRejectNil(t *testing.T) {
+	var primitive *avro.PrimitiveSchema
+	for _, child := range []avro.Schema{nil, primitive} {
+		assert.Nil(t, avro.NewArraySchema(child))
+		assert.Nil(t, avro.NewMapSchema(child))
+	}
+	var record *avro.RecordSchema
+	for _, child := range []avro.NamedSchema{nil, record} {
+		assert.Nil(t, avro.NewRefSchema(child))
+	}
+}
+
+func TestSchemaCheckedConstructors(t *testing.T) {
+	var primitive *avro.PrimitiveSchema
+	for _, child := range []avro.Schema{nil, primitive} {
+		a, err := avro.NewArraySchemaChecked(child)
+		require.Error(t, err)
+		require.Nil(t, a)
+		m, err := avro.NewMapSchemaChecked(child)
+		require.Error(t, err)
+		require.Nil(t, m)
+	}
+	var record *avro.RecordSchema
+	for _, child := range []avro.NamedSchema{nil, record} {
+		r, err := avro.NewRefSchemaChecked(child)
+		require.Error(t, err)
+		require.Nil(t, r)
+	}
+	child := avro.MustParse(`"long"`)
+	a, err := avro.NewArraySchemaChecked(child)
+	require.NoError(t, err)
+	require.Same(t, child, a.Items())
+	m, err := avro.NewMapSchemaChecked(child)
+	require.NoError(t, err)
+	require.Same(t, child, m.Values())
+	named := avro.MustParse(`{"type":"record","name":"Node","fields":[{"name":"next","type":["null","Node"]}]}`).(avro.NamedSchema)
+	r, err := avro.NewRefSchemaChecked(named)
+	require.NoError(t, err)
+	require.Same(t, named, r.Schema())
+}

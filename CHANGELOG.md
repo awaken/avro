@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## v2.32.0 - 2026-09-12
+
+- Preserve custom JSON numbers that cannot round-trip through `float64` as
+  `encoding/json.Number`; ordinary values retain their existing type.
+- Escape historical names in canonical JSON and fingerprints. Legacy canonical
+  forms remain available for migration.
+- Reject invalid UTF-8 strings/map keys and nonnil null-union payloads. Explicit
+  converters may map a null payload to nil.
+- Refresh codec generations after registration, including on existing streams.
+  Each datum uses one registration snapshot.
+- Let Reader/Writer wrappers expose `ConfigProvider`; unsupported configurations
+  return an error instead of panicking, and Reset preserves that error.
+- Reject nil children in array/map/reference constructors; add checked variants.
+- Ignore unused schema text when appending to an existing OCF.
+- Add Confluent GUID-header decoding and GUID lookup, preserving version-0
+  framing. Both decode paths handle top-level raw bytes without a length prefix.
+
+
 ## v2.31.6 - 2026-09-11
 
 ### Fixed

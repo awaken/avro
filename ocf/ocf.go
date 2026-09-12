@@ -509,11 +509,9 @@ type Encoder struct {
 // existing schema.
 func NewEncoder(s string, w io.Writer, opts ...EncoderFunc) (*Encoder, error) {
 	cfg := computeEncoderConfig(opts)
-	schema, err := avro.ParseWithCache(s, "", cfg.SchemaCache)
-	if err != nil {
-		return nil, err
-	}
-	return newEncoder(schema, w, cfg)
+	return newEncoderFrom(func() (avro.Schema, error) {
+		return avro.ParseWithCache(s, "", cfg.SchemaCache)
+	}, w, cfg)
 }
 
 // NewEncoderWithSchema returns a new encoder that writes to w using schema s.
@@ -524,7 +522,11 @@ func NewEncoderWithSchema(schema avro.Schema, w io.Writer, opts ...EncoderFunc) 
 	return newEncoder(schema, w, computeEncoderConfig(opts))
 }
 
-func newEncoder(schema avro.Schema, w io.Writer, cfg encoderConfig) (result *Encoder, err error) {
+func newEncoder(schema avro.Schema, w io.Writer, cfg encoderConfig) (*Encoder, error) {
+	return newEncoderFrom(func() (avro.Schema, error) { return schema, nil }, w, cfg)
+}
+
+func newEncoderFrom(loadSchema func() (avro.Schema, error), w io.Writer, cfg encoderConfig) (result *Encoder, err error) {
 	if isNilValue(w) {
 		return nil, errors.New("writer cannot be nil")
 	}
@@ -583,6 +585,11 @@ func newEncoder(schema avro.Schema, w io.Writer, cfg encoderConfig) (result *Enc
 			}
 			return e, nil
 		}
+	}
+	// Appending uses the file header and never parses an unused replacement schema.
+	schema, err := loadSchema()
+	if err != nil {
+		return nil, err
 	}
 	if isNilValue(schema) {
 		return nil, errors.New("schema cannot be nil")

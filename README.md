@@ -452,6 +452,53 @@ JSON document; operations without a returned value also permit an empty body.
 Oversized responses return `registry.ErrResponseLimit` and close after at most
 one byte beyond the limit. Bodies are not drained after errors. The default HTTP
 client has a timeout; custom clients should also set a timeout or request deadline.
+### Registration and schema values
+
+`Register` and `RegisterTypeConverters` affect subsequent calls, including the
+next datum on an existing stream. A datum already being processed retains one
+registration snapshot. Separate generations prevent stale codec builds from
+replacing newly registered codecs.
+
+Reader/Writer configuration accepts APIs from `Config.Freeze`. An API wrapper
+can implement `ConfigProvider` with `AvroConfig() avro.API` returning its wrapped
+API. Primitive I/O uses that API's settings, not wrapper method overrides.
+Unsupported or nil APIs set `Reader.Error` or `Writer.Error` without panicking;
+`Reset` preserves the configuration error.
+
+Custom numeric schema properties retain `float64` when JSON round-tripping
+preserves their value. Otherwise they use `encoding/json.Number`, including
+large integers, overflow, underflow and long decimals. Handle both types when
+reading numeric properties. Strings and map keys must contain valid UTF-8.
+A map-form null union accepts nil, or a nonnil value explicitly converted to nil.
+
+Canonical JSON escapes historical names accepted by `SkipNameValidation`.
+Their corrected fingerprints may differ; use `LegacyParsingCanonicalForm` and
+`LegacyFingerprintUsing` when migrating old identities. Array, map and reference
+constructors return nil for nil children; their `Checked` variants also return
+an error. Existing OCF files supply their own append schema, so unused schema
+text is neither parsed nor cached.
+
+### Confluent GUID headers
+
+`registry.Decoder.DecodeHeaders(ctx, data, headers, key, &value)` uses the last
+matching `registry.Header`. Set `key` for `KeySchemaIDHeader`; otherwise it uses
+`ValueSchemaIDHeader`. A header contains version byte 1 followed by 16 GUID
+bytes; the payload contains only the Avro datum. An absent matching header falls
+back to the version-0 payload prefix. Malformed headers and failed GUID lookups
+return errors without fallback. `Decode` keeps version-0 payload framing.
+Both entry points accept Confluent top-level `bytes` without an Avro length
+prefix; an extra application-supplied length prefix is now part of the value.
+
+`Client.GetSchemaByGUID` accepts a hexadecimal UUID and caches successful
+lookups separately from numeric IDs. Referenced schemas use immutable subject
+versions and resolved responses, with at most 1024 direct references. Existing
+response limits, HTTP timeouts and context cancellation apply. Older registries
+without the GUID endpoint return their HTTP error.
+
+The format and lookup follow the public
+[Confluent wire specification](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html#wire-format-schema-guid-in-header)
+and [registry API](https://docs.confluent.io/platform/current/schema-registry/develop/api.html#get--schemas-guids-(string-guid)).
+
 ### Schema resolution
 
 `SchemaCompatibility.Resolve(reader, writer)` supports recursive named records.

@@ -51,6 +51,22 @@ func NewTypeResolver() *TypeResolver {
 	return r
 }
 
+// clone copies a registration snapshot without sharing mutable name slices.
+func (r *TypeResolver) clone() *TypeResolver {
+	r.typesMu.RLock()
+	defer r.typesMu.RUnlock()
+	copy := &TypeResolver{}
+	r.names.Range(func(key, value any) bool {
+		copy.names.Store(key, value)
+		return true
+	})
+	r.types.Range(func(key, value any) bool {
+		copy.types.Store(key, append([]string(nil), value.([]string)...))
+		return true
+	})
+	return copy
+}
+
 // Register registers names to their types for resolution.
 func (r *TypeResolver) Register(name string, obj any) {
 	typ := reflect2.TypeOf(obj)

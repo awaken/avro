@@ -56,6 +56,16 @@ func (c *TypeConverters) RegisterTypeConverters(convs ...TypeConverter) {
 	}
 }
 
+func (c *TypeConverters) clone() *TypeConverters {
+	copy := NewTypeConverters()
+	c.convs.Range(func(key, value any) bool {
+		copy.convs.Store(key, value)
+		return true
+	})
+	copy.registered.Store(c.hasRegistered())
+	return copy
+}
+
 func (c *TypeConverters) hasRegistered() bool {
 	return c.registered.Load()
 }

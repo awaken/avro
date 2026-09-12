@@ -415,49 +415,17 @@ func TestDecoder_WithZStandardHandlesInvalidData(t *testing.T) {
 }
 
 func TestDecoder_WithZStandardOptions(t *testing.T) {
-	unionStr := "union value"
-	want := FullRecord{
-		Strings: []string{"string1", "string2", "string3", "string4", "string5"},
-		Longs:   []int64{1, 2, 3, 4, 5},
-		Enum:    "C",
-		Map: map[string]int{
-			"ke\xa9\xb1": 1,
-			"\x00\x00y2": 2,
-			"key3":       3,
-			"key4":       4,
-			"key5":       5,
-		},
-		Nullable: &unionStr,
-		Fixed:    [16]byte{0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04},
-		Record: &TestRecord{
-			Long:   1925639126735,
-			String: "I am a test record",
-			Int:    666,
-			Float:  7171.17,
-			Double: 916734926348163.01973408746523,
-			Bool:   true,
-		},
-	}
-
 	f, err := os.Open("testdata/zstd-invalid-data.avro")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = f.Close() })
-
 	dec, err := ocf.NewDecoder(f, ocf.WithZStandardDecoderOptions(zstd.IgnoreChecksum(true)))
 	require.NoError(t, err)
-
-	dec.HasNext()
-
+	t.Cleanup(func() { _ = dec.Close() })
+	require.True(t, dec.HasNext())
 	var got FullRecord
-	err = dec.Decode(&got)
-
-	require.NoError(t, err, "should not cause an error because checksum is ignored")
-	require.NoError(t, dec.Error(), "should not cause an error because checksum is ignored")
-	assert.Equal(t, want, got, "should read corrupted data as valid because checksum is ignored")
-
-	dec.HasNext()
-
-	assert.ErrorContains(t, dec.Error(), "decoder: invalid block", "trailing byte in file should cause error before hitting zstd decoder")
+	// Ignoring the compression checksum must not allow invalid Avro map keys.
+	require.ErrorContains(t, dec.Decode(&got), "invalid UTF-8")
+	require.ErrorContains(t, dec.Error(), "invalid UTF-8")
 }
 
 func TestDecoder_DecodeAvroError(t *testing.T) {
@@ -2300,4 +2268,36 @@ func FuzzOCFDecoder(f *testing.F) {
 		}
 		_ = decoder.Error()
 	})
+}
+
+func TestAppendIgnoresUnusedSchema(t *testing.T) {
+	dir, err := os.MkdirTemp("../../../../tmp", "avro-append-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	file, err := os.Create(filepath.Join(dir, "data.avro"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, file.Close()) })
+	enc, err := ocf.NewEncoder(`"long"`, file)
+	require.NoError(t, err)
+	require.NoError(t, enc.Encode(int64(1)))
+	require.NoError(t, enc.Close())
+	for _, unused := range []string{`not a schema`, `"MissingType"`} {
+		enc, err = ocf.NewEncoder(unused, file)
+		require.NoError(t, err, "append must use the existing OCF schema")
+		require.NoError(t, enc.Encode(int64(2)))
+		require.NoError(t, enc.Close())
+	}
+	_, err = file.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	dec, err := ocf.NewDecoder(file)
+	require.NoError(t, err)
+	defer dec.Close()
+	var values []int64
+	for dec.HasNext() {
+		var v int64
+		require.NoError(t, dec.Decode(&v))
+		values = append(values, v)
+	}
+	require.NoError(t, dec.Error())
+	require.Equal(t, []int64{1, 2, 2}, values)
 }

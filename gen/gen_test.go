@@ -936,16 +936,18 @@ func TestGenerator_RejectsNilSchemas(t *testing.T) {
 
 func TestGenerator_RejectsNilReferencedSchema(t *testing.T) {
 	var target *avro.RecordSchema
-	field, err := avro.NewField("value", avro.NewRefSchema(target))
-	require.NoError(t, err)
-	schema, err := avro.NewRecordSchema("test", "", []*avro.Field{field})
-	require.NoError(t, err)
-
+	schema := avro.NewRefSchema(target)
+	require.Nil(t, schema)
+	_, err := avro.NewField("value", schema)
+	require.Error(t, err, "invalid references must fail before generation")
 	var output bytes.Buffer
 	assert.NotPanics(t, func() {
-		err = gen.StructFromSchema(schema, &output, gen.Config{PackageName: "something"})
+		g := gen.NewGenerator("something", nil)
+		g.Parse(schema)
+		err = g.Write(&output)
 	})
 	assert.EqualError(t, err, "cannot generate Go code from a nil schema")
+	assert.Empty(t, output.Bytes())
 }
 
 func TestGenerator_RejectsUnsupportedSchemaImplementations(t *testing.T) {

@@ -188,9 +188,8 @@ func (e *mapUnionEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 		return
 	}
 
-	w.WriteInt(int32(pos))
-
 	if schema.Type() == Null && val == nil {
+		w.WriteInt(int32(pos))
 		return
 	}
 
@@ -208,10 +207,16 @@ func (e *mapUnionEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 		w.Error = err
 		return
 	}
+	if schema.Type() == Null {
+		if val != nil {
+			w.Error = errors.New("avro: null union branch requires a nil payload")
+			return
+		}
+		w.WriteInt(int32(pos))
+		return
+	}
 	if val == nil {
 		switch schema.Type() {
-		case Null:
-			return
 		case Array:
 			val = []struct{}{}
 		default:
@@ -220,6 +225,7 @@ func (e *mapUnionEncoder) Encode(ptr unsafe.Pointer, w *Writer) {
 		}
 	}
 
+	w.WriteInt(int32(pos))
 	elemType := reflect2.TypeOf(val)
 	elemPtr := reflect2.PtrOf(val)
 

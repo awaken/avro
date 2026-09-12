@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"strings"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -20,16 +21,27 @@ const (
 // ReaderFunc is a function used to customize the Reader.
 type ReaderFunc func(r *Reader)
 
-// WithReaderConfig specifies the configuration to use with a reader.
+// WithReaderConfig selects a frozen API or ConfigProvider. Unsupported or nil APIs
+// set Error; Reset preserves that configuration error.
 func WithReaderConfig(cfg API) ReaderFunc {
 	return func(r *Reader) {
-		r.cfg = cfg.(*frozenConfig)
+		r.owner, r.configErr = readerConfig(cfg)
+		if r.owner != nil {
+			r.cfg = r.owner.snapshot()
+		}
+		r.Error = r.configErr
+		if r.cfg == nil {
+			r.cfg = &frozenConfig{}
+		}
 	}
 }
 
 // Reader is an Avro specific io.Reader.
 type Reader struct {
 	cfg        *frozenConfig
+	configErr  error
+	owner      *frozenConfig
+	valDepth   int
 	reader     io.Reader
 	slab       []byte
 	buf        []byte
@@ -39,19 +51,19 @@ type Reader struct {
 	Error      error
 }
 
-// NewReader creates a new Reader.
+// NewReader creates a new Reader. Check Error for unsupported configurations.
 func NewReader(r io.Reader, bufSize int, opts ...ReaderFunc) *Reader {
 	if bufSize <= 0 {
 		bufSize = defaultReaderBufferSize
 	}
 	reader := &Reader{
-		cfg:    DefaultConfig.(*frozenConfig),
 		reader: r,
 		buf:    make([]byte, bufSize),
 		head:   0,
 		tail:   0,
 	}
 
+	WithReaderConfig(DefaultConfig)(reader)
 	for _, opt := range opts {
 		opt(reader)
 	}
@@ -62,14 +74,16 @@ func NewReader(r io.Reader, bufSize int, opts ...ReaderFunc) *Reader {
 // Reset resets a Reader with a new byte array attached.
 func (r *Reader) Reset(b []byte) *Reader {
 	if r.cfg == nil {
-		r.cfg = DefaultConfig.(*frozenConfig)
+		if r.configErr == nil {
+			WithReaderConfig(DefaultConfig)(r)
+		}
 	}
 	r.reader = nil
 	r.buf = b
 	r.head = 0
 	r.tail = len(b)
 	r.pendingErr = nil
-	r.Error = nil
+	r.Error = r.configErr
 	return r
 }
 
@@ -356,6 +370,10 @@ func (r *Reader) ReadBytes() []byte {
 // ReadString reads a String from the Reader.
 func (r *Reader) ReadString() string {
 	b := r.readBytes("string")
+	if !utf8.Valid(b) {
+		r.ReportError("ReadString", "invalid UTF-8")
+		return ""
+	}
 	if len(b) == 0 {
 		return ""
 	}

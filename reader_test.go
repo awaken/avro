@@ -881,3 +881,71 @@ func (r *delayedReader) Read(p []byte) (n int, err error) {
 
 	return copy(p, r.b), nil
 }
+
+func TestReaderRejectsInvalidUTF8(t *testing.T) {
+	for _, data := range [][]byte{{2, 0xff}, {4, 0xc0, 0xaf}, {6, 0xed, 0xa0, 0x80}} {
+		reader := avro.NewReader(bytes.NewReader(data), 1)
+		require.Empty(t, reader.ReadString())
+		require.Error(t, reader.Error)
+	}
+	reader := avro.NewReader(bytes.NewReader([]byte{2, 0xff}), 1)
+	previous := errors.New("previous error")
+	reader.Error = previous
+	reader.ReadString()
+	require.ErrorIs(t, reader.Error, previous)
+}
+
+type wrappedReaderAPI struct{ avro.API }
+
+func TestReaderUnsupportedAPI(t *testing.T) {
+	cfg := wrappedReaderAPI{avro.Config{}.Freeze()}
+	var value *avro.Reader
+	require.NotPanics(t, func() { value = avro.NewReader(nil, 16, avro.WithReaderConfig(cfg)) })
+	require.Error(t, value.Error)
+	value.Reset(nil)
+	require.Error(t, value.Error, "Reset must preserve an unsupported configuration error")
+}
+
+type providedReaderAPI struct{ avro.API }
+
+func (p providedReaderAPI) AvroConfig() avro.API { return p.API }
+
+func TestReaderConfigProvider(t *testing.T) {
+	cfg := providedReaderAPI{avro.Config{MaxByteSliceSize: 1}.Freeze()}
+	value := avro.NewReader(nil, 16, avro.WithReaderConfig(cfg))
+	require.NoError(t, value.Error)
+	value.Reset([]byte{4, 97, 98})
+	value.ReadString()
+	require.Error(t, value.Error)
+	for _, cfg := range []avro.API{nil, (*wrappedReaderAPI)(nil), wrappedReaderAPI{avro.Config{}.Freeze()}} {
+		value := avro.NewReader(nil, 16, avro.WithReaderConfig(cfg))
+		first := value.Error
+		require.Error(t, first)
+		require.NotPanics(t, func() { value.ReadVal(avro.MustParse(`"long"`), new(int64)) })
+		require.Same(t, first, value.Error)
+		value.Reset(nil)
+		require.Same(t, first, value.Error)
+	}
+}
+
+func TestStringAndMapUTF8(t *testing.T) {
+	stringSchema := avro.MustParse(`"string"`)
+	mapSchema := avro.MustParse(`{"type":"map","values":"long"}`)
+	for _, value := range []string{"", "plain", "é東京🙂"} {
+		data, err := avro.Marshal(stringSchema, value)
+		require.NoError(t, err)
+		var got string
+		require.NoError(t, avro.Unmarshal(stringSchema, data, &got))
+		require.Equal(t, value, got)
+		data, err = avro.Marshal(mapSchema, map[string]int64{value: 7})
+		require.NoError(t, err)
+		var items map[string]int64
+		require.NoError(t, avro.Unmarshal(mapSchema, data, &items))
+		require.Equal(t, int64(7), items[value])
+	}
+	_, err := avro.Marshal(mapSchema, map[string]int64{string([]byte{0xff}): 7})
+	require.ErrorContains(t, err, "UTF-8")
+	var items map[string]int64
+	require.ErrorContains(t, avro.Unmarshal(mapSchema, []byte{2, 2, 0xff, 14, 0}, &items), "UTF-8")
+	require.Empty(t, items)
+}
