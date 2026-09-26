@@ -12,6 +12,32 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Logical codecs must reject truncated input without publishing a partial value.
+func TestAuditLogicalTruncation(t *testing.T) {
+	for _, source := range []string{
+		`{"type":"long","logicalType":"timestamp-millis"}`,
+		`{"type":"long","logicalType":"timestamp-micros"}`,
+	} {
+		value := time.Unix(7, 0)
+		require.Error(t, avro.Unmarshal(avro.MustParse(source), []byte{0x80}, &value))
+		require.Equal(t, time.Unix(7, 0), value)
+	}
+	reader := avro.MustParse(`{"type":"long","logicalType":"time-micros"}`)
+	resolved, err := avro.NewSchemaCompatibility().Resolve(reader, avro.MustParse(`"int"`))
+	require.NoError(t, err)
+	value := int64(7)
+	require.Error(t, avro.Unmarshal(resolved, []byte{0x80}, &value))
+	require.Equal(t, int64(7), value)
+	duration := time.Second
+	require.Error(t, avro.Unmarshal(reader, []byte{0x80}, &duration))
+	require.Equal(t, time.Second, duration)
+
+	// One microsecond below the smallest signed timestamp must not wrap.
+	_, err = avro.Marshal(avro.MustParse(`{"type":"long","logicalType":"timestamp-micros"}`),
+		time.Unix(-9223372036855, 224191000).UTC())
+	require.Error(t, err)
+}
+
 func TestNativeIntegerDecodeBounds(t *testing.T) {
 	tests := []struct {
 		name   string

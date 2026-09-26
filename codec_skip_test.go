@@ -16,6 +16,24 @@ import (
 
 const recursiveSkipHelper = "AVRO_RECURSIVE_SKIP_HELPER"
 
+func TestAuditSkippedValueTruncation(t *testing.T) {
+	for _, tc := range []struct {
+		schema string
+		wire   []byte
+	}{
+		{`{"type":"enum","name":"E","symbols":["A"]}`, nil},
+		{`{"type":"array","items":"int"}`, []byte{2, 0x80}},
+		{`{"type":"map","values":"int"}`, []byte{2, 4, 'x'}},
+		{`{"type":"map","values":"int"}`, []byte{2, 2, 'x', 0x80}},
+	} {
+		writer := avro.MustParse(`{"type":"record","name":"Skipped","fields":[{"name":"value","type":` + tc.schema + `}]}`)
+		reader := avro.MustParse(`{"type":"record","name":"Skipped","fields":[]}`)
+		resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+		require.NoError(t, err)
+		require.Error(t, avro.Unmarshal(resolved, tc.wire, &struct{}{}), tc.schema)
+	}
+}
+
 func TestDecoder_SkipRecursiveRecord(t *testing.T) {
 	if os.Getenv(recursiveSkipHelper) == "1" {
 		debug.SetMaxStack(1 << 20)

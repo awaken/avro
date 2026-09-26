@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## v2.32.1 - 2026-09-26
+
+- Validate UTF-8 text and map keys, and stop recursive union decoding after a
+  truncated input error.
+- Keep resolved-union pointer storage isolated and include nested defaults,
+  aliases, and resolution state in codec-cache fingerprints.
+- Validate protocol request fields and require record fields to be arrays.
+- Reject truncated OCF append boundaries and snapshot caller-owned metadata,
+  including byte values.
+- Update `klauspost/compress` to v1.20.1.
+
 ## v2.32.0 - 2026-09-12
 
 - Preserve custom JSON numbers that cannot round-trip through `float64` as

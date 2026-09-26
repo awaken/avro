@@ -8,6 +8,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestAuditSchemaFieldTypes(t *testing.T) {
+	for _, source := range []string{
+		`{"type":"record","name":"R","fields":[{"name":"a","type":"int","doc":[]}]}`,
+		`{"type":"enum","name":"E","symbols":{}}`,
+		`[{"type":"enum","name":"E","symbols":["A"]},{"type":"fixed","name":"F","aliases":["E"],"size":1}]`,
+	} {
+		_, err := avro.Parse(source)
+		require.Error(t, err, source)
+	}
+}
+
 func TestParse_RecordAliasNamespace(t *testing.T) {
 	fields := []string{
 		`{"name":"a","type":"int","aliases":["old","old"]}`,
@@ -31,7 +42,7 @@ func TestParse_RecordAliasNamespace(t *testing.T) {
 }
 
 func TestExactNumericProperties(t *testing.T) {
-	for _, number := range []string{"9007199254740993", "1e400", "1e-400", "0.10000000000000001"} {
+	for _, number := range []string{"9007199254740993", "1e400", "1e-400", "0.10000000000000001", "0e99999999999999999999999", "0.0e-9223372036854775808"} {
 		schema, err := avro.Parse(`{"type":"long","n":` + number + `,"nested":{"values":[` + number + `]}}`)
 		require.NoError(t, err, number)
 		require.Equal(t, json.Number(number), schema.(*avro.PrimitiveSchema).Prop("n"))

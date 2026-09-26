@@ -251,6 +251,11 @@ type recordSchema struct {
 }
 
 func parseRecord(typ Type, namespace string, m map[string]any, seen seenCache, cache *SchemaCache) (Schema, error) {
+	// Validate the JSON shape before decoding collapses null into a nil slice.
+	if _, ok := m["fields"].([]any); !ok {
+		return nil, errors.New("avro: record must have an array of fields")
+	}
+
 	var (
 		r    recordSchema
 		meta mapstructure.Metadata
@@ -266,9 +271,6 @@ func parseRecord(typ Type, namespace string, m map[string]any, seen seenCache, c
 		r.Namespace = namespace
 	}
 
-	if !slices.Contains(meta.Keys, "fields") {
-		return nil, errors.New("avro: record must have an array of fields")
-	}
 	if err := normalizeProperties(r.Props); err != nil {
 		return nil, err
 	}

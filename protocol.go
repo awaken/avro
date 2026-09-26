@@ -370,6 +370,9 @@ func parseMessage(namespace string, m map[string]any, seen seenCache, cache *Sch
 		}
 		fields[i] = field
 	}
+	if err := validateRecordFields(fields); err != nil {
+		return nil, err
+	}
 	request := &RecordSchema{
 		name:       name{},
 		properties: properties{},

@@ -175,3 +175,41 @@ func (t *TestUnmarshalCounter) UnmarshalText([]byte) error {
 	*t++
 	return nil
 }
+
+type auditText string
+
+func (s auditText) MarshalText() ([]byte, error) { return []byte(s), nil }
+
+func (s *auditText) UnmarshalText(b []byte) error {
+	*s = auditText(b)
+	return nil
+}
+
+func TestAuditTextUTF8(t *testing.T) {
+	schema := avro.MustParse(`"string"`)
+	for _, text := range []string{"", "valid é", string([]byte{0xff})} {
+		t.Run(text, func(t *testing.T) {
+			valid := text != string([]byte{0xff})
+			data, err := avro.Marshal(schema, auditText(text))
+			if !valid {
+				if err == nil {
+					t.Errorf("text marshaler encoded invalid UTF-8: %x", data)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+			writer := avro.NewWriter(nil, 0)
+			writer.WriteBytes([]byte(text))
+			got := auditText("unchanged")
+			err = avro.Unmarshal(schema, writer.Buffer(), &got)
+			if !valid {
+				if err == nil || got != "unchanged" {
+					t.Errorf("invalid UTF-8 reached text unmarshaler: value=%q, error=%v", got, err)
+				}
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, text, string(got))
+			}
+		})
+	}
+}

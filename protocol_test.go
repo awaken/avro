@@ -401,3 +401,31 @@ func TestProtocolPermissiveNamesStayJSON(t *testing.T) {
 	assert.Contains(t, decoded["messages"], message)
 	assert.False(t, strings.ContainsRune(proto.String(), '\x01'))
 }
+
+// Protocol requests must obey the same field uniqueness rules as records.
+func TestAuditProtocolRequestFields(t *testing.T) {
+	for _, fields := range []string{
+		`[{"name":"a","type":"int"},{"name":"a","type":"int"}]`,
+		`[{"name":"a","type":"int","aliases":["b"]},{"name":"b","type":"int"}]`,
+	} {
+		t.Run(fields, func(t *testing.T) {
+			_, err := avro.Parse(`{"type":"record","name":"AuditRequest","fields":` + fields + `}`)
+			require.Error(t, err, "record validation control")
+			_, err = avro.ParseProtocol(`{"protocol":"AuditRequest","messages":{"call":{"request":` + fields + `,"response":"null"}}}`)
+			require.Error(t, err, "protocol accepted ambiguous request fields")
+		})
+	}
+	_, err := avro.ParseProtocol(`{"protocol":"AuditRequest","messages":{"call":{"request":[{"name":"a","type":"int"},{"name":"b","type":"int"}],"response":"null"}}}`)
+	require.NoError(t, err, "distinct request fields remain valid")
+}
+
+func TestAuditProtocolParseErrors(t *testing.T) {
+	for _, body := range []string{
+		`{"request":[],"response":"null","doc":[]}`,
+		`{"request":[],"response":"null","errors":["UnknownError"]}`,
+		`{"request":[],"response":"null","errors":[{"type":"error","name":"Oops","fields":[]},"Oops"]}`,
+	} {
+		_, err := avro.ParseProtocol(`{"protocol":"AuditBadMessage","messages":{"call":` + body + `}}`)
+		require.Error(t, err)
+	}
+}

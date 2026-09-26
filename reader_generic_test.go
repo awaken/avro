@@ -2,8 +2,13 @@ package avro_test
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"math"
 	"math/big"
+	"os"
+	"os/exec"
+	"runtime/debug"
 	"testing"
 	"time"
 
@@ -11,6 +16,97 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAuditGenericReadErrors(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"long","logicalType":"timestamp-millis"}`,
+		`{"type":"long","logicalType":"timestamp-micros"}`,
+		`{"type":"record","name":"AuditRead","fields":[{"name":"value","type":"string"}]}`,
+	} {
+		r := avro.NewReader(nil, 0).Reset(nil)
+		r.ReadNext(avro.MustParse(raw))
+		require.Error(t, r.Error)
+	}
+	resolved, err := avro.NewSchemaCompatibility().Resolve(avro.MustParse(`"long"`), avro.MustParse(`"int"`))
+	require.NoError(t, err)
+	r := avro.NewReader(nil, 0).Reset([]byte{14})
+	require.Equal(t, int64(7), r.ReadNext(resolved))
+	require.NoError(t, r.Error)
+
+	// Defaults use the same byte limits and encoding checks as ordinary values.
+	for _, value := range []string{"long default", string([]byte{0xff})} {
+		field, err := avro.NewField("value", avro.NewPrimitiveSchema(avro.String, nil), avro.WithDefault(value))
+		require.NoError(t, err)
+		reader, err := avro.NewRecordSchema("AuditDefault", "", []*avro.Field{field})
+		require.NoError(t, err)
+		writer := avro.MustParse(`{"type":"record","name":"AuditDefault","fields":[]}`)
+		resolved, err := avro.NewSchemaCompatibility().Resolve(reader, writer)
+		require.NoError(t, err)
+		cfg := avro.Config{MaxByteSliceSize: 1}.Freeze()
+		r := avro.NewReader(nil, 0, avro.WithReaderConfig(cfg)).Reset(nil)
+		r.ReadNext(resolved)
+		require.Error(t, r.Error)
+	}
+}
+
+func TestAuditMapCallbackErrors(t *testing.T) {
+	cfg := avro.Config{MaxMapAllocSize: 1}.Freeze()
+	for _, data := range [][]byte{{4}, {2, 2}} {
+		r := avro.NewReader(nil, 0, avro.WithReaderConfig(cfg)).Reset(data)
+		calls := 0
+		r.ReadMapCB(func(*avro.Reader, string) bool { calls++; return true })
+		require.Error(t, r.Error)
+		require.Zero(t, calls)
+	}
+	for _, fail := range []bool{false, true} {
+		r := avro.NewReader(nil, 0).Reset([]byte{2, 0, 0})
+		calls := 0
+		want := errors.New("callback failure")
+		r.ReadMapCB(func(r *avro.Reader, key string) bool {
+			calls++
+			require.Empty(t, key)
+			if fail {
+				r.Error = want
+			}
+			return false
+		})
+		require.Equal(t, 1, calls)
+		if fail {
+			require.ErrorIs(t, r.Error, want)
+		} else {
+			require.NoError(t, r.Error)
+		}
+	}
+}
+
+// A truncated branch index must terminate decoding before following recursion.
+func TestAuditReadNextTruncatedUnion(t *testing.T) {
+	if os.Getenv("FLOWER_AUDIT_AVRO_UNION") == "1" {
+		schema := avro.MustParse(`{"type":"record","name":"AuditNode","fields":[{"name":"next","type":["AuditNode","null"]}]}`)
+		debug.SetMaxStack(1 << 20)
+		reader := avro.NewReader(nil, 0).Reset([]byte{2})
+		reader.ReadNext(schema)
+		if reader.Error != nil {
+			t.Fatalf("valid terminating branch failed: %v", reader.Error)
+		}
+		reader.Reset(nil).ReadNext(schema)
+		if reader.Error == nil {
+			t.Fatal("truncated union accepted")
+		}
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAuditReadNextTruncatedUnion$")
+	cmd.Env = append(os.Environ(), "FLOWER_AUDIT_AVRO_UNION=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if bytes.Contains(out, []byte("stack overflow")) {
+			t.Fatal("truncated recursive union caused stack overflow instead of returning a decode error")
+		}
+		t.Fatalf("bounded decode process: %v, %s", err, out[:min(len(out), 1000)])
+	}
+}
 
 func TestReadNextTimeOfDayBounds(t *testing.T) {
 	for _, schema := range []avro.Schema{

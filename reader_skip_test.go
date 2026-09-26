@@ -12,6 +12,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestAuditNegativeSkip(t *testing.T) {
+	for _, wide := range []bool{false, true} {
+		r := avro.NewReader(nil, 1).Reset([]byte{14})
+		if wide {
+			r.SkipNBytesInt64(-1)
+		} else {
+			r.SkipNBytes(-1)
+		}
+		require.ErrorContains(t, r.Error, "negative byte count")
+		r.Error = nil
+		require.Equal(t, int64(7), r.ReadLong(), "invalid skip must not consume input")
+	}
+}
+
 func TestReader_SkipNBytes(t *testing.T) {
 	data := []byte{0x01, 0x01, 0x01, 0x36}
 	r := avro.NewReader(bytes.NewReader(data), 2)

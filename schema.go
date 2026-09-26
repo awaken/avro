@@ -349,29 +349,91 @@ type cacheFingerprinter struct {
 	cache atomic.Value // [32]byte
 }
 
-// CacheFingerprint returns the SHA256 identity of the schema.
-func (i *cacheFingerprinter) CacheFingerprint(schema Schema, fn func() []byte) [32]byte {
+// CacheFingerprint returns the SHA256 identity of the complete codec plan.
+func (i *cacheFingerprinter) CacheFingerprint(schema Schema, _ func() []byte) [32]byte {
 	if v := i.cache.Load(); v != nil {
 		return v.([32]byte)
 	}
 
-	if i.writerFingerprint == nil && fn == nil {
-		fp := LegacyFingerprint(schema)
-		i.cache.Store(fp)
-		return fp
-	}
-
-	fp := LegacyFingerprint(schema)
-	d := append([]byte{}, fp[:]...)
-	if i.writerFingerprint != nil {
-		d = append(d, (*i.writerFingerprint)[:]...)
-	}
-	if fn != nil {
-		d = append(d, fn()...)
-	}
-	ident := sha256.Sum256(d)
+	data, _ := jsoniterAPI.Marshal(codecCacheNode(schema, map[string]bool{}))
+	ident := sha256.Sum256(data)
 	i.cache.Store(ident)
 	return ident
+}
+
+// codecCacheNode expands each named schema once, then emits references. This
+// keeps recursive schemas finite while retaining nested defaults and aliases.
+func codecCacheNode(schema Schema, expanded map[string]bool) any {
+	node := map[string]any{"canonical": LegacyParsingCanonicalForm(schema)}
+	setWriter := func(fp *[32]byte) {
+		if fp != nil {
+			node["writer"] = *fp
+		}
+	}
+
+	switch s := schema.(type) {
+	case *PrimitiveSchema:
+		setWriter(s.writerFingerprint)
+		node["encodedType"] = s.encodedType
+	case *RecordSchema:
+		if expanded[s.FullName()] {
+			return map[string]any{"ref": s.FullName()}
+		}
+		expanded[s.FullName()] = true
+		setWriter(s.writerFingerprint)
+		node["aliases"] = s.aliases
+		fields := make([]any, len(s.fields))
+		for i, field := range s.fields {
+			metadata := map[string]any{
+				"name":    field.name,
+				"aliases": field.aliases,
+				"default": field.hasDef,
+				"action":  field.action,
+				"type":    codecCacheNode(field.typ, expanded),
+			}
+			if field.hasDef {
+				metadata["value"] = field.def
+			}
+			fields[i] = metadata
+		}
+		node["fields"] = fields
+	case *EnumSchema:
+		if expanded[s.FullName()] {
+			return map[string]any{"ref": s.FullName()}
+		}
+		expanded[s.FullName()] = true
+		setWriter(s.writerFingerprint)
+		node["aliases"] = s.aliases
+		node["default"] = s.def
+		node["encodedSymbols"] = s.encodedSymbols
+	case *ArraySchema:
+		setWriter(s.writerFingerprint)
+		node["items"] = codecCacheNode(s.items, expanded)
+	case *MapSchema:
+		setWriter(s.writerFingerprint)
+		node["values"] = codecCacheNode(s.values, expanded)
+	case *UnionSchema:
+		setWriter(s.writerFingerprint)
+		types := s.decodeTypes()
+		children := make([]any, len(types))
+		for i, typ := range types {
+			children[i] = codecCacheNode(typ, expanded)
+		}
+		node["types"] = children
+	case *FixedSchema:
+		if expanded[s.FullName()] {
+			return map[string]any{"ref": s.FullName()}
+		}
+		expanded[s.FullName()] = true
+		setWriter(s.writerFingerprint)
+		node["aliases"] = s.aliases
+	case *RefSchema:
+		if expanded[s.actual.FullName()] {
+			return map[string]any{"ref": s.actual.FullName()}
+		}
+		return codecCacheNode(s.actual, expanded)
+	}
+	return node
 }
 
 type properties struct {
@@ -752,6 +814,9 @@ func (s *RecordSchema) MarshalJSON() ([]byte, error) {
 		buf.WriteString(`,"type":"record"`)
 	}
 	fieldsJSON, err := jsoniterAPI.Marshal(s.fields)
+	if s.fields == nil {
+		fieldsJSON, err = jsoniterAPI.Marshal([]*Field{})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -776,21 +841,7 @@ func (s *RecordSchema) FingerprintUsing(typ FingerprintType) ([]byte, error) {
 
 // CacheFingerprint returns unique identity of the schema.
 func (s *RecordSchema) CacheFingerprint() [32]byte {
-	return s.cacheFingerprinter.CacheFingerprint(s, func() []byte {
-		defs := make([]any, len(s.fields))
-		for i, field := range s.fields {
-			metadata := []any{field.HasDefault()}
-			if field.HasDefault() {
-				metadata = append(metadata, field.Default())
-			}
-			if aliases := field.Aliases(); len(aliases) > 0 {
-				metadata = append(metadata, aliases)
-			}
-			defs[i] = metadata
-		}
-		b, _ := jsoniterAPI.Marshal(defs)
-		return b
-	})
+	return s.cacheFingerprinter.CacheFingerprint(s, nil)
 }
 
 // Field is an Avro record type field.
@@ -1173,12 +1224,7 @@ func (s *EnumSchema) FingerprintUsing(typ FingerprintType) ([]byte, error) {
 
 // CacheFingerprint returns unique identity of the schema.
 func (s *EnumSchema) CacheFingerprint() [32]byte {
-	return s.cacheFingerprinter.CacheFingerprint(s, func() []byte {
-		if !s.HasDefault() {
-			return []byte{}
-		}
-		return []byte(s.Default())
-	})
+	return s.cacheFingerprinter.CacheFingerprint(s, nil)
 }
 
 // ArraySchema is an Avro array type schema.

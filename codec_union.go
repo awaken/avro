@@ -580,10 +580,6 @@ func (d *unionResolvedDecoder) Decode(ptr unsafe.Pointer, r *Reader) {
 		mapType := typ.(*reflect2.UnsafeSliceType)
 		newPtr = mapType.UnsafeMakeSlice(0, 0)
 
-	case reflect.Ptr:
-		elemType := typ.(*reflect2.UnsafePtrType).Elem()
-		newPtr = elemType.UnsafeNew()
-
 	default:
 		newPtr = typ.UnsafeNew()
 	}

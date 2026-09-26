@@ -38,6 +38,56 @@ func TestConfig_UnmarshalExact(t *testing.T) {
 	require.Error(t, exact.UnmarshalExact(empty, []byte{0}, &record))
 }
 
+func TestAuditNestedCodecCache(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("disabled=%t", disabled), func(t *testing.T) {
+			api := Config{DisableCaching: disabled}.Freeze()
+			for _, value := range []int{1, 2, 1} {
+				schema, err := ParseWithCache(fmt.Sprintf(`{"type":"record","name":"AuditOuter","fields":[{"name":"Child","type":{"type":"record","name":"AuditInner","fields":[{"name":"Number","type":"int","default":%d}]}}]}`, value), "", nil)
+				require.NoError(t, err)
+				data, err := api.Marshal(schema, struct {
+					Child struct{} `json:"Child" yaml:"Child" xml:"Child"`
+				}{})
+				require.NoError(t, err)
+				if !bytes.Equal(data, []byte{byte(value * 2)}) {
+					t.Errorf("nested default=%d encoded %x, want %02x", value, data, value*2)
+				}
+			}
+
+			for _, alias := range []string{"Old", "New", "Old"} {
+				schema, err := ParseWithCache(fmt.Sprintf(`{"type":"array","items":{"type":"record","name":"AuditAliases","fields":[{"name":"Number","type":"int","aliases":[%q]}]}}`, alias), "", nil)
+				require.NoError(t, err)
+				var values []struct {
+					Old int `json:"Old" yaml:"Old" xml:"Old"`
+					New int `json:"New" yaml:"New" xml:"New"`
+				}
+				require.NoError(t, api.Unmarshal(schema, []byte{2, 84, 0}, &values))
+				require.Len(t, values, 1)
+				wantOld, wantNew := 42, 0
+				if alias == "New" {
+					wantOld, wantNew = 0, 42
+				}
+				if values[0].Old != wantOld || values[0].New != wantNew {
+					t.Errorf("nested alias %q selected %+v, want Old=%d New=%d", alias, values[0], wantOld, wantNew)
+				}
+			}
+		})
+	}
+}
+
+func TestAuditRegistrationPreservesNames(t *testing.T) {
+	api := Config{}.Freeze()
+	api.Register("AuditName", struct{}{})
+	api.RegisterTypeConverters()
+	api.RegisterTypeConverters(TypeConversionFuncs{AvroType: String})
+	api.RegisterTypeConverters(TypeConversionFuncs{})
+	names, err := api.NamesOf(reflect2.TypeOf(struct{}{}))
+	require.NoError(t, err)
+	require.Contains(t, names, "AuditName")
+	_, err = api.TypeOf("AuditName")
+	require.NoError(t, err)
+}
+
 func TestConfig_Freeze(t *testing.T) {
 	api := Config{
 		TagKey:      "test",

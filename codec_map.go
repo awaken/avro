@@ -141,7 +141,7 @@ func (d *mapDecoderUnmarshaler) Decode(ptr unsafe.Pointer, r *Reader) {
 				keyObj = d.keyType.UnsafeIndirect(keyPtr)
 			}
 			unmarshaler := keyObj.(encoding.TextUnmarshaler)
-			key := r.ReadBytes()
+			key := []byte(r.ReadString())
 			if r.Error != nil {
 				return
 			}

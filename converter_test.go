@@ -8,6 +8,15 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// Numeric promotion must not silently accept incompatible source schemas.
+func TestAuditPromotionRejectsOtherTypes(t *testing.T) {
+	for _, typ := range []Type{String, Bytes, Boolean, Array, Map, Record} {
+		assert.Nil(t, createLongConverter(typ))
+		assert.Nil(t, createFloatConverter(typ))
+		assert.Nil(t, createDoubleConverter(typ))
+	}
+}
+
 func TestLongConverter(t *testing.T) {
 	tests := []struct {
 		data []byte

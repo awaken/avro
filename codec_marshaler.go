@@ -39,7 +39,7 @@ type textMarshalerCodec struct {
 }
 
 func (c textMarshalerCodec) Decode(ptr unsafe.Pointer, r *Reader) {
-	b := r.ReadBytes()
+	b := []byte(r.ReadString())
 	if r.Error != nil {
 		return
 	}
@@ -74,5 +74,5 @@ func (c textMarshalerCodec) Encode(ptr unsafe.Pointer, w *Writer) {
 		w.Error = err
 		return
 	}
-	w.WriteBytes(b)
+	w.WriteString(string(b))
 }

@@ -2301,3 +2301,163 @@ func TestAppendIgnoresUnusedSchema(t *testing.T) {
 	require.NoError(t, dec.Error())
 	require.Equal(t, []int64{1, 2, 2}, values)
 }
+
+// Appending must reject every partial block without changing its bytes.
+func TestAuditAppendTruncation(t *testing.T) {
+	dir, err := os.MkdirTemp("../../../../tmp", "avro-audit-append-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	original := buildSecurityOCF(t, ocf.Null)
+	headerEnd, _ := securityOCFHeaderEnd(t, original)
+	for n := headerEnd; n <= len(original); n++ {
+		t.Run(strconv.Itoa(n-headerEnd), func(t *testing.T) {
+			data := original[:n]
+			file, err := os.Create(filepath.Join(dir, "partial.avro"))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, file.Close()) })
+			_, err = file.Write(data)
+			require.NoError(t, err)
+			enc, err := ocf.NewEncoder(`"long"`, file)
+			if n == headerEnd || n == len(original) {
+				require.NoError(t, err, "complete boundary must support append")
+				require.NoError(t, enc.Close())
+			} else {
+				assert.Error(t, err, "partial block must not support append")
+			}
+			got, readErr := os.ReadFile(file.Name())
+			require.NoError(t, readErr)
+			assert.Equal(t, data, got, "validation changed the existing file")
+		})
+	}
+	t.Run("partial count", func(t *testing.T) {
+		file, err := os.Create(filepath.Join(dir, "count.avro"))
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, file.Close()) })
+		data := append(bytes.Clone(original[:headerEnd]), 0x80)
+		_, err = file.Write(data)
+		require.NoError(t, err)
+		_, err = ocf.NewEncoder(`"long"`, file)
+		assert.Error(t, err, "partial count is not a clean end of file")
+		got, readErr := os.ReadFile(file.Name())
+		require.NoError(t, readErr)
+		assert.Equal(t, data, got)
+	})
+}
+
+// Reusing metadata options must not change an existing encoder's schema or codec.
+func TestAuditMetadataReuse(t *testing.T) {
+	meta := map[string][]byte{"label": []byte("shared")}
+	option := ocf.WithMetadata(meta)
+	var first, other, reset bytes.Buffer
+	enc, err := ocf.NewEncoder(`"long"`, &first, option)
+	require.NoError(t, err)
+	require.NoError(t, enc.Encode(int64(7)))
+	require.NoError(t, enc.Flush())
+	second, err := ocf.NewEncoder(`"boolean"`, &other, option, ocf.WithCodec(ocf.Deflate))
+	require.NoError(t, err)
+	require.NoError(t, second.Close())
+	require.NoError(t, enc.Reset(&reset))
+	require.NoError(t, enc.Encode(int64(7)))
+	require.NoError(t, enc.Close())
+	for _, data := range [][]byte{first.Bytes(), reset.Bytes()} {
+		dec, err := ocf.NewDecoder(bytes.NewReader(data))
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, dec.Close()) })
+		assert.Equal(t, avro.Long, dec.Schema().Type(), "reset changed the declared schema")
+		assert.Equal(t, []byte("null"), dec.Metadata()["avro.codec"], "reset changed the declared codec")
+		if assert.True(t, dec.HasNext(), "encoder must remain decodable: %v", dec.Error()) {
+			var got int64
+			require.NoError(t, dec.Decode(&got))
+			assert.Equal(t, int64(7), got)
+		}
+	}
+}
+
+// Corrupt block boundaries must stop decoding before allocating or returning data.
+func TestAuditBlockErrors(t *testing.T) {
+	original := buildSecurityOCF(t, ocf.Null)
+	headerEnd, _ := securityOCFHeaderEnd(t, original)
+	for _, suffix := range [][]byte{
+		{0x80},     // Incomplete count.
+		{1},        // Negative count.
+		{2, 0x80},  // Incomplete size.
+		{2, 1},     // Negative size.
+		{2, 8, 14}, // Short data block.
+	} {
+		data := append(bytes.Clone(original[:headerEnd]), suffix...)
+		dec, err := ocf.NewDecoder(bytes.NewReader(data))
+		require.NoError(t, err)
+		require.False(t, dec.HasNext())
+		require.Error(t, dec.Error())
+		require.NoError(t, dec.Close())
+	}
+	var suffix bytes.Buffer
+	w := avro.NewWriter(&suffix, 0)
+	w.WriteLong(1)
+	w.WriteLong(128 << 10)
+	_, err := w.Write(make([]byte, 64<<10))
+	require.NoError(t, err)
+	require.NoError(t, w.Flush())
+	dec, err := ocf.NewDecoder(bytes.NewReader(append(bytes.Clone(original[:headerEnd]), suffix.Bytes()...)))
+	require.NoError(t, err)
+	require.False(t, dec.HasNext())
+	require.Error(t, dec.Error())
+	require.NoError(t, dec.Close())
+}
+
+func TestAuditEncoderFailures(t *testing.T) {
+	want := errors.New("schema marshaler failure")
+	_, err := ocf.NewEncoder(`"long"`, io.Discard, ocf.WithSchemaMarshaler(func(avro.Schema) ([]byte, error) {
+		return nil, want
+	}))
+	require.ErrorIs(t, err, want)
+
+	enc, err := ocf.NewEncoder(`"long"`, &errorBlockWriter{}, ocf.WithBlockLength(1))
+	require.NoError(t, err)
+	n, err := enc.Write([]byte{14})
+	require.Equal(t, 1, n)
+	require.Error(t, err)
+
+	enc, err = ocf.NewEncoder(`"long"`, &errorBlockWriter{})
+	require.NoError(t, err)
+	require.NoError(t, enc.Encode(int64(7)))
+	var destination bytes.Buffer
+	require.Error(t, enc.Reset(&destination))
+	require.Empty(t, destination.Bytes(), "failed flush must not begin the new file")
+
+	dir, err := os.MkdirTemp("../../../../tmp", "avro-audit-file-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	file, err := os.Create(filepath.Join(dir, "closed.avro"))
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+	_, err = ocf.NewEncoder(`"long"`, file)
+	require.Error(t, err)
+
+	original := buildSecurityOCF(t, ocf.Null)
+	headerEnd, _ := securityOCFHeaderEnd(t, original)
+	for _, data := range [][]byte{[]byte("bad header"), append(bytes.Clone(original[:headerEnd]), 2, 1)} {
+		file, err := os.Create(filepath.Join(dir, "invalid.avro"))
+		require.NoError(t, err)
+		_, err = file.Write(data)
+		require.NoError(t, err)
+		_, err = ocf.NewEncoder(`"long"`, file)
+		assert.Error(t, err)
+		require.NoError(t, file.Close())
+	}
+
+	// A raw write that reaches the block threshold remains decodable.
+	var valid bytes.Buffer
+	enc, err = ocf.NewEncoder(`"long"`, &valid, ocf.WithBlockLength(1))
+	require.NoError(t, err)
+	_, err = enc.Write([]byte{14})
+	require.NoError(t, err)
+	require.NoError(t, enc.Close())
+	dec, err := ocf.NewDecoder(&valid)
+	require.NoError(t, err)
+	require.True(t, dec.HasNext())
+	var value int64
+	require.NoError(t, dec.Decode(&value))
+	require.Equal(t, int64(7), value)
+	require.NoError(t, dec.Close())
+}

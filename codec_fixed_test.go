@@ -10,6 +10,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestAuditFixedBoundaries(t *testing.T) {
+	one := avro.MustParse(`{"type":"fixed","name":"OneByte","size":1}`)
+	_, err := avro.Marshal(one, uint64(7))
+	require.Error(t, err, "uint64 requires an eight-byte fixed schema")
+	value := uint64(7)
+	require.Error(t, avro.Unmarshal(one, []byte{1}, &value))
+	eight := avro.MustParse(`{"type":"fixed","name":"EightBytes","size":8}`)
+	require.Error(t, avro.Unmarshal(eight, []byte{1}, &value))
+	require.Equal(t, uint64(7), value)
+	decimal := avro.MustParse(`{"type":"fixed","name":"DecimalBytes","size":2,"logicalType":"decimal","precision":2}`)
+	array := [2]byte{0, 7}
+	require.Error(t, avro.Unmarshal(decimal, []byte{1}, &array))
+	require.Equal(t, [2]byte{0, 7}, array)
+}
+
 type fixedLimitReader struct {
 	reads int
 }

@@ -9,6 +9,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestAuditDecimalWorkBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		scale, limit int
+		value        int64
+	}{
+		{5, 2, 1},     // The power of ten needs 17 bits; the limit allows 16.
+		{0, 2, 65536}, // The input already exceeds the bit budget.
+		{1, 1, 255},   // Scaling, rather than the input, exceeds the budget.
+	} {
+		schema := avro.NewPrimitiveSchema(avro.Bytes, avro.NewDecimalLogicalSchema(10, tc.scale))
+		api := avro.Config{MaxByteSliceSize: tc.limit}.Freeze()
+		value := big.NewRat(tc.value, 1)
+		before := new(big.Rat).Set(value)
+		_, err := api.Marshal(schema, value)
+		require.ErrorContains(t, err, "MaxByteSliceSize")
+		require.Equal(t, before, value)
+	}
+}
+
 func TestDecimalExactScale(t *testing.T) {
 	for _, text := range []string{
 		`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`,

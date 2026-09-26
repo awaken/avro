@@ -11,6 +11,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestAuditWriterErrorState(t *testing.T) {
+	w := new(avro.Writer)
+	avro.WithWriterConfig(nil)(w)
+	require.Error(t, w.Error)
+	w.WriteString("ignored")
+	require.Empty(t, w.Buffer())
+	w.Reset(io.Discard)
+	require.Error(t, w.Flush(), "reset must retain a configuration failure")
+
+	var output bytes.Buffer
+	w = new(avro.Writer)
+	w.Reset(&output)
+	w.WriteInt(7)
+	require.NoError(t, w.Flush())
+	require.Equal(t, []byte{14}, output.Bytes())
+	w = avro.NewWriter(nil, -1)
+	w.WriteInt(7)
+	require.Equal(t, output.Bytes(), w.Buffer())
+}
+
 func TestWriter_Reset(t *testing.T) {
 	var buf bytes.Buffer
 	w := avro.NewWriter(nil, 10)

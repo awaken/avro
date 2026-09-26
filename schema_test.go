@@ -3,6 +3,7 @@ package avro_test
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"math"
 	"os"
@@ -17,6 +18,87 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// Empty records must retain an array-valued fields property in schema JSON.
+func TestAuditEmptyRecordJSON(t *testing.T) {
+	for _, kind := range []string{"record", "error"} {
+		for _, fields := range [][]*avro.Field{nil, {}} {
+			var s *avro.RecordSchema
+			var err error
+			if kind == "record" {
+				s, err = avro.NewRecordSchema("Empty", "", fields)
+			} else {
+				s, err = avro.NewErrorRecordSchema("Empty", "", fields)
+			}
+			require.NoError(t, err)
+			data, err := json.Marshal(s)
+			require.NoError(t, err)
+			var object map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(data, &object))
+			assert.JSONEq(t, `[]`, string(object["fields"]), "%s: nil=%v", kind, fields == nil)
+		}
+
+		_, err := avro.Parse(`{"type":"` + kind + `","name":"Empty","fields":[]}`)
+		require.NoError(t, err, "empty field arrays are valid")
+		_, err = avro.Parse(`{"type":"` + kind + `","name":"Empty","fields":null}`)
+		assert.Error(t, err, "null is not an array of fields")
+	}
+}
+
+// JSON failures in properties or child schemas must reach the caller.
+func TestAuditSchemaJSONFailures(t *testing.T) {
+	bad := avro.WithProps(map[string]any{"unsupported": math.Inf(1)})
+	primitive := avro.NewPrimitiveSchema(avro.Int, nil, bad)
+	field, err := avro.NewField("value", primitive)
+	require.NoError(t, err)
+	badField, err := avro.NewField("value", avro.NewPrimitiveSchema(avro.Int, nil), bad)
+	require.NoError(t, err)
+	record, err := avro.NewRecordSchema("BadRecord", "", nil, bad)
+	require.NoError(t, err)
+	childRecord, err := avro.NewRecordSchema("BadChild", "", []*avro.Field{field})
+	require.NoError(t, err)
+	enum, err := avro.NewEnumSchema("BadEnum", "", []string{"A"}, bad)
+	require.NoError(t, err)
+	fixed, err := avro.NewFixedSchema("BadFixed", "", 1, nil, bad)
+	require.NoError(t, err)
+	for _, value := range []any{
+		primitive, field, badField, record, childRecord, enum, fixed, avro.NewNullSchema(bad),
+		avro.NewArraySchema(primitive), avro.NewMapSchema(primitive),
+		avro.NewArraySchema(avro.NewNullSchema(), bad), avro.NewMapSchema(avro.NewNullSchema(), bad),
+	} {
+		_, err := json.Marshal(value)
+		require.Error(t, err, "%T", value)
+	}
+	for _, kind := range []string{"enum", "fixed"} {
+		schema := `{"type":"enum","name":"Aliased","symbols":["A"],"aliases":["Old"]}`
+		if kind == "fixed" {
+			schema = `{"type":"fixed","name":"Aliased","size":1,"aliases":["Old"]}`
+		}
+		data, err := json.Marshal(avro.MustParse(schema))
+		require.NoError(t, err)
+		require.JSONEq(t, schema, string(data))
+	}
+}
+
+func TestAuditDefaultBounds(t *testing.T) {
+	large := int64(1 << 40)
+	values := []any{large, 1.5, float64(large)}
+	if int64(int(large)) == large {
+		values = append(values, int(large))
+	}
+	for _, value := range values {
+		_, err := avro.NewField("value", avro.NewPrimitiveSchema(avro.Int, nil), avro.WithDefault(value))
+		require.Error(t, err)
+	}
+	for _, value := range []float64{1.5, math.Exp2(63), -math.Exp2(64)} {
+		_, err := avro.NewField("value", avro.NewPrimitiveSchema(avro.Long, nil), avro.WithDefault(value))
+		require.Error(t, err)
+	}
+	_, err := avro.NewField("value", avro.NewPrimitiveSchema(avro.Bytes, nil), avro.WithDefault("東京"))
+	require.Error(t, err)
+	_, err = avro.NewRecordSchema("invalid-name", "", nil)
+	require.Error(t, err)
+}
 
 func TestParse_InvalidType(t *testing.T) {
 	schemas := []string{
@@ -90,6 +172,9 @@ func TestNewField_RejectsCyclicDefault(t *testing.T) {
 	for _, kind := range []string{"map", "slice"} {
 		t.Run(kind, func(t *testing.T) {
 			cmd := exec.Command(os.Args[0], "-test.run=^TestNewField_RejectsCyclicDefault$")
+			if coverage := flag.Lookup("test.gocoverdir"); coverage != nil && coverage.Value.String() != "" {
+				cmd.Args = append(cmd.Args, "-test.gocoverdir="+coverage.Value.String())
+			}
 			cmd.Env = append(os.Environ(), helper+"="+kind)
 			output, err := cmd.CombinedOutput()
 			require.NoError(t, err, string(output))

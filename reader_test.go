@@ -13,6 +13,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestAuditReaderErrorState(t *testing.T) {
+	r := new(avro.Reader)
+	avro.WithReaderConfig(nil)(r)
+	require.Error(t, r.Error)
+	r.Reset([]byte{14})
+	require.Error(t, r.Error, "reset must retain a configuration failure")
+	require.Zero(t, r.ReadInt())
+	require.Zero(t, r.ReadLong())
+}
+
 func TestNewReader(t *testing.T) {
 	r := avro.NewReader(bytes.NewBuffer([]byte{}), 10)
 

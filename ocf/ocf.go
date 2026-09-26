@@ -440,11 +440,10 @@ func WithZStandardEncoder(enc *zstd.Encoder) EncoderFunc {
 // WithMetadata sets the metadata on the encoder header.
 func WithMetadata(meta map[string][]byte) EncoderFunc {
 	return func(cfg *encoderConfig) {
-		if meta == nil {
-			cfg.Metadata = map[string][]byte{}
-			return
+		cfg.Metadata = make(map[string][]byte, len(meta))
+		for key, value := range meta {
+			cfg.Metadata[key] = bytes.Clone(value)
 		}
-		cfg.Metadata = meta
 	}
 }
 
@@ -817,9 +816,16 @@ func readHeader(reader *avro.Reader, schemaCache *avro.SchemaCache, codecOpts co
 
 func skipToEnd(reader *avro.Reader, sync [16]byte) error {
 	for {
-		count := reader.ReadLong()
+		reader.Peek()
 		if errors.Is(reader.Error, io.EOF) {
 			return nil
+		}
+		if reader.Error != nil {
+			return reader.Error
+		}
+		count := reader.ReadLong()
+		if reader.Error != nil {
+			return reader.Error
 		}
 		if count < 0 {
 			return errors.New("ocf decoder: negative record count")
