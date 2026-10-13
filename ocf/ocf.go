@@ -497,6 +497,8 @@ type Encoder struct {
 	blockLength int
 	count       int
 	blockSize   int
+	failed      bool // A terminal output failure has already been returned by I/O.
+	closed      bool
 
 	// Stored for Reset.
 	header Header
@@ -672,6 +674,12 @@ func (e *Encoder) shouldWriteDataBlock() bool {
 // thrown if the bytes does not conform to the schema given to NewEncoder, but
 // the final ocf data will be corrupted.
 func (e *Encoder) Write(p []byte) (n int, err error) {
+	if e.closed {
+		return 0, io.ErrClosedPipe
+	}
+	if e.failed {
+		return 0, e.writer.Error
+	}
 	n, err = e.buf.Write(p)
 	if err != nil {
 		return n, err
@@ -680,15 +688,24 @@ func (e *Encoder) Write(p []byte) (n int, err error) {
 	e.count++
 	if e.shouldWriteDataBlock() {
 		if err = e.writerBlock(); err != nil {
+			e.failed = true
 			return n, err
 		}
 	}
 
+	e.failed = e.writer.Error != nil
 	return n, e.writer.Error
 }
 
-// Encode writes the Avro encoding of v to the stream.
+// Encode writes the Avro encoding of v to the stream. Invalid records can be
+// retried; an output failure stops further output until a successful Reset.
 func (e *Encoder) Encode(v any) error {
+	if e.closed {
+		return io.ErrClosedPipe
+	}
+	if e.failed {
+		return e.writer.Error
+	}
 	start := e.buf.Len()
 	if err := e.encoder.Encode(v); err != nil {
 		e.buf.Truncate(start)
@@ -699,32 +716,51 @@ func (e *Encoder) Encode(v any) error {
 	e.count++
 	if e.shouldWriteDataBlock() {
 		if err := e.writerBlock(); err != nil {
+			e.failed = true
 			return err
 		}
 	}
 
+	e.failed = e.writer.Error != nil
 	return e.writer.Error
 }
 
-// Flush flushes the underlying writer.
+// Flush writes buffered records. It does not retry or repeat an output failure
+// already returned by Write, Encode, Flush, or Reset.
 func (e *Encoder) Flush() error {
+	if e.failed {
+		return nil
+	}
 	if e.count == 0 {
+		e.failed = e.writer.Error != nil
 		return e.writer.Error
 	}
 
 	if err := e.writerBlock(); err != nil {
+		e.failed = true
 		return err
 	}
 
+	e.failed = e.writer.Error != nil
 	return e.writer.Error
 }
 
-// Close closes the encoder, flushing the writer and releasing codec resources.
+// Close flushes successful output and releases codec resources once. It reports
+// only new finalization errors; later calls return nil. Earlier I/O errors must
+// be checked at the operation that returned them.
 func (e *Encoder) Close() error {
+	if e.closed {
+		return nil
+	}
+	e.closed = true
 	err := e.Flush()
 	if c, ok := e.codec.(io.Closer); ok {
-		if cerr := c.Close(); cerr != nil && err == nil {
-			err = cerr
+		if cerr := c.Close(); cerr != nil {
+			if err == nil {
+				err = cerr
+			} else {
+				err = errors.Join(err, cerr)
+			}
 		}
 	}
 	return err
@@ -753,6 +789,7 @@ func (e *Encoder) Reset(w io.Writer) error {
 	e.writer.Reset(w)
 	e.writer.WriteVal(HeaderSchema, e.header)
 	if err := e.writer.Flush(); err != nil {
+		e.failed = true
 		return err
 	}
 
@@ -760,6 +797,7 @@ func (e *Encoder) Reset(w io.Writer) error {
 	e.buf.Reset()
 	e.encoder.Reset(e.buf)
 	e.count = 0
+	e.failed, e.closed = false, false
 
 	return nil
 }

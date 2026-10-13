@@ -879,7 +879,7 @@ func TestEncoder_ExistingOCF(t *testing.T) {
 	require.NoError(t, err)
 
 	if *update {
-		err = os.WriteFile("testdata/full-appended.avro", got, 0o644)
+		err = os.WriteFile("testdata/full-appended.avro", got, 0o600)
 		require.NoError(t, err)
 	}
 
@@ -1239,7 +1239,7 @@ func TestEncoder_CloseHandlesWriteBlockError(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestEncoder_CloseRetainsEarlierWriteError(t *testing.T) {
+func TestEncoder_CloseDoesNotRepeatWriteError(t *testing.T) {
 	w := &errorBlockWriter{}
 	enc, err := ocf.NewEncoder(`"long"`, w, ocf.WithBlockLength(1))
 	require.NoError(t, err)
@@ -1247,7 +1247,7 @@ func TestEncoder_CloseRetainsEarlierWriteError(t *testing.T) {
 
 	err = enc.Close()
 
-	assert.ErrorContains(t, err, "test")
+	assert.NoError(t, err)
 }
 
 func TestEncodeDecodeMetadata(t *testing.T) {
@@ -1491,7 +1491,7 @@ func TestWithSchemaMarshaler(t *testing.T) {
 	require.NoError(t, err)
 
 	if *update {
-		err = os.WriteFile("testdata/full-schema.json", got, 0o644)
+		err = os.WriteFile("testdata/full-schema.json", got, 0o600)
 		require.NoError(t, err)
 	}
 
@@ -1506,7 +1506,7 @@ func copyToTemp(t *testing.T, src string) *os.File {
 	file, err := os.CreateTemp(t.TempDir(), "temp-*.avro")
 	require.NoError(t, err)
 
-	b, err := os.ReadFile(src)
+	b, err := os.ReadFile(src) // #nosec G304 -- test-controlled fixture path.
 	require.NoError(t, err)
 
 	_, err = io.Copy(file, bytes.NewReader(b))
@@ -1542,7 +1542,7 @@ func TestSharedZstdEncoder(t *testing.T) {
 	// Create a shared zstd encoder
 	sharedEncoder, err := zstd.NewWriter(nil)
 	require.NoError(t, err)
-	defer sharedEncoder.Close()
+	defer func() { require.NoError(t, sharedEncoder.Close()) }()
 
 	// Use the shared encoder with multiple OCF encoders
 	var buf1, buf2 bytes.Buffer
@@ -1856,7 +1856,7 @@ func TestEncoder_AppendToExistingFile(t *testing.T) {
 	require.NoError(t, err)
 
 	// Reopen file and append second record
-	file, err := os.OpenFile(tmpName, os.O_RDWR, 0o644)
+	file, err := os.OpenFile(tmpName, os.O_RDWR, 0o600) // #nosec G304 -- test-controlled fixture path.
 	require.NoError(t, err)
 
 	enc2, err := ocf.NewEncoder(simpleSchema, file)
@@ -1869,9 +1869,9 @@ func TestEncoder_AppendToExistingFile(t *testing.T) {
 	require.NoError(t, err)
 
 	// Read back and verify both records
-	file, err = os.Open(tmpName)
+	file, err = os.Open(tmpName) // #nosec G304 -- test-controlled fixture path.
 	require.NoError(t, err)
-	defer file.Close()
+	defer func() { require.NoError(t, file.Close()) }()
 
 	dec, err := ocf.NewDecoder(file)
 	require.NoError(t, err)
@@ -1895,7 +1895,7 @@ func TestEncoder_AppendToFilePositionedAtEnd(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
 
-	file, err := os.Create(filepath.Join(dir, "append.avro"))
+	file, err := os.Create(filepath.Join(dir, "append.avro")) // #nosec G304 -- test-controlled fixture path.
 	require.NoError(t, err)
 
 	encoder, err := ocf.NewEncoder(`"long"`, file)
@@ -1961,7 +1961,7 @@ func TestDecoder_DefaultResourceLimits(t *testing.T) {
 
 	t.Run("compressed block bytes", func(t *testing.T) {
 		var hostile bytes.Buffer
-		hostile.Write(original[:headerEnd])
+		_, _ = hostile.Write(original[:headerEnd])
 		writeSecurityLong(&hostile, 1)
 		writeSecurityLong(&hostile, 65<<20)
 
@@ -1973,10 +1973,10 @@ func TestDecoder_DefaultResourceLimits(t *testing.T) {
 
 	t.Run("records per block", func(t *testing.T) {
 		var hostile bytes.Buffer
-		hostile.Write(original[:headerEnd])
+		_, _ = hostile.Write(original[:headerEnd])
 		writeSecurityLong(&hostile, 1_048_577)
 		writeSecurityLong(&hostile, 0)
-		hostile.Write(sync)
+		_, _ = hostile.Write(sync)
 
 		decoder, err := ocf.NewDecoder(bytes.NewReader(hostile.Bytes()))
 		require.NoError(t, err)
@@ -1990,11 +1990,11 @@ func TestDecoder_SkipsEmptyBlocks(t *testing.T) {
 	headerEnd, sync := securityOCFHeaderEnd(t, original)
 
 	var data bytes.Buffer
-	data.Write(original[:headerEnd])
+	_, _ = data.Write(original[:headerEnd])
 	writeSecurityLong(&data, 0)
 	writeSecurityLong(&data, 0)
-	data.Write(sync)
-	data.Write(original[headerEnd:])
+	_, _ = data.Write(sync)
+	_, _ = data.Write(original[headerEnd:])
 
 	decoder, err := ocf.NewDecoder(bytes.NewReader(data.Bytes()))
 	require.NoError(t, err)
@@ -2043,9 +2043,9 @@ func replaceOCFCount(t *testing.T, data []byte, count int64) []byte {
 	_, size := binary.Uvarint(data[headerEnd:])
 	require.Greater(t, size, 0)
 	var result bytes.Buffer
-	result.Write(data[:headerEnd])
+	_, _ = result.Write(data[:headerEnd])
 	writeSecurityLong(&result, count)
-	result.Write(data[headerEnd+size:])
+	_, _ = result.Write(data[headerEnd+size:])
 	return result.Bytes()
 }
 
@@ -2208,10 +2208,10 @@ func replaceSecurityOCFPayload(t *testing.T, original, payload []byte) []byte {
 	require.LessOrEqual(t, oldPayloadEnd+len(sync), len(original))
 
 	var mutated bytes.Buffer
-	mutated.Write(original[:headerEnd+countSize])
+	_, _ = mutated.Write(original[:headerEnd+countSize])
 	writeSecurityLong(&mutated, int64(len(payload)))
-	mutated.Write(payload)
-	mutated.Write(sync)
+	_, _ = mutated.Write(payload)
+	_, _ = mutated.Write(sync)
 	return mutated.Bytes()
 }
 
@@ -2244,7 +2244,7 @@ func FuzzOCFDecoder(f *testing.F) {
 	f.Add([]byte{})
 	f.Add([]byte("Obj\x01"))
 
-	f.Fuzz(func(_ *testing.T, data []byte) {
+	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > 4<<20 {
 			return
 		}
@@ -2258,7 +2258,7 @@ func FuzzOCFDecoder(f *testing.F) {
 		if err != nil {
 			return
 		}
-		defer decoder.Close()
+		defer func() { require.NoError(t, decoder.Close()) }()
 
 		for count := 0; count < 1024 && decoder.HasNext(); count++ {
 			var value int64
@@ -2274,7 +2274,7 @@ func TestAppendIgnoresUnusedSchema(t *testing.T) {
 	dir, err := os.MkdirTemp("../../../../tmp", "avro-append-")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
-	file, err := os.Create(filepath.Join(dir, "data.avro"))
+	file, err := os.Create(filepath.Join(dir, "data.avro")) // #nosec G304 -- test-controlled fixture path.
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, file.Close()) })
 	enc, err := ocf.NewEncoder(`"long"`, file)
@@ -2291,7 +2291,7 @@ func TestAppendIgnoresUnusedSchema(t *testing.T) {
 	require.NoError(t, err)
 	dec, err := ocf.NewDecoder(file)
 	require.NoError(t, err)
-	defer dec.Close()
+	defer func() { require.NoError(t, dec.Close()) }()
 	var values []int64
 	for dec.HasNext() {
 		var v int64
@@ -2312,7 +2312,7 @@ func TestAuditAppendTruncation(t *testing.T) {
 	for n := headerEnd; n <= len(original); n++ {
 		t.Run(strconv.Itoa(n-headerEnd), func(t *testing.T) {
 			data := original[:n]
-			file, err := os.Create(filepath.Join(dir, "partial.avro"))
+			file, err := os.Create(filepath.Join(dir, "partial.avro")) // #nosec G304 -- test-controlled fixture path.
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, file.Close()) })
 			_, err = file.Write(data)
@@ -2330,7 +2330,7 @@ func TestAuditAppendTruncation(t *testing.T) {
 		})
 	}
 	t.Run("partial count", func(t *testing.T) {
-		file, err := os.Create(filepath.Join(dir, "count.avro"))
+		file, err := os.Create(filepath.Join(dir, "count.avro")) // #nosec G304 -- test-controlled fixture path.
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, file.Close()) })
 		data := append(bytes.Clone(original[:headerEnd]), 0x80)
@@ -2374,6 +2374,50 @@ func TestAuditMetadataReuse(t *testing.T) {
 }
 
 // Corrupt block boundaries must stop decoding before allocating or returning data.
+func TestEncoderCloseOwnsOnlyFinalization(t *testing.T) {
+	for _, op := range []string{"write", "encode", "flush"} {
+		t.Run(op, func(t *testing.T) {
+			w := &encoderFailureSink{}
+			e, err := ocf.NewEncoder(`"long"`, w, ocf.WithBlockLength(1))
+			require.NoError(t, err)
+			w.err = errors.New("destination failed")
+			switch op {
+			case "write":
+				_, err = e.Write([]byte{2})
+			case "encode":
+				err = e.Encode(int64(1))
+			case "flush":
+				e, err = ocf.NewEncoder(`"long"`, io.Discard)
+				require.NoError(t, err)
+				// Reset binds the failing sink while its header is still accepted.
+				w.err = nil
+				require.NoError(t, e.Reset(w))
+				require.NoError(t, e.Encode(int64(1)))
+				w.err = errors.New("destination failed")
+				err = e.Flush()
+			}
+			require.ErrorIs(t, err, w.err)
+			calls := w.calls
+			require.NoError(t, e.Close(), "I/O failure must not be returned again")
+			require.NoError(t, e.Close())
+			require.Equal(t, calls, w.calls, "failed output must not be retried")
+		})
+	}
+}
+
+type encoderFailureSink struct {
+	err   error
+	calls int
+}
+
+func (w *encoderFailureSink) Write(p []byte) (int, error) {
+	w.calls++
+	if w.err != nil {
+		return 0, w.err
+	}
+	return len(p), nil
+}
+
 func TestAuditBlockErrors(t *testing.T) {
 	original := buildSecurityOCF(t, ocf.Null)
 	headerEnd, _ := securityOCFHeaderEnd(t, original)
@@ -2428,7 +2472,7 @@ func TestAuditEncoderFailures(t *testing.T) {
 	dir, err := os.MkdirTemp("../../../../tmp", "avro-audit-file-")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
-	file, err := os.Create(filepath.Join(dir, "closed.avro"))
+	file, err := os.Create(filepath.Join(dir, "closed.avro")) // #nosec G304 -- test-controlled fixture path.
 	require.NoError(t, err)
 	require.NoError(t, file.Close())
 	_, err = ocf.NewEncoder(`"long"`, file)
@@ -2437,7 +2481,7 @@ func TestAuditEncoderFailures(t *testing.T) {
 	original := buildSecurityOCF(t, ocf.Null)
 	headerEnd, _ := securityOCFHeaderEnd(t, original)
 	for _, data := range [][]byte{[]byte("bad header"), append(bytes.Clone(original[:headerEnd]), 2, 1)} {
-		file, err := os.Create(filepath.Join(dir, "invalid.avro"))
+		file, err := os.Create(filepath.Join(dir, "invalid.avro")) // #nosec G304 -- test-controlled fixture path.
 		require.NoError(t, err)
 		_, err = file.Write(data)
 		require.NoError(t, err)

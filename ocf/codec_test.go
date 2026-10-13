@@ -169,13 +169,13 @@ func TestZstdEncodeDecodeLowEntropyShort(t *testing.T) {
 }
 
 func TestZstdEncodeDecodeHighEntropyLong(t *testing.T) {
-	input := makeTestData(8762, func() byte { return byte(rand.Uint32()) })
+	input := makeTestData(8762, func() byte { return byte(rand.Uint32()) }) // #nosec G404 -- non-security test and benchmark byte fixtures.
 
 	verifyZstdEncodeDecode(t, input)
 }
 
 func TestZstdEncodeDecodeHighEntropyShort(t *testing.T) {
-	input := makeTestData(7, func() byte { return byte(rand.Uint32()) })
+	input := makeTestData(7, func() byte { return byte(rand.Uint32()) }) // #nosec G404 -- non-security test and benchmark byte fixtures.
 
 	verifyZstdEncodeDecode(t, input)
 }
@@ -219,7 +219,7 @@ func BenchmarkZstdEncodeDecodeLowEntropyLong(b *testing.B) {
 }
 
 func BenchmarkZstdEncodeDecodeHighEntropyLong(b *testing.B) {
-	input := makeTestData(8762, func() byte { return byte(rand.Uint32()) })
+	input := makeTestData(8762, func() byte { return byte(rand.Uint32()) }) // #nosec G404 -- non-security test and benchmark byte fixtures.
 
 	codec, err := resolveCodec(ZStandard, codecOptions{})
 	require.NoError(b, err)

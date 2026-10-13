@@ -64,7 +64,7 @@ func TestExampleNewEncoderUsesWritableFile(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 
 	path := filepath.Join(dir, "file.avro")
-	seed, err := os.Create(path)
+	seed, err := os.Create(path) // #nosec G304 -- test-controlled fixture path.
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,11 @@ func TestExampleNewEncoderUsesWritableFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer output.Close()
+	defer func() {
+		if err := output.Close(); err != nil {
+			log.Fatal(err)
+		}
+	}()
 
 	encoder, err := ocf.NewEncoder(`"null"`, output)
 	if err != nil {
@@ -97,7 +101,11 @@ func ExampleNewDecoder() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			log.Fatal(err)
+		}
+	}()
 
 	dec, err := ocf.NewDecoder(f)
 	if err != nil {
@@ -139,7 +147,11 @@ func ExampleNewEncoder() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			log.Fatal(err)
+		}
+	}()
 
 	enc, err := ocf.NewEncoder(schema, f)
 	if err != nil {
